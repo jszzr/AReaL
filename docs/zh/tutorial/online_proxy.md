@@ -235,8 +235,8 @@ with PPOTrainer(
 > **版本 0 基线：** `eval_before_train` 会让 PPO 循环第一次到达评测点时执行评测，但这个评测点位于第一次优化器更新和权重更新之后。
 > 如果实验需要未训练的版本 0 基线，应在在线训练开始前单独运行一个冻结评测组，并保持验证集、解码设置和奖励函数完全一致。
 
-这些是可信控制平面上的编排保证。内部 lease API 与 producer 共用管理员凭据，所以它不是针对恶意
-`rollout.admin_api_key` 持有者的安全边界。
+这些是可信控制平面上的编排保证。内部 lease API 与 producer 共用管理员凭据，所以它不是针对恶意 `rollout.admin_api_key`
+持有者的安全边界。
 
 ## FAQ
 

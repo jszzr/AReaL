@@ -17,10 +17,7 @@ from areal.v2.inference_service.controller import workflow as workflow_module
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
-from areal.v2.inference_service.controller.workflow import (
-    InferenceServiceWorkflow,
-    validate_trajectory_policy_version,
-)
+from areal.v2.inference_service.controller.workflow import InferenceServiceWorkflow
 from areal.v2.inference_service.data_proxy.session import TrajectoryDeliveryMode
 from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
@@ -2156,42 +2153,6 @@ class TestValidateTrajectoryPolicyVersion:
             side_effect=AssertionError("local RTensor must not fetch"),
         ):
             workflow_module.validate_trajectory_policy_version(traj, 7)
-
-
-class TestValidateTrajectoryPolicyVersion:
-    @staticmethod
-    def _trajectory(versions: list[int], loss_mask: list[int]):
-        return {
-            "versions": torch.tensor(versions, dtype=torch.int32),
-            "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),
-        }
-
-    def test_accepts_expected_loss_bearing_tokens(self):
-        validate_trajectory_policy_version(
-            self._trajectory([999, -1, 4, 4], [0, 0, 1, 1]),
-            4,
-        )
-
-    def test_rejects_stale_or_mixed_loss_bearing_tokens(self):
-        with pytest.raises(ValueError, match=r"expected policy version 4.*\[3, 4\]"):
-            validate_trajectory_policy_version(
-                self._trajectory([-1, 4, 3], [0, 1, 1]),
-                4,
-            )
-
-    @pytest.mark.parametrize("missing", ["versions", "loss_mask"])
-    def test_rejects_missing_provenance(self, missing):
-        trajectory = self._trajectory([-1, 4], [0, 1])
-        del trajectory[missing]
-        with pytest.raises(ValueError, match=missing):
-            validate_trajectory_policy_version(trajectory, 4)
-
-    def test_rejects_trajectory_without_loss_tokens(self):
-        with pytest.raises(ValueError, match="no loss-bearing tokens"):
-            validate_trajectory_policy_version(
-                self._trajectory([-1, 4], [0, 0]),
-                4,
-            )
 
 
 # =============================================================================
