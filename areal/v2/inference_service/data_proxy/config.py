@@ -9,6 +9,8 @@ class DataProxyConfig:
     port: int = 8082
     backend_addr: str = "http://localhost:30000"  # co-located SGLang/vLLM
     backend_type: str = "sglang"
+    use_lora: bool = False
+    lora_name: str = ""
     tokenizer_path: str = ""
     log_level: str = "warning"
     request_timeout: float = 120.0  # seconds per SGLang call
@@ -32,3 +34,9 @@ class DataProxyConfig:
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"
+
+    def __post_init__(self) -> None:
+        if self.use_lora and (
+            not isinstance(self.lora_name, str) or not self.lora_name.strip()
+        ):
+            raise ValueError("lora_name must be set when use_lora=True")

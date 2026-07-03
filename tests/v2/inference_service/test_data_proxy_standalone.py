@@ -7,6 +7,8 @@ otherwise (no auth, admin key, unknown key) → standalone mode (no caching).
 
 from __future__ import annotations
 
+import importlib
+import sys
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -122,6 +124,98 @@ def admin_headers():
 
 
 class TestStandaloneChat:
+    def test_lora_config_requires_non_empty_adapter_name(self):
+        with pytest.raises(ValueError, match="lora_name"):
+            DataProxyConfig(
+                backend_addr="http://mock-sglang:30000",
+                tokenizer_path="mock-tokenizer",
+                use_lora=True,
+                lora_name="",
+            )
+
+    def test_lora_config_builds_enabled_bridge_and_named_client(self, monkeypatch):
+        app_module = importlib.import_module(
+            "areal.v2.inference_service.data_proxy.app"
+        )
+        from areal.v2.inference_service.data_proxy.pause import PauseState
+
+        config = DataProxyConfig(
+            backend_addr="http://mock-sglang:30000",
+            tokenizer_path="mock-tokenizer",
+            use_lora=True,
+            lora_name="online-gsm8k-lora",
+        )
+        bridge = app_module._create_inf_bridge(
+            config.backend_addr, PauseState(), config
+        )
+        tokenizer = MagicMock()
+        tokenizer._tok = MagicMock()
+        client_factory = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr(app_module, "ArealOpenAI", client_factory)
+
+        app_module._create_areal_client(bridge, tokenizer, config)
+
+        assert bridge.use_lora is True
+        assert client_factory.call_args.kwargs["lora_name"] == "online-gsm8k-lora"
+
+    def test_non_lora_config_ignores_adapter_name(self, monkeypatch):
+        app_module = importlib.import_module(
+            "areal.v2.inference_service.data_proxy.app"
+        )
+        from areal.v2.inference_service.data_proxy.pause import PauseState
+
+        config = DataProxyConfig(
+            backend_addr="http://mock-sglang:30000",
+            tokenizer_path="mock-tokenizer",
+            use_lora=False,
+            lora_name="must-not-be-selected",
+        )
+        bridge = app_module._create_inf_bridge(
+            config.backend_addr, PauseState(), config
+        )
+        tokenizer = MagicMock()
+        tokenizer._tok = MagicMock()
+        client_factory = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr(app_module, "ArealOpenAI", client_factory)
+
+        app_module._create_areal_client(bridge, tokenizer, config)
+
+        assert bridge.use_lora is False
+        assert client_factory.call_args.kwargs["lora_name"] == ""
+
+    def test_data_proxy_cli_parses_lora_selection(self, monkeypatch):
+        main_module = importlib.import_module(
+            "areal.v2.inference_service.data_proxy.__main__"
+        )
+        captured = {}
+
+        def fake_create_app(config):
+            captured["config"] = config
+            return MagicMock()
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "data-proxy",
+                "--host",
+                "127.0.0.1",
+                "--tokenizer-path",
+                "mock-tokenizer",
+                "--use-lora",
+                "--lora-name",
+                "online-gsm8k-lora",
+            ],
+        )
+        monkeypatch.setattr(main_module, "create_app", fake_create_app)
+        monkeypatch.setattr(main_module.uvicorn, "run", MagicMock())
+        monkeypatch.setattr(main_module, "suppress_http_loggers", MagicMock())
+
+        main_module.main()
+
+        assert captured["config"].use_lora is True
+        assert captured["config"].lora_name == "online-gsm8k-lora"
+
     def test_config_can_select_vllm_backend(self):
         """backend_type=vllm creates a vLLM-backed InfBridge."""
         from areal.v2.inference_service.data_proxy.app import (

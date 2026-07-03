@@ -15,6 +15,8 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         port=8082,
         backend_addr="http://backend",
         backend_type="sglang",
+        use_lora=False,
+        lora_name="",
         tokenizer_path="mock-tokenizer",
         log_level="info",
         request_timeout=120.0,

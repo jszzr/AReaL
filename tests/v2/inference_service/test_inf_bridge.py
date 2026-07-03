@@ -340,6 +340,81 @@ class TestInfBridge:
 
         assert resp.output_versions == [7]
 
+    @pytest.mark.asyncio
+    async def test_sglang_lora_requests_select_current_version(self):
+        payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            payloads.append(dict(http_req.payload))
+            return _make_sglang_response([(-0.5, 100)], "stop")
+
+        bridge = _make_bridge(version=0, use_lora=True)
+        bridge._send_request = mock_send
+        request = _make_request(lora_name="online-gsm8k-lora")
+
+        version_zero = await bridge.agenerate(request)
+        bridge.set_version(1)
+        version_one = await bridge.agenerate(request)
+
+        assert [payload["lora_path"] for payload in payloads] == [
+            "online-gsm8k-lora-v0",
+            "online-gsm8k-lora-v1",
+        ]
+        assert version_zero.output_versions == [0]
+        assert version_one.output_versions == [1]
+
+    @pytest.mark.asyncio
+    async def test_non_lora_request_ignores_default_adapter_name(self):
+        payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            payloads.append(dict(http_req.payload))
+            return _make_sglang_response([(-0.5, 100)], "stop")
+
+        bridge = _make_bridge(use_lora=False)
+        bridge._send_request = mock_send
+
+        await bridge.agenerate(_make_request())
+
+        assert "lora_path" not in payloads[0]
+
+    @pytest.mark.asyncio
+    async def test_lora_request_without_name_fails_before_backend_call(self):
+        bridge = _make_bridge(use_lora=True)
+        bridge._send_request = AsyncMock(
+            return_value=_make_sglang_response([(-0.5, 100)], "stop")
+        )
+
+        with pytest.raises(ValueError, match="LoRA name"):
+            await bridge.agenerate(_make_request(lora_name=""))
+
+        bridge._send_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lora_resubmit_keeps_request_adapter_version(self):
+        payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            payloads.append(dict(http_req.payload))
+            if len(payloads) == 1:
+                bridge.set_version(1)
+                return _make_sglang_response([(-0.5, 100)], "abort")
+            return _make_sglang_response([(-0.3, 101)], "stop")
+
+        bridge = _make_bridge(version=0, use_lora=True)
+        bridge._send_request = mock_send
+
+        response = await bridge.agenerate(
+            _make_request(max_new_tokens=2, lora_name="online-gsm8k-lora")
+        )
+
+        assert [payload["lora_path"] for payload in payloads] == [
+            "online-gsm8k-lora-v0",
+            "online-gsm8k-lora-v0",
+        ]
+        assert response.output_versions == [0, 0]
+        assert bridge.get_version() == 1
+
     # -- 10. n_samples validation ------------------------------------------------
 
     @pytest.mark.asyncio
@@ -431,6 +506,42 @@ class TestInfBridge:
 
 
 class TestVLLMBridgeBackend:
+    @pytest.mark.asyncio
+    async def test_vllm_lora_requests_select_current_version(self):
+        payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            payloads.append(dict(http_req.payload))
+            return _make_vllm_response([100], [-0.5], "stop")
+
+        bridge = _make_bridge(backend=VLLMBridgeBackend(), version=0, use_lora=True)
+        bridge._send_request = mock_send
+        request = _make_request(lora_name="online-gsm8k-lora")
+
+        await bridge.agenerate(request)
+        bridge.set_version(1)
+        await bridge.agenerate(request)
+
+        assert [payload["model"] for payload in payloads] == [
+            "online-gsm8k-lora-v0",
+            "online-gsm8k-lora-v1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_vllm_non_lora_request_omits_adapter_model(self):
+        payloads: list[dict[str, Any]] = []
+
+        async def mock_send(http_req, **kwargs):
+            payloads.append(dict(http_req.payload))
+            return _make_vllm_response([100], [-0.5], "stop")
+
+        bridge = _make_bridge(backend=VLLMBridgeBackend(), use_lora=False)
+        bridge._send_request = mock_send
+
+        await bridge.agenerate(_make_request())
+
+        assert "model" not in payloads[0]
+
     @pytest.mark.asyncio
     async def test_vllm_text_abort_then_stop_accumulates_tokens(self):
         """vLLM text completions resubmit by extending prompt + shrinking max_tokens."""

@@ -56,6 +56,8 @@ class InfBridge:
         Sleep duration (seconds) between pause-state polls.
     version:
         Initial weight version.
+    use_lora:
+        Whether generation requests must select a versioned LoRA adapter.
     """
 
     def __init__(
@@ -67,6 +69,7 @@ class InfBridge:
         max_resubmit_retries: int = 20,
         resubmit_wait: float = 0.5,
         version: int = 0,
+        use_lora: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_addr = backend_addr.rstrip("/")
@@ -75,6 +78,7 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
+        self.use_lora = use_lora
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
@@ -172,11 +176,16 @@ class InfBridge:
                 f"InfBridge only supports n_samples=1, got {req.gconfig.n_samples}"
             )
 
+        # Bind adapter selection to the policy version observed when this request
+        # starts. Abort/resubmit may overlap a later set_version call, but every
+        # continuation must keep using the same loaded adapter.
+        request_version = self._version
+
         # Build the initial HTTP request via the backend
         http_req = self.backend.build_generation_request(
             req,
-            with_lora=False,
-            version=self._version,
+            with_lora=self.use_lora,
+            version=request_version,
         )
 
         # Extract effective max_new_tokens from the payload the backend built
@@ -221,7 +230,8 @@ class InfBridge:
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
-            accumulated_versions.extend([self._version] * len(result.output_tokens))
+            output_version = request_version if self.use_lora else self._version
+            accumulated_versions.extend([output_version] * len(result.output_tokens))
             stop_reason = cast(_StopReason, result.stop_reason)
 
             if result.routed_experts is not None:

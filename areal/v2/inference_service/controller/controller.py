@@ -122,6 +122,12 @@ class RolloutControllerV2:
             )
         if not config.model:
             raise ValueError("InferenceEngineConfig.model must not be empty")
+        if config.use_lora and (
+            not isinstance(config.lora_name, str) or not config.lora_name.strip()
+        ):
+            raise ValueError(
+                "InferenceEngineConfig.lora_name must be set when use_lora=True"
+            )
         self.config = config
         self.scheduler = scheduler
 
@@ -513,6 +519,8 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if cfg.use_lora:
+            data_proxy_base_cmd += ["--use-lora", "--lora-name", cfg.lora_name]
 
         data_proxy_worker_ids = [str(uuid.uuid4()) for _ in range(dp_size)]
 

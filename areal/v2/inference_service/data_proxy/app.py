@@ -218,6 +218,7 @@ def _create_inf_bridge(
         request_timeout=config.request_timeout,
         max_resubmit_retries=config.max_resubmit_retries,
         resubmit_wait=config.resubmit_wait,
+        use_lora=config.use_lora,
     )
 
 
@@ -234,6 +235,7 @@ def _create_areal_client(
         reasoning_parser=config.reasoning_parser,
         engine_max_tokens=config.engine_max_tokens,
         chat_template_type=config.chat_template_type,
+        lora_name=config.lora_name if config.use_lora else "",
     )
 
 

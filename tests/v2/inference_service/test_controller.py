@@ -333,6 +333,20 @@ class TestRolloutControllerV2Construction:
         with pytest.raises(ValueError, match="model must not be empty"):
             RolloutControllerV2(config=cfg, scheduler=MagicMock(n_gpus_per_node=8))
 
+    def test_lora_requires_non_empty_adapter_name_before_startup(self):
+        cfg = InferenceEngineConfig(
+            backend="sglang:d1",
+            admin_api_key="test-key",
+            use_lora=True,
+            lora_name="",
+        )
+        scheduler = MagicMock(n_gpus_per_node=8)
+
+        with pytest.raises(ValueError, match="lora_name"):
+            RolloutControllerV2(config=cfg, scheduler=scheduler)
+
+        scheduler.create_workers.assert_not_called()
+
     def test_constructor(self):
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
@@ -440,6 +454,8 @@ class TestRolloutControllerV2Construction:
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
             request_timeout=15.0,
+            use_lora=True,
+            lora_name="online-gsm8k-lora",
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
@@ -494,6 +510,9 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert "--use-lora" in data_proxy_cmd
+        lora_name_index = data_proxy_cmd.index("--lora-name")
+        assert data_proxy_cmd[lora_name_index + 1] == "online-gsm8k-lora"
         assert "--worker-id" in data_proxy_cmd
         assert data_proxy_cmd[data_proxy_cmd.index("--worker-id") + 1] == "epoch-e1"
 
@@ -1121,6 +1140,59 @@ class TestRouterRegistrationIncarnations:
             "http://data-proxy:18081": "launch-worker-id"
         }
         assert controller._predecessor_worker_ids == {"http://data-proxy:18081": None}
+
+
+class TestNonLoraDataProxyLaunch:
+    @pytest.mark.asyncio
+    async def test_async_initialize_non_lora_omits_adapter_flags(self):
+        from areal.api.cli_args import SchedulingSpec
+        from areal.api.io_struct import LocalInfServerInfo
+
+        worker = MagicMock()
+        worker.ip = "127.0.0.1"
+        worker.worker_ports = [18000]
+        scheduler = MagicMock(n_gpus_per_node=8)
+        scheduler.get_workers.return_value = [worker]
+        cfg = InferenceEngineConfig(
+            backend="sglang:d1",
+            tokenizer_path="mock-tokenizer",
+            scheduling_spec=(
+                SchedulingSpec(
+                    gpu=0,
+                    cpu=1,
+                    mem=1,
+                    cmd="python -m areal.v2.inference_service.guard",
+                ),
+            ),
+            admin_api_key="test-admin-key",
+        )
+        controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
+        controller._callback_host = "127.0.0.1"
+        controller._callback_port = 19000
+
+        with patch.object(controller, "_async_fork_on_guard") as mock_fork:
+            mock_fork.side_effect = [
+                ("127.0.0.1", 18081),
+                ("127.0.0.1", 18082),
+                ("127.0.0.1", 18080),
+            ]
+            await controller._async_initialize(
+                server_args=None,
+                server_infos=[
+                    LocalInfServerInfo(
+                        host="127.0.0.1", port=30000, process=MagicMock()
+                    )
+                ],
+            )
+
+        data_proxy_call = next(
+            call
+            for call in mock_fork.call_args_list
+            if call.kwargs.get("role") == "data-proxy"
+        )
+        data_proxy_cmd = data_proxy_call.kwargs["raw_cmd"]
+        assert "--use-lora" not in data_proxy_cmd
+        assert "--lora-name" not in data_proxy_cmd
 
 
 class TestOnlineCallbackFlow:

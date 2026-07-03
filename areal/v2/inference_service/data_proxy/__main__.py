@@ -32,6 +32,8 @@ def main():
         default="sglang",
         choices=("sglang", "vllm"),
     )
+    parser.add_argument("--use-lora", action="store_true")
+    parser.add_argument("--lora-name", default="")
     parser.add_argument(
         "--tokenizer-path",
         required=True,
@@ -93,6 +95,8 @@ def main():
         port=args.port,
         backend_addr=args.backend_addr,
         backend_type=args.backend_type,
+        use_lora=args.use_lora,
+        lora_name=args.lora_name,
         tokenizer_path=args.tokenizer_path,
         log_level=args.log_level,
         request_timeout=args.request_timeout,
