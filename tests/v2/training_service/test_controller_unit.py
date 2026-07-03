@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import os
 import threading
@@ -12,6 +13,7 @@ import requests
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.api.io_struct import WeightUpdateMeta
+from areal.infra.utils.http import HttpxAsyncClientCleanup
 from areal.trainer import rl_trainer
 from areal.trainer.rl_trainer import PPOTrainer
 from areal.v2.inference_service.controller.controller import RolloutControllerV2
@@ -119,6 +121,30 @@ class _FailOnceSession:
 
 
 class TestGatewayTrainControllerInitialization:
+    def test_async_client_closes_on_owner_loop_shutdown(self):
+        controller = _make_controller()
+        client = MagicMock()
+        client.is_closed = False
+        close_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def close_client() -> None:
+            close_loops.append(asyncio.get_running_loop())
+            client.is_closed = True
+
+        client.aclose = AsyncMock(side_effect=close_client)
+        loop = asyncio.new_event_loop()
+        try:
+            with patch(f"{MODULE}.create_httpx_client", return_value=client):
+                assert loop.run_until_complete(controller._get_async_client()) is client
+        finally:
+            loop.close()
+
+        client.aclose.assert_awaited_once_with()
+        assert close_loops == [loop]
+        assert controller._async_client is None
+        assert controller._async_client_loop is None
+        assert controller._async_client_cleanup is None
+
     def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner(self):
         scheduler = MagicMock()
         controller = _make_controller(scheduler)
@@ -774,6 +800,34 @@ class TestGatewayTrainControllerWeightUpdate:
 
 
 class TestGatewayTrainControllerLifecycle:
+    def test_destroy_retains_async_client_when_close_fails(self):
+        controller = _make_controller()
+        client = MagicMock()
+        owner_loop = MagicMock()
+        primary = RuntimeError("async transport close failed")
+        cleanup = HttpxAsyncClientCleanup(client, owner_loop)
+        controller._async_client = client
+        controller._async_client_loop = owner_loop
+        controller._async_client_cleanup = cleanup
+
+        with (
+            patch(f"{MODULE}.close_httpx_client_from_sync", side_effect=primary),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            controller.destroy()
+
+        assert exc_info.value is primary
+        assert controller._async_client is client
+        assert controller._async_client_loop is owner_loop
+        assert controller._async_client_cleanup is cleanup
+
+        with patch(f"{MODULE}.close_httpx_client_from_sync"):
+            controller.destroy()
+
+        assert controller._async_client is None
+        assert controller._async_client_loop is None
+        assert controller._async_client_cleanup is None
+
     def test_guard_deletion_does_not_mask_unconfirmed_direct_kill(self):
         scheduler = MagicMock()
         controller = _make_controller(scheduler)
