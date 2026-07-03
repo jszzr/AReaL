@@ -1,8 +1,7 @@
 # V2 在线代理
 
-V2 推理网关允许外部智能体生成轨迹，同时由 AReaL 训练器在线消费。核心不是简单地“把请求转发到模型”，而是建立
-明确的所有权：一个训练 waiter 发布一个有限期 lease，一次 producer 请求消费该 lease，最终参与 loss 的 token
-必须来自 lease 捕获的策略版本。
+V2 推理网关允许外部智能体生成轨迹，同时由 AReaL 训练器在线消费。核心不是简单地“把请求转发到模型”，而是建立 明确的所有权：一个训练 waiter 发布一个有限期
+lease，一次 producer 请求消费该 lease，最终参与 loss 的 token 必须来自 lease 捕获的策略版本。
 
 ```text
 外部智能体 -> Gateway -> Router -> Data Proxy -> SGLang/vLLM
@@ -60,8 +59,8 @@ curl -X POST http://<gateway>/rl/start_session \
   }'
 ```
 
-`request_id` 是调用方为一次逻辑创建生成的幂等键。请求超时或响应丢失后，必须原样复用它。相同请求会重放第一次
-返回的凭据，不会再次消费 lease；同一个 ID 搭配不同参数会返回 `409`。
+`request_id` 是调用方为一次逻辑创建生成的幂等键。请求超时或响应丢失后，必须原样复用它。相同请求会重放第一次 返回的凭据，不会再次消费 lease；同一个 ID
+搭配不同参数会返回 `409`。
 
 主要响应是：
 
@@ -114,12 +113,12 @@ curl -X POST http://<gateway>/rl/set_reward \
   -d '{"interaction_id": null, "reward": 1.0}'
 ```
 
-奖励边界就绪后，Data Proxy 会向准确匹配的 controller waiter 发送带版本的 callback，再由 controller 导出轨迹。
-外部 producer 不需要调用 `end_session` 端点。
+奖励边界就绪后，Data Proxy 会向准确匹配的 controller waiter 发送带版本的 callback，再由 controller 导出轨迹。 外部
+producer 不需要调用 `end_session` 端点。
 
-对于本地 SGLang/vLLM 策略，AReaL 会验证每个参与 loss 的 token 是否具有 lease 所期望的策略版本。陈旧或混合
-版本的轨迹会被拒绝，其远程 tensor shard 也会被清理。外部 API 不暴露这类 token provenance，因此 external mode
-的交互记录不能证明 provider 的具体模型 revision。
+对于本地 SGLang/vLLM 策略，AReaL 会验证每个参与 loss 的 token 是否具有 lease 所期望的策略版本。陈旧或混合 版本的轨迹会被拒绝，其远程
+tensor shard 也会被清理。外部 API 不暴露这类 token provenance，因此 external mode 的交互记录不能证明 provider
+的具体模型 revision。
 
 ## pull 交付与显式导出
 
@@ -151,8 +150,8 @@ curl -X POST http://<gateway>/export_trajectories \
   }'
 ```
 
-响应丢失后应原样重放请求。Gateway 会记住选中的 worker，Data Proxy 会重放第一次序列化的结果，而不是再次
-弹出轨迹。只有参数变化或真正的新导出才使用新的 ID。
+响应丢失后应原样重放请求。Gateway 会记住选中的 worker，Data Proxy 会重放第一次序列化的结果，而不是再次 弹出轨迹。只有参数变化或真正的新导出才使用新的
+ID。
 
 ## 失败与并发保证
 
@@ -160,6 +159,9 @@ curl -X POST http://<gateway>/export_trajectories \
 - 新会话独立分配；创建后，会话密钥固定路由到所属 worker。
 - session ID 包含全局唯一的 group 身份，Router 会拒绝 ID 或密钥所有权冲突。
 - Router 注册绑定 worker 的注册 epoch，避免进程在同一地址重启后被延迟响应复活旧会话。
+- Data Proxy 的健康响应会返回不可变 worker ID；Router 只会把 ID 与已注册 epoch 相同的 `200` 视为健康。
+- 新 proxy 健康后，推理 CLI 只读取一次管理员端点 `/worker_epoch`，并将其作为注册 CAS 的 predecessor。 如果返回
+  `409`，本次启动直接失败，不会重读后覆盖并发 successor。
 - lease 在 controller 持有的超时后过期；worker 会话取消和 Router 撤销会独立重试。
 - callback ACK、创建结果和导出结果都保留有界重放 tombstone，因此成功响应丢失后可以安全重试。
 
@@ -226,5 +228,5 @@ with PPOTrainer(
 }
 ```
 
-lease 数量只适合观测。producer 应以原子的 `start_session` 响应（`201` 或 `429`）作为准入结果，而不是先轮询
-health 再自行预留。
+lease 数量只适合观测。producer 应以原子的 `start_session` 响应（`201` 或 `429`）作为准入结果，而不是先轮询 health
+再自行预留。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlencode
 
 from areal.v2.cli.client import (
     BaseHTTPClient,
@@ -26,6 +27,10 @@ class GatewayClient(BaseHTTPClient):
 
 
 class RouterClient(BaseHTTPClient):
+    def get_worker_epoch(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        query = urlencode({"worker_addr": addr})
+        return self._get(f"/worker_epoch?{query}", timeout=timeout)
+
     def register_worker(
         self,
         addr: str,

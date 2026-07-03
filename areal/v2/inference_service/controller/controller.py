@@ -733,10 +733,16 @@ class RolloutControllerV2:
         self, data_proxy_addr: str, worker_id: str | None = None
     ) -> None:
         """Track one newly launched process and freeze its registration CAS."""
+        data_proxy_addr = data_proxy_addr.rstrip("/")
         with self._registration_operation_lock:
             with self._registration_state_lock:
                 if self._destroyed:
                     return
+                if worker_id is not None and data_proxy_addr in self._data_proxy_addrs:
+                    raise ValueError(
+                        "duplicate canonical data-proxy address returned by launcher: "
+                        f"{data_proxy_addr}"
+                    )
                 desired_worker_id = worker_id or str(uuid.uuid4())
                 expected_worker_id = self._worker_ids.get(data_proxy_addr)
                 if data_proxy_addr not in self._data_proxy_addrs:

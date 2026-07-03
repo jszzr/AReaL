@@ -34,6 +34,10 @@ class WorkerRegistry:
         # tombstone, a delayed first-registration request could resurrect a
         # retired process at a reused address.
         self._last_worker_ids: dict[str, str] = {}
+        # Incarnation IDs are one-shot fencing tokens. Keeping retired IDs
+        # prevents an old delayed request from becoming valid at another
+        # address after the original owner has been unregistered.
+        self._used_worker_ids: set[str] = set()
         self._lock = asyncio.Lock()
 
     async def register(
@@ -55,6 +59,10 @@ class WorkerRegistry:
                     if current.registered_from_worker_id == expected_worker_id:
                         return "replayed"
                     raise ValueError(f"Registration replay mismatch for {worker_addr}")
+            if worker_id in self._used_worker_ids:
+                raise ValueError(f"Worker ID {worker_id} has already been used")
+
+            if current is not None:
                 if expected_worker_id != current.worker_id:
                     raise ValueError(
                         f"Worker epoch mismatch for {worker_addr}: "
@@ -96,6 +104,7 @@ class WorkerRegistry:
             )
             self._id_to_addr[worker_id] = worker_addr
             self._last_worker_ids[worker_addr] = worker_id
+            self._used_worker_ids.add(worker_id)
             return action
 
     async def unregister(self, worker_addr: str, worker_id: str) -> bool:
@@ -120,6 +129,18 @@ class WorkerRegistry:
     async def get_by_addr(self, worker_addr: str) -> WorkerInfo | None:
         async with self._lock:
             return self._workers.get(worker_addr)
+
+    async def get_epoch(self, worker_addr: str) -> tuple[str, str | None]:
+        """Return ``(status, worker_id)`` for one canonical address."""
+
+        async with self._lock:
+            current = self._workers.get(worker_addr)
+            if current is not None:
+                return "active", current.worker_id
+            last_worker_id = self._last_worker_ids.get(worker_addr)
+            if last_worker_id is not None:
+                return "retired", last_worker_id
+            return "unseen", None
 
     async def update_health(
         self, worker_addr: str, expected_worker_id: str, healthy: bool

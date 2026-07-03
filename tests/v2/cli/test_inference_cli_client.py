@@ -60,3 +60,29 @@ def test_router_unregister_worker_sends_exact_incarnation_payload(monkeypatch):
         )
     ]
     assert response["removed"] is True
+
+
+def test_router_worker_epoch_query_encodes_canonical_address(monkeypatch):
+    client = RouterClient("http://router", "admin")
+    calls = []
+
+    def fake_get(path, *, timeout=5.0, auth=True):
+        calls.append((path, timeout, auth))
+        return {
+            "worker_addr": "http://proxy:5001",
+            "status": "retired",
+            "worker_id": "proxy-incarnation-1",
+        }
+
+    monkeypatch.setattr(client, "_get", fake_get)
+
+    response = client.get_worker_epoch("http://proxy:5001", timeout=4.0)
+
+    assert calls == [
+        (
+            "/worker_epoch?worker_addr=http%3A%2F%2Fproxy%3A5001",
+            4.0,
+            True,
+        )
+    ]
+    assert response["status"] == "retired"

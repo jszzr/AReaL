@@ -99,6 +99,20 @@ def test_model_state_round_trips_router_worker_id(tmp_path, monkeypatch):
     assert loaded.models["m"].replicas[0].router_worker_id == "proxy-incarnation-1"
 
 
+def test_model_state_round_trips_pending_router_cleanup(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    replica = _replica(router_worker_id="proxy-incarnation-1")
+    replica.router_cleanup_pending = True
+    ModelState(
+        service="svc",
+        models={"m": ModelEntry(backend="sglang:d1", replicas=[replica])},
+    ).save()
+
+    loaded = ModelState.load("svc")
+
+    assert loaded.models["m"].replicas[0].router_cleanup_pending is True
+
+
 def test_model_state_loads_legacy_replica_without_router_worker_id(
     tmp_path, monkeypatch
 ):

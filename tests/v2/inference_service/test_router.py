@@ -12,6 +12,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from areal.v2.inference_service.router import app as router_app
 from areal.v2.inference_service.router.app import create_app
 from areal.v2.inference_service.router.config import RouterConfig
 from areal.v2.inference_service.router.state import (
@@ -168,6 +169,15 @@ class TestWorkerRegistry:
         reg = WorkerRegistry()
         result = await reg.get_by_id("nonexistent-id")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_retired_worker_id_cannot_be_reused_at_another_address(self):
+        reg = WorkerRegistry()
+        await reg.register(WORKER_1, "one-shot-id", None)
+        assert await reg.unregister(WORKER_1, "one-shot-id") is True
+
+        with pytest.raises(ValueError, match="already been used"):
+            await reg.register(WORKER_2, "one-shot-id", None)
 
 
 # =============================================================================
@@ -334,6 +344,40 @@ class TestRouterEndpoints:
         assert data["strategy"] == "round_robin"
 
     @pytest.mark.asyncio
+    async def test_health_poll_rejects_200_from_different_worker_epoch(
+        self, config, monkeypatch
+    ):
+        probe_finished = asyncio.Event()
+
+        class FakeHealthClient:
+            async def get(self, _url):
+                probe_finished.set()
+                return httpx.Response(
+                    200,
+                    json={"status": "ok", "worker_id": "successor-epoch"},
+                )
+
+            async def aclose(self):
+                return None
+
+        fake_client = FakeHealthClient()
+        monkeypatch.setattr(
+            router_app.httpx,
+            "AsyncClient",
+            lambda *args, **kwargs: fake_client,
+        )
+        app = create_app(config)
+        await app.state.worker_registry.register(WORKER_1, WORKER_ID_1, None)
+
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(probe_finished.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            worker = await app.state.worker_registry.get_by_addr(WORKER_1)
+
+        assert worker is not None
+        assert worker.is_healthy is False
+
+    @pytest.mark.asyncio
     async def test_hitl_route_binds_first_use(self, client):
         await client.post(
             "/register",
@@ -394,6 +438,87 @@ class TestRouterEndpoints:
             headers={"Authorization": "Bearer wrong-key"},
         )
         assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_worker_epoch_reports_unseen_active_and_retired_state(self, client):
+        unseen = await client.get(
+            "/worker_epoch",
+            params={"worker_addr": WORKER_1},
+            headers=admin_headers(),
+        )
+        assert unseen.status_code == 200
+        assert unseen.json() == {
+            "worker_addr": WORKER_1,
+            "status": "unseen",
+            "worker_id": None,
+        }
+
+        assert (
+            await client.post(
+                "/register", json=register_payload(WORKER_1), headers=admin_headers()
+            )
+        ).status_code == 200
+        active = await client.get(
+            "/worker_epoch",
+            params={"worker_addr": WORKER_1},
+            headers=admin_headers(),
+        )
+        assert active.json() == {
+            "worker_addr": WORKER_1,
+            "status": "active",
+            "worker_id": WORKER_ID_1,
+        }
+
+        assert (
+            await client.post(
+                "/unregister",
+                json={"worker_addr": WORKER_1, "worker_id": WORKER_ID_1},
+                headers=admin_headers(),
+            )
+        ).json()["removed"] is True
+        retired = await client.get(
+            "/worker_epoch",
+            params={"worker_addr": WORKER_1},
+            headers=admin_headers(),
+        )
+        assert retired.json() == {
+            "worker_addr": WORKER_1,
+            "status": "retired",
+            "worker_id": WORKER_ID_1,
+        }
+
+        successor = await client.post(
+            "/register",
+            json=register_payload(
+                WORKER_1,
+                worker_id="worker-1-epoch-2",
+                expected_worker_id=retired.json()["worker_id"],
+            ),
+            headers=admin_headers(),
+        )
+        assert successor.status_code == 200
+        assert successor.json()["action"] == "replaced"
+
+    @pytest.mark.asyncio
+    async def test_worker_epoch_requires_admin_key(self, client):
+        assert (
+            await client.get("/worker_epoch", params={"worker_addr": WORKER_1})
+        ).status_code == 401
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("worker_id", ["", "x" * 129])
+    async def test_register_rejects_invalid_worker_id_schema(self, client, worker_id):
+        response = await client.post(
+            "/register",
+            json={
+                "worker_addr": WORKER_1,
+                "worker_id": worker_id,
+                "expected_worker_id": None,
+            },
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 422
 
     @pytest.mark.asyncio
     async def test_register_requires_nullable_expected_worker_id_field(self, client):
@@ -814,7 +939,7 @@ class TestRouterEndpoints:
         )
 
     @pytest.mark.asyncio
-    async def test_retired_id_reused_at_another_addr_is_not_cascade_owner(self, client):
+    async def test_retired_id_cannot_be_reused_at_another_addr(self, client):
         reused_worker_id = "reused-worker-id"
         assert (
             await client.post(
@@ -830,53 +955,14 @@ class TestRouterEndpoints:
                 headers=admin_headers(),
             )
         ).json()["removed"] is True
-        assert (
-            await client.post(
-                "/register",
-                json=register_payload(WORKER_2, worker_id=reused_worker_id),
-                headers=admin_headers(),
-            )
-        ).status_code == 200
-        assert (
-            await client.post(
-                "/register_session",
-                json={
-                    "sessions": [
-                        {"session_api_key": "live-key", "session_id": "live-id"}
-                    ],
-                    "worker_addr": WORKER_2,
-                    "worker_id": reused_worker_id,
-                    "group_id": "live-group",
-                },
-                headers=admin_headers(),
-            )
-        ).status_code == 200
-
-        successor = await client.post(
+        reused = await client.post(
             "/register",
-            json=register_payload(
-                WORKER_1,
-                worker_id="worker-1-epoch-2",
-                expected_worker_id=reused_worker_id,
-            ),
+            json=register_payload(WORKER_2, worker_id=reused_worker_id),
             headers=admin_headers(),
         )
-        routed = await client.post(
-            "/route", json={"api_key": "live-key"}, headers=admin_headers()
-        )
 
-        assert successor.status_code == 200
-        assert routed.status_code == 200
-        assert routed.json() == {
-            "worker_addr": WORKER_2,
-            "worker_id": reused_worker_id,
-            "url": None,
-            "api_key": None,
-        }
-        assert (
-            await client._transport.app.state.group_registry.lookup("live-group")
-            is not None
-        )
+        assert reused.status_code == 409
+        assert "already been used" in reused.json()["detail"]
 
     # ----- /route — admin key -----
 

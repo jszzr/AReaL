@@ -66,6 +66,7 @@ _MAX_ADMISSION_TOMBSTONES = 4096
 
 class DataProxyHealthResponse(BaseModel):
     status: str
+    worker_id: str | None
     backend: str | None
     sessions: int
     paused: bool
@@ -420,6 +421,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
             status="ok",
+            worker_id=config.worker_id,
             backend=config.backend_addr,
             sessions=store.session_count,
             paused=await pause_state.is_paused(),

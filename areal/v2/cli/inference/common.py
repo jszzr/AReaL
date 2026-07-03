@@ -147,6 +147,30 @@ def format_gpu_count(handle: TaskHandle) -> str:
     return f"×{n}" if n > 0 else "-"
 
 
+def _read_worker_predecessor(router: RouterClient, addr: str) -> str | None:
+    """Read one immutable CAS predecessor snapshot from the Router."""
+
+    try:
+        response = router.get_worker_epoch(addr)
+    except (ServiceUnreachable, ServiceHTTPError) as exc:
+        raise click.ClickException(f"router worker_epoch {addr} failed: {exc}") from exc
+
+    if response.get("worker_addr") != addr:
+        raise click.ClickException(
+            f"router worker_epoch {addr} returned unexpected worker_addr "
+            f"{response.get('worker_addr')!r}"
+        )
+    status = response.get("status")
+    worker_id = response.get("worker_id")
+    if status == "unseen" and worker_id is None:
+        return None
+    if status in {"active", "retired"} and isinstance(worker_id, str) and worker_id:
+        return worker_id
+    raise click.ClickException(
+        f"router worker_epoch {addr} returned malformed epoch state {response!r}"
+    )
+
+
 def register_internal(
     *,
     model: str,
@@ -171,7 +195,9 @@ def register_internal(
 
     replicas: list[ModelReplica] = []
     spawned_handles: list[TaskHandle] = []
-    confirmed_router_workers: list[tuple[str, str]] = []
+    generated_router_workers: list[tuple[str, str]] = []
+    registration_intents: list[tuple[str, str, str | None]] = []
+    proxy_addrs_seen: set[str] = set()
 
     try:
         for rank in range(dp):
@@ -227,6 +253,8 @@ def register_internal(
             )
             proxy_handle = scheduler.submit(proxy_spec)
             spawned_handles.append(proxy_handle)
+            proxy_addr = proxy_handle.addr.rstrip("/")
+            generated_router_workers.append((proxy_addr, router_worker_id))
             logger.info(
                 "spawned data-proxy %d/%d pid=%d port=%d",
                 rank,
@@ -234,12 +262,21 @@ def register_internal(
                 proxy_handle.pid,
                 proxy_handle.ports[0],
             )
+            if proxy_addr in proxy_addrs_seen:
+                raise click.ClickException(
+                    f"duplicate data-proxy address returned by launcher: {proxy_addr}"
+                )
+            proxy_addrs_seen.add(proxy_addr)
             wait_http_health(
-                proxy_handle.addr,
+                proxy_addr,
                 pid=proxy_handle.pid,
                 timeout=30.0,
                 label=f"data-proxy {rank}",
                 poll_interval=1.0,
+            )
+            predecessor_worker_id = _read_worker_predecessor(router, proxy_addr)
+            registration_intents.append(
+                (proxy_addr, router_worker_id, predecessor_worker_id)
             )
 
             replicas.append(
@@ -250,23 +287,24 @@ def register_internal(
                 )
             )
 
-        proxy_addrs = [r.data_proxy.addr for r in replicas]
-        for replica in replicas:
-            addr = replica.data_proxy.addr
-            assert replica.router_worker_id is not None
+        proxy_addrs = [addr for addr, _, _ in registration_intents]
+        for addr, worker_id, predecessor_worker_id in registration_intents:
             try:
-                response = router.register_worker(addr, replica.router_worker_id, None)
+                response = router.register_worker(
+                    addr,
+                    worker_id,
+                    predecessor_worker_id,
+                )
             except (ServiceUnreachable, ServiceHTTPError) as exc:
                 raise click.ClickException(
                     f"router register_worker {addr} failed: {exc}"
                 ) from exc
             echoed_worker_id = response.get("worker_id")
-            if echoed_worker_id != replica.router_worker_id:
+            if echoed_worker_id != worker_id:
                 raise click.ClickException(
                     f"router register_worker {addr} returned unexpected worker_id "
-                    f"{echoed_worker_id!r}; expected {replica.router_worker_id!r}"
+                    f"{echoed_worker_id!r}; expected {worker_id!r}"
                 )
-            confirmed_router_workers.append((addr, replica.router_worker_id))
 
         try:
             gateway.register_model(
@@ -281,7 +319,7 @@ def register_internal(
             raise click.ClickException(f"gateway register_model failed: {exc}") from exc
 
     except BaseException:
-        for addr, worker_id in reversed(confirmed_router_workers):
+        for addr, worker_id in reversed(generated_router_workers):
             try:
                 router.unregister_worker(addr, worker_id)
             except Exception as exc:

@@ -671,6 +671,22 @@ class TestRouterRegistrationIncarnations:
         response.raise_for_status.assert_called_once_with()
         assert controller.worker_ids == {"http://data-proxy:18081": "desired-worker-id"}
 
+    def test_launch_rejects_duplicate_canonical_data_proxy_address(self):
+        controller = self._controller()
+        controller._record_data_proxy_launch(
+            "http://data-proxy:18081", "first-incarnation"
+        )
+
+        with pytest.raises(ValueError, match="duplicate canonical data-proxy address"):
+            controller._record_data_proxy_launch(
+                "http://data-proxy:18081/", "second-incarnation"
+            )
+
+        assert controller._data_proxy_addrs == ["http://data-proxy:18081"]
+        assert controller._desired_worker_ids == {
+            "http://data-proxy:18081": "first-incarnation"
+        }
+
     def test_register_method_retry_reuses_exact_incarnation_cas_payload(self):
         controller = self._controller()
         controller._router_addr = "http://router:18080"

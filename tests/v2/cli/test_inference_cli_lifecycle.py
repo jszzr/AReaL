@@ -75,6 +75,10 @@ def _proxy_handle(*, rank: int) -> TaskHandle:
     )
 
 
+def _unseen_epoch(addr: str) -> dict[str, str | None]:
+    return {"worker_addr": addr, "status": "unseen", "worker_id": None}
+
+
 def _register_internal(common, tmp_path, *, backend, scheduler, router, gateway):
     return common.register_internal(
         model="model",
@@ -104,7 +108,11 @@ def test_register_internal_preserves_worker_identity_from_proxy_launch_to_router
         uuid_calls.append(None)
         return "proxy-incarnation-1"
 
-    router = SimpleNamespace(register_worker=lambda *args: None)
+    router = SimpleNamespace(
+        get_worker_epoch=_unseen_epoch,
+        register_worker=lambda *args: None,
+        unregister_worker=lambda *args: {"removed": False},
+    )
     router_calls = []
 
     def register_worker(addr, worker_id, expected_worker_id):
@@ -171,16 +179,178 @@ def test_data_proxy_worker_identity_cannot_be_overridden_by_proxy_extra(tmp_path
     assert proxy_cmd[-2:] == ["--worker-id", "proxy-incarnation-1"]
 
 
+def test_register_internal_reads_retired_predecessor_once_after_proxy_health(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference import common
+
+    events = []
+
+    def get_worker_epoch(addr):
+        events.append(("epoch", addr))
+        return {
+            "worker_addr": addr,
+            "status": "retired",
+            "worker_id": "retired-incarnation",
+        }
+
+    def register_worker(addr, worker_id, expected_worker_id):
+        events.append(("register", addr, worker_id, expected_worker_id))
+        return {"status": "ok", "worker_id": worker_id}
+
+    router = SimpleNamespace(
+        get_worker_epoch=get_worker_epoch,
+        register_worker=register_worker,
+        unregister_worker=lambda *args: {"removed": False},
+    )
+    gateway = SimpleNamespace(register_model=lambda payload: None)
+    scheduler = _Scheduler([_worker_handle(rank=0), _proxy_handle(rank=0)])
+    monkeypatch.setattr(common, "uuid4", lambda: "new-incarnation")
+    monkeypatch.setattr(
+        common,
+        "wait_http_health",
+        lambda url, **kwargs: events.append(("health", url)),
+    )
+
+    _register_internal(
+        common,
+        tmp_path,
+        backend="sglang:d1",
+        scheduler=scheduler,
+        router=router,
+        gateway=gateway,
+    )
+
+    assert events == [
+        ("health", "http://127.0.0.1:6000"),
+        ("health", "http://127.0.0.1:7000"),
+        ("epoch", "http://127.0.0.1:7000"),
+        (
+            "register",
+            "http://127.0.0.1:7000",
+            "new-incarnation",
+            "retired-incarnation",
+        ),
+    ]
+
+
+def test_register_internal_does_not_reread_epoch_or_retry_after_cas_conflict(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference import common
+
+    events = []
+
+    def get_worker_epoch(addr):
+        events.append(("epoch", addr))
+        return {
+            "worker_addr": addr,
+            "status": "active",
+            "worker_id": "observed-predecessor",
+        }
+
+    def register_worker(addr, worker_id, expected_worker_id):
+        events.append(("register", addr, worker_id, expected_worker_id))
+        raise common.ServiceHTTPError(409, "epoch changed")
+
+    router = SimpleNamespace(
+        get_worker_epoch=get_worker_epoch,
+        register_worker=register_worker,
+        unregister_worker=lambda addr, worker_id: events.append(
+            ("unregister", addr, worker_id)
+        ),
+    )
+    gateway = SimpleNamespace(register_model=lambda payload: None)
+    scheduler = _Scheduler([_worker_handle(rank=0), _proxy_handle(rank=0)])
+    monkeypatch.setattr(common, "uuid4", lambda: "new-incarnation")
+    monkeypatch.setattr(common, "wait_http_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(common, "kill_pids", lambda *args, **kwargs: None)
+
+    with pytest.raises(click.ClickException, match="router register_worker"):
+        _register_internal(
+            common,
+            tmp_path,
+            backend="sglang:d1",
+            scheduler=scheduler,
+            router=router,
+            gateway=gateway,
+        )
+
+    assert [event for event in events if event[0] == "epoch"] == [
+        ("epoch", "http://127.0.0.1:7000")
+    ]
+    assert [event for event in events if event[0] == "register"] == [
+        (
+            "register",
+            "http://127.0.0.1:7000",
+            "new-incarnation",
+            "observed-predecessor",
+        )
+    ]
+    assert events[-1] == (
+        "unregister",
+        "http://127.0.0.1:7000",
+        "new-incarnation",
+    )
+
+
+def test_register_internal_rejects_duplicate_data_proxy_addresses(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference import common
+
+    events = []
+    worker_ids = iter(["incarnation-1", "incarnation-2"])
+    router = SimpleNamespace(
+        get_worker_epoch=lambda addr: events.append(("epoch", addr))
+        or _unseen_epoch(addr),
+        register_worker=lambda *args: events.append(("register", *args)),
+        unregister_worker=lambda addr, worker_id: events.append(
+            ("unregister", addr, worker_id)
+        ),
+    )
+    gateway = SimpleNamespace(register_model=lambda payload: None)
+    scheduler = _Scheduler(
+        [
+            _worker_handle(rank=0),
+            _proxy_handle(rank=0),
+            _worker_handle(rank=1),
+            _proxy_handle(rank=0),
+        ]
+    )
+    monkeypatch.setattr(common, "uuid4", lambda: next(worker_ids))
+    monkeypatch.setattr(common, "wait_http_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(common, "kill_pids", lambda *args, **kwargs: None)
+
+    with pytest.raises(click.ClickException, match="duplicate data-proxy address"):
+        _register_internal(
+            common,
+            tmp_path,
+            backend="sglang:d2",
+            scheduler=scheduler,
+            router=router,
+            gateway=gateway,
+        )
+
+    assert not any(event[0] == "register" for event in events)
+    assert [event for event in events if event[0] == "unregister"] == [
+        ("unregister", "http://127.0.0.1:7000", "incarnation-2"),
+        ("unregister", "http://127.0.0.1:7000", "incarnation-1"),
+    ]
+
+
 def test_register_internal_rejects_mismatched_router_worker_id_echo(
     tmp_path, monkeypatch
 ):
     from areal.v2.cli.inference import common
 
     router = SimpleNamespace(
+        get_worker_epoch=_unseen_epoch,
         register_worker=lambda addr, worker_id, expected_worker_id: {
             "status": "ok",
             "worker_id": "different-incarnation",
-        }
+        },
+        unregister_worker=lambda *args: {"removed": False},
     )
     gateway_calls = []
     gateway = SimpleNamespace(
@@ -230,7 +400,9 @@ def test_register_internal_rolls_back_exact_router_owner_before_killing_on_gatew
         raise common.ServiceUnreachable("gateway down")
 
     router = SimpleNamespace(
-        register_worker=register_worker, unregister_worker=unregister_worker
+        get_worker_epoch=_unseen_epoch,
+        register_worker=register_worker,
+        unregister_worker=unregister_worker,
     )
     gateway = SimpleNamespace(register_model=register_model)
     scheduler = _Scheduler([_worker_handle(rank=0), _proxy_handle(rank=0)])
@@ -264,7 +436,7 @@ def test_register_internal_rolls_back_exact_router_owner_before_killing_on_gatew
     ]
 
 
-def test_register_internal_rolls_back_only_confirmed_owner_on_partial_registration_failure(
+def test_register_internal_rolls_back_every_generated_owner_on_ambiguous_registration_failure(
     tmp_path, monkeypatch
 ):
     from areal.v2.cli.inference import common
@@ -283,7 +455,9 @@ def test_register_internal_rolls_back_only_confirmed_owner_on_partial_registrati
         return {"status": "ok", "removed": True}
 
     router = SimpleNamespace(
-        register_worker=register_worker, unregister_worker=unregister_worker
+        get_worker_epoch=_unseen_epoch,
+        register_worker=register_worker,
+        unregister_worker=unregister_worker,
     )
     gateway = SimpleNamespace(
         register_model=lambda payload: events.append(("gateway", payload))
@@ -315,10 +489,87 @@ def test_register_internal_rolls_back_only_confirmed_owner_on_partial_registrati
         )
 
     assert [event for event in events if event[0] == "unregister"] == [
-        ("unregister", "http://127.0.0.1:7000", "proxy-incarnation-1")
+        ("unregister", "http://127.0.0.1:7001", "proxy-incarnation-2"),
+        ("unregister", "http://127.0.0.1:7000", "proxy-incarnation-1"),
     ]
     assert events[-1] == ("kill", [100, 200, 101, 201], 10.0)
     assert not any(event[0] == "gateway" for event in events)
+
+
+def test_register_response_loss_rolls_back_then_next_launch_cas_reuses_address(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference import common
+
+    class StatefulRouter:
+        def __init__(self):
+            self.status = "unseen"
+            self.worker_id = None
+            self.drop_first_register_response = True
+            self.register_payloads = []
+
+        def get_worker_epoch(self, addr):
+            return {
+                "worker_addr": addr,
+                "status": self.status,
+                "worker_id": self.worker_id,
+            }
+
+        def register_worker(self, addr, worker_id, expected_worker_id):
+            self.register_payloads.append((addr, worker_id, expected_worker_id))
+            assert expected_worker_id == self.worker_id
+            self.status = "active"
+            self.worker_id = worker_id
+            if self.drop_first_register_response:
+                self.drop_first_register_response = False
+                raise common.ServiceUnreachable("response lost after commit")
+            return {"status": "ok", "worker_id": worker_id}
+
+        def unregister_worker(self, addr, worker_id):
+            if self.status == "active" and self.worker_id == worker_id:
+                self.status = "retired"
+                return {"status": "ok", "removed": True}
+            return {"status": "ok", "removed": False}
+
+    router = StatefulRouter()
+    gateway_calls = []
+    gateway = SimpleNamespace(
+        register_model=lambda payload: gateway_calls.append(payload)
+    )
+    worker_ids = iter(["incarnation-e1", "incarnation-e2"])
+    monkeypatch.setattr(common, "uuid4", lambda: next(worker_ids))
+    monkeypatch.setattr(common, "wait_http_health", lambda *args, **kwargs: None)
+    monkeypatch.setattr(common, "kill_pids", lambda *args, **kwargs: None)
+
+    with pytest.raises(click.ClickException, match="response lost after commit"):
+        _register_internal(
+            common,
+            tmp_path,
+            backend="sglang:d1",
+            scheduler=_Scheduler([_worker_handle(rank=0), _proxy_handle(rank=0)]),
+            router=router,
+            gateway=gateway,
+        )
+    assert router.status == "retired"
+    assert router.worker_id == "incarnation-e1"
+
+    replicas = _register_internal(
+        common,
+        tmp_path,
+        backend="sglang:d1",
+        scheduler=_Scheduler([_worker_handle(rank=0), _proxy_handle(rank=0)]),
+        router=router,
+        gateway=gateway,
+    )
+
+    assert router.register_payloads == [
+        ("http://127.0.0.1:7000", "incarnation-e1", None),
+        ("http://127.0.0.1:7000", "incarnation-e2", "incarnation-e1"),
+    ]
+    assert router.status == "active"
+    assert router.worker_id == "incarnation-e2"
+    assert replicas[0].router_worker_id == "incarnation-e2"
+    assert len(gateway_calls) == 1
 
 
 def test_deregister_uses_exact_router_worker_id_before_killing(tmp_path, monkeypatch):
@@ -346,11 +597,13 @@ def test_deregister_uses_exact_router_worker_id_before_killing(tmp_path, monkeyp
         admin_api_key="admin",
     )
 
+    def unregister_worker(addr, worker_id):
+        events.append(("unregister", addr, worker_id))
+        return {"status": "ok", "removed": True}
+
     router = SimpleNamespace(
         remove_model=lambda name: events.append(("remove_model", name)),
-        unregister_worker=lambda addr, worker_id: events.append(
-            ("unregister", addr, worker_id)
-        ),
+        unregister_worker=unregister_worker,
     )
     monkeypatch.setattr(
         deregister.inf_lifecycle, "load_running_state", lambda service: state
@@ -366,8 +619,8 @@ def test_deregister_uses_exact_router_worker_id_before_killing(tmp_path, monkeyp
 
     assert result == 0
     assert events == [
-        ("remove_model", "model"),
         ("unregister", "http://127.0.0.1:5001", "proxy-incarnation-1"),
+        ("remove_model", "model"),
         ("kill", [20], 7.0),
         ("kill", [10], 7.0),
         ("save",),
@@ -375,14 +628,13 @@ def test_deregister_uses_exact_router_worker_id_before_killing(tmp_path, monkeyp
     assert models == {}
 
 
-def test_deregister_legacy_replica_warns_and_skips_router_unregister(
+def test_deregister_legacy_replica_fails_with_migration_hint_and_keeps_state(
     tmp_path, monkeypatch
 ):
     from areal.v2.cli.inference.commands import deregister
 
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     events = []
-    warnings = []
     replica = _replica(worker_pid=10, proxy_pid=20, router_worker_id=None)
     models = {
         "model": ModelEntry(backend="sglang:d1", replicas=[replica]),
@@ -398,11 +650,14 @@ def test_deregister_legacy_replica_warns_and_skips_router_unregister(
         router_url="http://router",
         admin_api_key="admin",
     )
+
+    def unregister_worker(addr, worker_id):
+        events.append(("unregister", addr, worker_id))
+        return {"status": "ok", "removed": True}
+
     router = SimpleNamespace(
         remove_model=lambda name: events.append(("remove_model", name)),
-        unregister_worker=lambda addr, worker_id: events.append(
-            ("unregister", addr, worker_id)
-        ),
+        unregister_worker=unregister_worker,
     )
     monkeypatch.setattr(
         deregister.inf_lifecycle, "load_running_state", lambda service: state
@@ -413,25 +668,184 @@ def test_deregister_legacy_replica_warns_and_skips_router_unregister(
         "kill_pids",
         lambda pids, grace_s: events.append(("kill", list(pids), grace_s)),
     )
+
+    with pytest.raises(click.ClickException, match="legacy.*router_worker_id"):
+        deregister.do_deregister("model", 7.0, False, service="svc")
+
+    assert not any(event[0] == "unregister" for event in events)
+    assert not any(event[0] == "kill" for event in events)
+    assert events == [("save",)]
+    assert models == {"model": ModelEntry(backend="sglang:d1", replicas=[replica])}
+    assert replica.router_cleanup_pending is True
+
+
+def test_deregister_unregister_failure_marks_pending_and_keeps_processes_and_state(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference.commands import deregister
+
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    events = []
+    replica = _replica(
+        worker_pid=10,
+        proxy_pid=20,
+        router_worker_id="proxy-incarnation-1",
+    )
+    models = {"model": ModelEntry(backend="sglang:d1", replicas=[replica])}
+    model_state = SimpleNamespace(
+        models=models,
+        save=lambda: events.append(("save",)),
+    )
+    state = SimpleNamespace(
+        service="svc",
+        models=models,
+        model_state=model_state,
+        router_url="http://router",
+        admin_api_key="admin",
+    )
+
+    def unregister_worker(addr, worker_id):
+        events.append(("unregister", addr, worker_id))
+        raise deregister.ServiceUnreachable("router down")
+
+    router = SimpleNamespace(
+        remove_model=lambda name: events.append(("remove_model", name)),
+        unregister_worker=unregister_worker,
+    )
     monkeypatch.setattr(
-        deregister.logger,
-        "warning",
-        lambda message, *args: warnings.append((message, args)),
+        deregister.inf_lifecycle, "load_running_state", lambda service: state
+    )
+    monkeypatch.setattr(deregister, "RouterClient", lambda *args: router)
+    monkeypatch.setattr(
+        deregister,
+        "kill_pids",
+        lambda pids, grace_s: events.append(("kill", list(pids), grace_s)),
+    )
+
+    with pytest.raises(click.ClickException, match="cleanup is pending"):
+        deregister.do_deregister("model", 7.0, False, service="svc")
+
+    assert events == [
+        ("unregister", "http://127.0.0.1:5001", "proxy-incarnation-1"),
+        ("save",),
+    ]
+    assert "model" in models
+    assert replica.router_cleanup_pending is True
+
+
+def test_deregister_model_cleanup_failure_keeps_identity_and_processes(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference.commands import deregister
+
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    events = []
+    replica = _replica(
+        worker_pid=10,
+        proxy_pid=20,
+        router_worker_id="proxy-incarnation-1",
+    )
+    models = {"model": ModelEntry(backend="sglang:d1", replicas=[replica])}
+    model_state = SimpleNamespace(
+        models=models,
+        save=lambda: events.append(("save",)),
+    )
+    state = SimpleNamespace(
+        service="svc",
+        models=models,
+        model_state=model_state,
+        router_url="http://router",
+        admin_api_key="admin",
+    )
+
+    def unregister_worker(addr, worker_id):
+        events.append(("unregister", addr, worker_id))
+        return {"removed": True}
+
+    def remove_model(name):
+        events.append(("remove_model", name))
+        raise deregister.ServiceUnreachable("router down")
+
+    router = SimpleNamespace(
+        unregister_worker=unregister_worker,
+        remove_model=remove_model,
+    )
+    monkeypatch.setattr(
+        deregister.inf_lifecycle, "load_running_state", lambda service: state
+    )
+    monkeypatch.setattr(deregister, "RouterClient", lambda *args: router)
+    monkeypatch.setattr(
+        deregister,
+        "kill_pids",
+        lambda pids, grace_s: events.append(("kill", list(pids), grace_s)),
+    )
+
+    with pytest.raises(click.ClickException, match="model cleanup is pending"):
+        deregister.do_deregister("model", 7.0, False, service="svc")
+
+    assert events == [
+        ("unregister", "http://127.0.0.1:5001", "proxy-incarnation-1"),
+        ("remove_model", "model"),
+        ("save",),
+    ]
+    assert "model" in models
+    assert replica.router_cleanup_pending is True
+
+
+def test_deregister_retry_accepts_exact_retired_tombstone_after_response_loss(
+    tmp_path, monkeypatch
+):
+    from areal.v2.cli.inference.commands import deregister
+
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    events = []
+    replica = _replica(
+        worker_pid=10,
+        proxy_pid=20,
+        router_worker_id="proxy-incarnation-1",
+    )
+    replica.router_cleanup_pending = True
+    models = {"model": ModelEntry(backend="sglang:d1", replicas=[replica])}
+    model_state = SimpleNamespace(
+        models=models,
+        save=lambda: events.append(("save",)),
+    )
+    state = SimpleNamespace(
+        service="svc",
+        models=models,
+        model_state=model_state,
+        router_url="http://router",
+        admin_api_key="admin",
+    )
+    router = SimpleNamespace(
+        unregister_worker=lambda addr, worker_id: {"removed": False},
+        get_worker_epoch=lambda addr: {
+            "worker_addr": addr,
+            "status": "retired",
+            "worker_id": "proxy-incarnation-1",
+        },
+        remove_model=lambda name: events.append(("remove_model", name)),
+    )
+    monkeypatch.setattr(
+        deregister.inf_lifecycle, "load_running_state", lambda service: state
+    )
+    monkeypatch.setattr(deregister, "RouterClient", lambda *args: router)
+    monkeypatch.setattr(
+        deregister,
+        "kill_pids",
+        lambda pids, grace_s: events.append(("kill", list(pids), grace_s)),
     )
 
     result = deregister.do_deregister("model", 7.0, False, service="svc")
 
     assert result == 0
-    assert not any(event[0] == "unregister" for event in events)
-    assert len(warnings) == 1
-    assert "router_worker_id" in warnings[0][0]
-    assert warnings[0][1] == ("http://127.0.0.1:5001",)
-    assert events[-3:] == [
+    assert models == {}
+    assert events == [
+        ("remove_model", "model"),
         ("kill", [20], 7.0),
         ("kill", [10], 7.0),
         ("save",),
     ]
-    assert models == {}
 
 
 def test_deregister_holds_model_state_lock_through_load_unregister_kill_and_save(
@@ -478,11 +892,13 @@ def test_deregister_holds_model_state_lock_through_load_unregister_kill_and_save
         events.append(("load", service))
         return state
 
+    def unregister_worker(addr, worker_id):
+        events.append(("unregister", addr, worker_id))
+        return {"status": "ok", "removed": True}
+
     router = SimpleNamespace(
         remove_model=lambda name: events.append(("remove_model", name)),
-        unregister_worker=lambda addr, worker_id: events.append(
-            ("unregister", addr, worker_id)
-        ),
+        unregister_worker=unregister_worker,
     )
     monkeypatch.setattr(
         deregister.inf_lifecycle, "resolve_service_name", resolve_service_name
@@ -505,8 +921,8 @@ def test_deregister_holds_model_state_lock_through_load_unregister_kill_and_save
         ("resolve", None),
         ("lock_enter", "svc"),
         ("load", "svc"),
-        ("remove_model", "model"),
         ("unregister", "http://127.0.0.1:5001", "proxy-incarnation-1"),
+        ("remove_model", "model"),
         ("kill", [20], 7.0),
         ("kill", [10], 7.0),
         ("save",),

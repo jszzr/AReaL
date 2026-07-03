@@ -18,8 +18,8 @@ interchangeable with it.
 
 ## Start a V2 training service
 
-Use a configuration with both rollout and actor explicitly set to V2. The Hermes
-example is a working reference:
+Use a configuration with both rollout and actor explicitly set to V2. The Hermes example
+is a working reference:
 
 ```bash
 uv run python3 examples/hermes/train.py \
@@ -125,13 +125,13 @@ curl -X POST http://<gateway>/rl/set_reward \
   -d '{"interaction_id": null, "reward": 1.0}'
 ```
 
-When the reward boundary becomes ready, the Data Proxy sends a version-bound callback
-to the exact controller waiter. The controller then exports the trajectory; the
-external producer does not call an `end_session` endpoint.
+When the reward boundary becomes ready, the Data Proxy sends a version-bound callback to
+the exact controller waiter. The controller then exports the trajectory; the external
+producer does not call an `end_session` endpoint.
 
 For local SGLang/vLLM policies, AReaL verifies that every loss-bearing token has the
-lease's expected policy version. A stale or mixed-version trajectory is rejected and
-its remote tensor shards are cleared. External API providers do not expose this token
+lease's expected policy version. A stale or mixed-version trajectory is rejected and its
+remote tensor shards are cleared. External API providers do not expose this token
 provenance, so external-mode interaction records are not proof of a provider model
 revision.
 
@@ -178,8 +178,13 @@ trajectory twice. Use a new ID for different parameters or a genuinely new expor
   conflicting ID/key ownership.
 - Router registration is bound to a worker registration epoch, preventing a delayed
   response from reviving sessions after a process restarts at the same address.
-- Leases expire after the controller-owned timeout. Cleanup independently retries
-  worker cancellation and Router revocation.
+- Data Proxy health replies include that immutable worker ID. Router health probes
+  accept a `200` only when the returned ID matches the registered epoch.
+- The inference CLI reads the admin-only `/worker_epoch` snapshot once after a new proxy
+  becomes healthy and uses it as the registration CAS predecessor. A `409` fails the
+  launch instead of rereading and overwriting a concurrent successor.
+- Leases expire after the controller-owned timeout. Cleanup independently retries worker
+  cancellation and Router revocation.
 - Callback acknowledgements and start/export results retain bounded replay tombstones,
   so a lost success response is safe to retry.
 

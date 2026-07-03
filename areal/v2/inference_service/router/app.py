@@ -16,10 +16,11 @@ from __future__ import annotations
 import asyncio
 import hmac
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from areal.utils import logging
 from areal.v2.inference_service.router.config import RouterConfig
@@ -62,16 +63,18 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 # Request models
 # =============================================================================
 
+WorkerId = Annotated[str, Field(min_length=1, max_length=128)]
+
 
 class RegisterWorkerRequest(BaseModel):
     worker_addr: str
-    worker_id: str
-    expected_worker_id: str | None
+    worker_id: WorkerId
+    expected_worker_id: WorkerId | None
 
 
 class UnregisterWorkerRequest(BaseModel):
     worker_addr: str
-    worker_id: str
+    worker_id: WorkerId
 
 
 class RouteRequest(BaseModel):
@@ -90,7 +93,7 @@ class SessionEntry(BaseModel):
 class RegisterSessionRequest(BaseModel):
     sessions: list[SessionEntry]
     worker_addr: str
-    worker_id: str
+    worker_id: WorkerId
     group_id: str
 
 
@@ -181,6 +184,12 @@ class ResolveWorkerResponse(BaseModel):
     worker_addr: str
 
 
+class WorkerEpochResponse(BaseModel):
+    worker_addr: str
+    status: str
+    worker_id: str | None
+
+
 # =============================================================================
 # App factory
 # =============================================================================
@@ -204,8 +213,13 @@ def create_app(config: RouterConfig) -> FastAPI:
             async def _check(w):
                 try:
                     resp = await app.state.http_client.get(f"{w.worker_addr}/health")
+                    payload = resp.json() if resp.status_code == 200 else {}
+                    healthy = (
+                        isinstance(payload, dict)
+                        and payload.get("worker_id") == w.worker_id
+                    )
                     await worker_registry.update_health(
-                        w.worker_addr, w.worker_id, resp.status_code == 200
+                        w.worker_addr, w.worker_id, healthy
                     )
                 except Exception:
                     await worker_registry.update_health(
@@ -283,6 +297,18 @@ def create_app(config: RouterConfig) -> FastAPI:
     # =========================================================================
     # Worker management (admin key required)
     # =========================================================================
+
+    @app.get("/worker_epoch", response_model=WorkerEpochResponse)
+    async def worker_epoch(worker_addr: str, request: Request):
+        """Return the active or last-retired epoch for one worker address."""
+
+        _require_admin_key(request, config.admin_api_key)
+        status, worker_id = await worker_registry.get_epoch(worker_addr)
+        return WorkerEpochResponse(
+            worker_addr=worker_addr,
+            status=status,
+            worker_id=worker_id,
+        )
 
     @app.post("/register", response_model=RegisterWorkerResponse)
     async def register(body: RegisterWorkerRequest, request: Request):

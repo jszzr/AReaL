@@ -186,6 +186,16 @@ class TestVersionEndpoints:
         assert "version" in data
 
     @pytest.mark.asyncio
+    async def test_health_reports_process_worker_id(self, app_client):
+        client, app = app_client
+        app.state.config.worker_id = "proxy-incarnation-1"
+
+        resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        assert resp.json()["worker_id"] == "proxy-incarnation-1"
+
+    @pytest.mark.asyncio
     async def test_health_version_updates_after_set(self, app_client):
         client, app = app_client
         await client.post("/set_version", json={"version": 99})
