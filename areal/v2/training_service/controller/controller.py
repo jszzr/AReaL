@@ -80,6 +80,7 @@ class GatewayTrainController:
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
         self._disk_weight_update_root: str | None = None
+        self._weight_update_lock = Lock()
 
         # Version management
         self._version_lock = Lock()
@@ -991,72 +992,85 @@ class GatewayTrainController:
                 "v2 disk weight updates require at least one local inference worker"
             )
 
-        self.rollout = rollout
+        with self._weight_update_lock:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(
+                    "Cannot connect WeightUpdateController after shutdown was requested"
+                )
+            if self._weight_update_ctrl is not None:
+                raise RuntimeError("WeightUpdateController is already connected")
 
-        ctrl = WeightUpdateController(
-            WeightUpdateControllerConfig(
-                # Bind gateway to this node's outbound IP so cross-host
-                # train/inf workers can reach the kv_store_url the gateway
-                # publishes. Default "127.0.0.1" only works single-machine.
-                host=gethostip(),
-                admin_api_key=self.config.admin_api_key,
-                log_level=self.config.log_level,
+            self.rollout = rollout
+            ctrl = WeightUpdateController(
+                WeightUpdateControllerConfig(
+                    # Bind gateway to this node's outbound IP so cross-host
+                    # train/inf workers can reach the kv_store_url the gateway
+                    # publishes. Default "127.0.0.1" only works single-machine.
+                    host=gethostip(),
+                    admin_api_key=self.config.admin_api_key,
+                    log_level=self.config.log_level,
+                )
             )
-        )
-        try:
-            ctrl.initialize()
-            pair_name = f"{self._role}-rollout"
-            self._disk_weight_update_root = None
-
-            if meta.type == "awex":
-                # NCCL rendezvous master must live on the rank-0 process's node.
-                # awex assigns rank 0 to inference[0], so allocate on the inference
-                # rank-0 guard rather than a train guard.
-                inf_guard_addrs = rollout.inference_guard_addrs
-                resp = requests.post(
-                    f"{inf_guard_addrs[0]}/alloc_ports",
-                    json={"count": 1},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                port_data = resp.json()
-                ctrl.connect(
-                    pair_name=pair_name,
-                    train_worker_urls=self._worker_addrs,
-                    inference_worker_urls=inference_urls,
-                    mode="awex",
-                    nccl_master_addr=port_data["host"],
-                    nccl_master_port=port_data["ports"][0],
-                )
-            else:  # disk
-                save_root = _disk_gateway_save_root(meta)
-                ctrl.connect(
-                    pair_name=pair_name,
-                    train_worker_urls=self._worker_addrs,
-                    inference_worker_urls=inference_urls,
-                    mode="disk",
-                    save_path=save_root,
-                    use_lora=meta.use_lora,
-                    lora_name=meta.lora_name,
-                    lora_keep_versions=meta.lora_keep_versions,
-                )
-                self._disk_weight_update_root = save_root
-        except BaseException:
             try:
-                ctrl.destroy()
-            except Exception:
-                logger.error(
-                    "Failed to destroy WeightUpdateController after connection error",
-                    exc_info=True,
-                )
-            raise
-        self._weight_update_ctrl = ctrl
-        logger.info(
-            "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
-            pair_name,
-            len(self._worker_addrs),
-            len(inference_urls),
-        )
+                ctrl.initialize()
+
+                pair_name = f"{self._role}-rollout"
+                self._disk_weight_update_root = None
+
+                if meta.type == "awex":
+                    # NCCL rendezvous master must live on the rank-0 process's node.
+                    # awex assigns rank 0 to inference[0], so allocate on the inference
+                    # rank-0 guard rather than a train guard.
+                    inf_guard_addrs = rollout.inference_guard_addrs
+                    resp = requests.post(
+                        f"{inf_guard_addrs[0]}/alloc_ports",
+                        json={"count": 1},
+                        timeout=30,
+                    )
+                    resp.raise_for_status()
+                    port_data = resp.json()
+                    ctrl.connect(
+                        pair_name=pair_name,
+                        train_worker_urls=self._worker_addrs,
+                        inference_worker_urls=inference_urls,
+                        mode="awex",
+                        nccl_master_addr=port_data["host"],
+                        nccl_master_port=port_data["ports"][0],
+                    )
+                else:  # disk
+                    save_root = _disk_gateway_save_root(meta)
+                    ctrl.connect(
+                        pair_name=pair_name,
+                        train_worker_urls=self._worker_addrs,
+                        inference_worker_urls=inference_urls,
+                        mode="disk",
+                        save_path=save_root,
+                        use_lora=meta.use_lora,
+                        lora_name=meta.lora_name,
+                        lora_keep_versions=meta.lora_keep_versions,
+                    )
+                    self._disk_weight_update_root = save_root
+            except BaseException as primary_error:
+                try:
+                    ctrl.destroy()
+                except BaseException as cleanup_error:
+                    self._weight_update_ctrl = ctrl
+                    logger.error(
+                        "Failed to destroy WeightUpdateController after connection error",
+                        exc_info=True,
+                    )
+                    primary_error.add_note(
+                        "WeightUpdateController rollback also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
+            self._weight_update_ctrl = ctrl
+            logger.info(
+                "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
+                pair_name,
+                len(self._worker_addrs),
+                len(inference_urls),
+            )
 
     def update_weights(self, meta: Any) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:
@@ -1233,15 +1247,18 @@ class GatewayTrainController:
         logger.info("All training worker engines destroyed gracefully")
 
     def _cleanup_runtime_state(self) -> None:
-        weight_update_ctrl = self._weight_update_ctrl
-        if weight_update_ctrl is not None:
-            try:
-                weight_update_ctrl.destroy()
-            except Exception:
-                logger.error("Failed to destroy WeightUpdateController", exc_info=True)
-            else:
-                if self._weight_update_ctrl is weight_update_ctrl:
-                    self._weight_update_ctrl = None
+        with self._weight_update_lock:
+            weight_update_ctrl = self._weight_update_ctrl
+            if weight_update_ctrl is not None:
+                try:
+                    weight_update_ctrl.destroy()
+                except Exception:
+                    logger.error(
+                        "Failed to destroy WeightUpdateController", exc_info=True
+                    )
+                else:
+                    if self._weight_update_ctrl is weight_update_ctrl:
+                        self._weight_update_ctrl = None
 
         if self._router_addr and self._model_addr:
             try:

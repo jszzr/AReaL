@@ -219,13 +219,17 @@ class WeightUpdateController:
             except Exception:
                 logger.warning("Failed to disconnect during destroy", exc_info=True)
 
+        session_error: BaseException | None = None
         session = self._session
-        self._session = None
         if session is not None:
             try:
                 session.close()
-            except Exception:
+            except BaseException as exc:
                 logger.warning("Failed to close gateway HTTP session", exc_info=True)
+                session_error = exc
+            else:
+                if self._session is session:
+                    self._session = None
 
         gateway_proc = self._gateway_proc
         if gateway_proc is not None:
@@ -244,8 +248,10 @@ class WeightUpdateController:
                 except ProcessLookupError:
                     # The process may exit between wait() timing out and kill().
                     pass
-                gateway_proc.wait()
+                gateway_proc.wait(timeout=1)
             if self._gateway_proc is gateway_proc:
                 self._gateway_proc = None
         self._gateway_url = ""
+        if session_error is not None:
+            raise session_error
         logger.info("WeightUpdateController destroyed")

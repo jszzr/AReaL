@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,6 +49,23 @@ def _make_controller(scheduler: MagicMock | None = None) -> GatewayTrainControll
             request_timeout=5.0,
             setup_timeout=5.0,
         ),
+    )
+
+
+def _make_rollout() -> RolloutControllerV2:
+    rollout = RolloutControllerV2.__new__(RolloutControllerV2)
+    rollout._init_future = None
+    rollout._inf_addrs = ["http://inference-worker"]
+    return rollout
+
+
+def _disk_meta() -> SimpleNamespace:
+    return SimpleNamespace(
+        type="disk",
+        path="",
+        use_lora=False,
+        lora_name="",
+        lora_keep_versions=0,
     )
 
 
@@ -431,21 +449,182 @@ class TestGatewayTrainControllerLifecycle:
             lambda _config: resource,
         )
 
-        rollout = RolloutControllerV2.__new__(RolloutControllerV2)
-        rollout._init_future = None
-        rollout._inf_addrs = ["http://inference-worker"]
         controller = _make_controller()
-        meta = SimpleNamespace(
-            type="disk",
-            path="",
-            use_lora=False,
-            lora_name="",
-            lora_keep_versions=0,
-        )
 
         with pytest.raises(RuntimeError, match="connect failed"):
-            controller.connect_engine(rollout, meta)
+            controller.connect_engine(_make_rollout(), _disk_meta())
 
         assert resource.initialized is True
         assert resource.destroyed is True
+        assert controller._weight_update_ctrl is None
+
+    @pytest.mark.parametrize(
+        "cleanup_error",
+        [
+            pytest.param(RuntimeError("cleanup failed"), id="runtime-error"),
+            pytest.param(
+                KeyboardInterrupt("cleanup interrupted"), id="keyboard-interrupt"
+            ),
+        ],
+    )
+    def test_connect_engine_preserves_primary_error_and_failed_cleanup_owner(
+        self, monkeypatch, cleanup_error
+    ):
+        from areal.v2.weight_update.controller import controller as wu_module
+
+        primary_error = RuntimeError("connect failed")
+
+        class FailingWeightUpdateController:
+            def initialize(self):
+                return None
+
+            def connect(self, **_kwargs):
+                raise primary_error
+
+            def destroy(self):
+                raise cleanup_error
+
+        resource = FailingWeightUpdateController()
+        monkeypatch.setattr(
+            wu_module,
+            "WeightUpdateController",
+            lambda _config: resource,
+        )
+        controller = _make_controller()
+
+        observed_error: BaseException | None = None
+        try:
+            controller.connect_engine(_make_rollout(), _disk_meta())
+        except BaseException as exc:
+            observed_error = exc
+
+        assert observed_error is primary_error
+        assert any(
+            type(cleanup_error).__name__ in note
+            for note in getattr(primary_error, "__notes__", [])
+        )
+        assert controller._weight_update_ctrl is resource
+
+    def test_connect_engine_rejects_replacing_existing_owner(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as wu_module
+
+        class ConnectedWeightUpdateController:
+            def initialize(self):
+                return None
+
+            def connect(self, **_kwargs):
+                return None
+
+            def destroy(self):
+                return None
+
+        resources: list[ConnectedWeightUpdateController] = []
+
+        def create_resource(_config):
+            resource = ConnectedWeightUpdateController()
+            resources.append(resource)
+            return resource
+
+        monkeypatch.setattr(wu_module, "WeightUpdateController", create_resource)
+        controller = _make_controller()
+        rollout = _make_rollout()
+        meta = _disk_meta()
+
+        controller.connect_engine(rollout, meta)
+
+        with pytest.raises(RuntimeError, match="already connected"):
+            controller.connect_engine(rollout, meta)
+
+        assert len(resources) == 1
+        assert controller._weight_update_ctrl is resources[0]
+
+    def test_connect_engine_rejects_after_destroy_returns(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as wu_module
+
+        resources_created = 0
+
+        def create_resource(_config):
+            nonlocal resources_created
+            resources_created += 1
+            return MagicMock()
+
+        monkeypatch.setattr(wu_module, "WeightUpdateController", create_resource)
+        controller = _make_controller()
+
+        controller.destroy()
+
+        with pytest.raises(RuntimeError, match="shutdown was requested"):
+            controller.connect_engine(_make_rollout(), _disk_meta())
+
+        assert resources_created == 0
+        assert controller._weight_update_ctrl is None
+
+    def test_destroy_cannot_return_before_inflight_connect_is_owned(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as wu_module
+
+        connect_entered = threading.Event()
+        allow_connect = threading.Event()
+        worker_cleanup_entered = threading.Event()
+
+        class BlockingWeightUpdateController:
+            def __init__(self):
+                self.destroy_count = 0
+
+            def initialize(self):
+                return None
+
+            def connect(self, **_kwargs):
+                connect_entered.set()
+                if not allow_connect.wait(timeout=2.0):
+                    raise TimeoutError("test did not release connect")
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        resource = BlockingWeightUpdateController()
+        monkeypatch.setattr(
+            wu_module,
+            "WeightUpdateController",
+            lambda _config: resource,
+        )
+        scheduler = MagicMock()
+        scheduler.delete_workers.side_effect = (
+            lambda **_kwargs: worker_cleanup_entered.set()
+        )
+        controller = _make_controller(scheduler)
+        controller._service_roles = ["actor"]
+        rollout = _make_rollout()
+        meta = _disk_meta()
+        connect_errors: list[BaseException] = []
+        destroy_errors: list[BaseException] = []
+
+        def connect() -> None:
+            try:
+                controller.connect_engine(rollout, meta)
+            except BaseException as exc:
+                connect_errors.append(exc)
+
+        def destroy() -> None:
+            try:
+                controller.destroy()
+            except BaseException as exc:
+                destroy_errors.append(exc)
+
+        connect_thread = threading.Thread(target=connect)
+        destroy_thread = threading.Thread(target=destroy)
+        connect_thread.start()
+        assert connect_entered.wait(timeout=1.0)
+        destroy_thread.start()
+        assert controller._shutdown_requested.wait(timeout=1.0)
+        destroy_advanced_past_wu = worker_cleanup_entered.wait(timeout=0.2)
+        allow_connect.set()
+        connect_thread.join(timeout=2.0)
+        destroy_thread.join(timeout=2.0)
+
+        assert not destroy_advanced_past_wu
+        assert not connect_thread.is_alive()
+        assert not destroy_thread.is_alive()
+        assert connect_errors == []
+        assert destroy_errors == []
+        assert resource.destroy_count == 1
         assert controller._weight_update_ctrl is None

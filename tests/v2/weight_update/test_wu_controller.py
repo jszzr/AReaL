@@ -4,6 +4,7 @@ from __future__ import annotations
 import select
 import subprocess
 import sys
+import threading
 from unittest.mock import MagicMock
 
 import httpx
@@ -69,6 +70,23 @@ class _ScriptedGatewayProcess:
         self.kill_count += 1
         if self.kill_error is not None:
             raise self.kill_error
+
+
+class _NeverReturningGatewayProcess:
+    def __init__(self) -> None:
+        self.pid = 12345
+        self.wait_timeouts: list[float | None] = []
+        self.kill_count = 0
+        self.release_unbounded_wait = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeouts.append(timeout)
+        if timeout is None:
+            self.release_unbounded_wait.wait()
+        raise subprocess.TimeoutExpired(cmd="gateway", timeout=timeout)
+
+    def kill(self) -> None:
+        self.kill_count += 1
 
 
 @pytest.fixture()
@@ -316,6 +334,84 @@ class TestLifecycle:
             finally:
                 _force_reap_process(process)
 
+    def test_initialize_preserves_primary_error_when_bounded_rollback_times_out(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        primary_error = RuntimeError("health check failed")
+        process = _ScriptedGatewayProcess(
+            [
+                subprocess.TimeoutExpired(cmd="gateway", timeout=1),
+                subprocess.TimeoutExpired(cmd="gateway", timeout=1),
+                -9,
+            ]
+        )
+        controller = WeightUpdateController()
+        monkeypatch.setattr(
+            controller_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+        monkeypatch.setattr(
+            controller, "_wait_for_health", MagicMock(side_effect=primary_error)
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            controller.initialize()
+
+        assert exc_info.value is primary_error
+        assert any(
+            "TimeoutExpired" in note
+            for note in getattr(exc_info.value, "__notes__", [])
+        )
+        assert process.wait_timeouts == [1, 1]
+        assert controller._gateway_proc is process
+
+        controller.destroy()
+
+        assert process.wait_timeouts == [1, 1, 1]
+        assert controller._gateway_proc is None
+
+    def test_initialize_preserves_primary_and_retries_rollback_session(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        primary_error = RuntimeError("health check failed")
+        session_error = RuntimeError("session close failed")
+        session = MagicMock(spec=httpx.Client)
+        session.close.side_effect = [session_error, None]
+        process = _ScriptedGatewayProcess([0])
+        controller = WeightUpdateController()
+        monkeypatch.setattr(
+            controller_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+        monkeypatch.setattr(controller_module.httpx, "Client", lambda: session)
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+        monkeypatch.setattr(
+            controller, "_wait_for_health", MagicMock(side_effect=primary_error)
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            controller.initialize()
+
+        assert exc_info.value is primary_error
+        assert any(
+            "session close failed" in note
+            for note in getattr(primary_error, "__notes__", [])
+        )
+        assert controller._session is session
+        assert controller._gateway_proc is None
+
+        controller.destroy()
+
+        assert controller._session is None
+        assert session.close.call_count == 2
+
     def test_destroy_reaps_gateway_and_releases_inherited_output(self):
         controller = WeightUpdateController()
         process = _spawn_gateway_with_inherited_stdout()
@@ -346,25 +442,47 @@ class TestLifecycle:
         finally:
             _force_reap_process(process)
 
-    def test_destroy_reaps_gateway_when_http_session_close_fails(self):
+    @pytest.mark.parametrize(
+        "session_error",
+        [
+            pytest.param(RuntimeError("session close failed"), id="runtime-error"),
+            pytest.param(
+                KeyboardInterrupt("session close interrupted"),
+                id="keyboard-interrupt",
+            ),
+        ],
+    )
+    def test_destroy_retries_http_session_close_after_reaping_gateway(
+        self, session_error
+    ):
         controller = WeightUpdateController()
         session = MagicMock(spec=httpx.Client)
-        session.close.side_effect = RuntimeError("session close failed")
+        session.close.side_effect = [session_error, None]
         process = _spawn_gateway_with_inherited_stdout()
         controller._session = session
         controller._gateway_proc = process
 
         try:
-            controller.destroy()
+            observed_error: BaseException | None = None
+            try:
+                controller.destroy()
+            except BaseException as exc:
+                observed_error = exc
 
+            assert observed_error is session_error
             assert process.returncode is not None
-            assert controller._session is None
+            assert controller._session is session
             assert controller._gateway_proc is None
             session.close.assert_called_once_with()
+
+            controller.destroy()
+
+            assert controller._session is None
+            assert session.close.call_count == 2
         finally:
             _force_reap_process(process)
 
-    def test_destroy_uses_blocking_wait_after_kill_when_tree_cleanup_fails(
+    def test_destroy_uses_second_bounded_wait_when_tree_cleanup_fails(
         self, monkeypatch
     ):
         from areal.v2.weight_update.controller import controller as controller_module
@@ -386,7 +504,7 @@ class TestLifecycle:
         controller.destroy()
 
         assert tree_cleanup_attempted is True
-        assert process.wait_timeouts == [1, None]
+        assert process.wait_timeouts == [1, 1]
         assert process.kill_count == 1
         assert controller._gateway_proc is None
 
@@ -403,7 +521,7 @@ class TestLifecycle:
 
         controller.destroy()
 
-        assert process.wait_timeouts == [1, None]
+        assert process.wait_timeouts == [1, 1]
         assert process.kill_count == 1
         assert controller._gateway_proc is None
 
@@ -430,9 +548,42 @@ class TestLifecycle:
 
         controller.destroy()
 
-        assert process.wait_timeouts == [1, None, 1]
+        assert process.wait_timeouts == [1, 1, 1]
         assert process.kill_count == 1
         assert controller._gateway_proc is None
+
+    def test_destroy_is_bounded_when_gateway_never_exits(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        process = _NeverReturningGatewayProcess()
+        controller = WeightUpdateController()
+        controller._gateway_proc = process
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+        errors: list[BaseException] = []
+        finished = threading.Event()
+
+        def destroy_controller() -> None:
+            try:
+                controller.destroy()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=destroy_controller, daemon=True)
+        thread.start()
+        completed_within_bound = finished.wait(timeout=0.5)
+        if not completed_within_bound:
+            process.release_unbounded_wait.set()
+        thread.join(timeout=1.0)
+
+        assert completed_within_bound, "destroy entered an unbounded final wait"
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], subprocess.TimeoutExpired)
+        assert process.wait_timeouts == [1, 1]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is process
 
     def test_full_lifecycle(self, ctrl):
         connect_resp = _mock_response(200, {"pair_name": "pair0"})
