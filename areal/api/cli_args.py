@@ -3195,15 +3195,51 @@ class PPOConfig(BaseExperimentConfig):
     )
 
     def __post_init__(self):
-        """Validate the eval generation config."""
+        """Validate generation and rollout configuration before startup."""
+        if self.actor.use_lora != self.rollout.use_lora:
+            raise ValueError(
+                "actor.use_lora and rollout.use_lora must match; "
+                f"got actor.use_lora={self.actor.use_lora} and "
+                f"rollout.use_lora={self.rollout.use_lora}."
+            )
+
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+
         # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
         # generation path requests the same adapter the trainer loads. The request
         # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from
         # the engine config. Single source of truth: gconfig.lora_name.
-        if self.rollout.use_lora and not self.rollout.lora_name:
-            self.rollout.lora_name = self.gconfig.lora_name
+        if self.rollout.use_lora:
+            lora_name = self.gconfig.lora_name
+            if not isinstance(lora_name, str) or not lora_name.strip():
+                raise ValueError(
+                    "gconfig.lora_name must be a non-empty string when LoRA is enabled."
+                )
+
+            if not self.rollout.lora_name:
+                self.rollout.lora_name = lora_name
+            elif self.rollout.lora_name != lora_name:
+                raise ValueError(
+                    "rollout.lora_name must match gconfig.lora_name when LoRA is "
+                    f"enabled; got {self.rollout.lora_name!r} and {lora_name!r}."
+                )
+
+            if self.eval_gconfig.lora_name != lora_name:
+                raise ValueError(
+                    "eval_gconfig.lora_name must match gconfig.lora_name when LoRA "
+                    f"is enabled; got {self.eval_gconfig.lora_name!r} and "
+                    f"{lora_name!r}."
+                )
+
+            rollout_backend = self.rollout.backend.split(":", maxsplit=1)[0]
+            if self.rollout._version == "v2" and rollout_backend == "vllm":
+                raise ValueError(
+                    "vLLM rollout LoRA is not supported with controller v2 because "
+                    "the v2 weight gateway only implements SGLang LoRA load/unload "
+                    "endpoints. Use an SGLang rollout backend or disable LoRA."
+                )
+
         super().__post_init__()
 
 

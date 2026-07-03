@@ -507,7 +507,8 @@ class TestInfBridge:
 
 class TestVLLMBridgeBackend:
     @pytest.mark.asyncio
-    async def test_vllm_lora_requests_select_current_version(self):
+    async def test_vllm_backend_selector_encodes_current_lora_version(self):
+        """Unit-test selector encoding, not v2 gateway LoRA loading support."""
         payloads: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
