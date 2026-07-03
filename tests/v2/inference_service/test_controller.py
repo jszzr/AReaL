@@ -1878,6 +1878,8 @@ class TestInferenceServiceWorkflow:
     @pytest.mark.asyncio
     async def test_online_mode_records_reward_with_expected_policy_version(self):
         controller = MagicMock()
+        controller.reserve_online_trajectory.return_value = ("lease-1", 7)
+        controller.external_mode = False
         controller.wait_for_online_trajectory = AsyncMock(
             return_value={"session_id": "session-1", "trajectory_id": 3}
         )
@@ -1887,6 +1889,8 @@ class TestInferenceServiceWorkflow:
             expected_policy_version=7,
         )
         traj = self._versioned_rtensor_trajectory(7)
+        workflow._grant_online_lease = AsyncMock()
+        workflow._cancel_online_lease = AsyncMock()
         workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
         to_thread = AsyncMock(side_effect=lambda fn, *args: fn(*args))
@@ -1919,6 +1923,8 @@ class TestInferenceServiceWorkflow:
     @pytest.mark.asyncio
     async def test_online_mode_rejects_version_before_recording_metrics(self):
         controller = MagicMock()
+        controller.reserve_online_trajectory.return_value = ("lease-1", 7)
+        controller.external_mode = False
         controller.wait_for_online_trajectory = AsyncMock(
             return_value={"session_id": "session-1", "trajectory_id": 3}
         )
@@ -1928,6 +1934,8 @@ class TestInferenceServiceWorkflow:
             expected_policy_version=7,
         )
         traj = self._versioned_rtensor_trajectory(6)
+        workflow._grant_online_lease = AsyncMock()
+        workflow._cancel_online_lease = AsyncMock()
         workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
         clear_node = AsyncMock()
@@ -1956,6 +1964,8 @@ class TestInferenceServiceWorkflow:
     @pytest.mark.asyncio
     async def test_online_mode_clears_exported_trajectory_when_reward_is_missing(self):
         controller = MagicMock()
+        controller.reserve_online_trajectory.return_value = ("lease-1", 7)
+        controller.external_mode = False
         controller.wait_for_online_trajectory = AsyncMock(
             return_value={"session_id": "session-1", "trajectory_id": 3}
         )
@@ -1969,8 +1979,12 @@ class TestInferenceServiceWorkflow:
                     shard_id="input-ids", node_addr="storage.test:9999"
                 ),
                 data=torch.tensor([1, 2], dtype=torch.int64),
-            )
+            ),
+            "versions": torch.tensor([7, 7], dtype=torch.int32),
+            "loss_mask": torch.tensor([1, 1], dtype=torch.int32),
         }
+        workflow._grant_online_lease = AsyncMock()
+        workflow._cancel_online_lease = AsyncMock()
         workflow._export_interactions = AsyncMock(return_value=traj)
         clear_node = AsyncMock()
 
@@ -1986,6 +2000,8 @@ class TestInferenceServiceWorkflow:
     @pytest.mark.asyncio
     async def test_online_mode_without_expectation_accepts_missing_versions(self):
         controller = MagicMock()
+        controller.reserve_online_trajectory.return_value = ("lease-1", 7)
+        controller.external_mode = True
         controller.wait_for_online_trajectory = AsyncMock(
             return_value={"session_id": "session-1", "trajectory_id": 3}
         )
@@ -1994,6 +2010,8 @@ class TestInferenceServiceWorkflow:
             gateway_addr="http://test:8080",
             expected_policy_version=None,
         )
+        workflow._grant_online_lease = AsyncMock()
+        workflow._cancel_online_lease = AsyncMock()
         workflow._export_interactions = AsyncMock(
             return_value={"rewards": torch.tensor([0.0, 1.25])}
         )
