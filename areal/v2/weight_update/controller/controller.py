@@ -73,8 +73,18 @@ class WeightUpdateController:
             self._session = httpx.Client()
             self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
             self._wait_for_health()
-        except BaseException:
-            self.destroy()
+        except BaseException as primary_error:
+            try:
+                self.destroy()
+            except BaseException as cleanup_error:
+                logger.warning(
+                    "Failed to roll back WeightUpdateController initialization",
+                    exc_info=True,
+                )
+                primary_error.add_note(
+                    "WeightUpdateController rollback also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
         logger.info("Gateway ready at %s", self._gateway_url)
 
@@ -218,7 +228,6 @@ class WeightUpdateController:
                 logger.warning("Failed to close gateway HTTP session", exc_info=True)
 
         gateway_proc = self._gateway_proc
-        self._gateway_proc = None
         if gateway_proc is not None:
             try:
                 kill_process_tree(gateway_proc.pid)
@@ -230,7 +239,13 @@ class WeightUpdateController:
                 logger.warning(
                     "Gateway process did not exit after process-tree cleanup"
                 )
-                gateway_proc.kill()
-                gateway_proc.wait(timeout=1)
+                try:
+                    gateway_proc.kill()
+                except ProcessLookupError:
+                    # The process may exit between wait() timing out and kill().
+                    pass
+                gateway_proc.wait()
+            if self._gateway_proc is gateway_proc:
+                self._gateway_proc = None
         self._gateway_url = ""
         logger.info("WeightUpdateController destroyed")

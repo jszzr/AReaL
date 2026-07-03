@@ -383,6 +383,28 @@ class TestGatewayTrainControllerLifecycle:
         assert weight_update_controller.destroy_count == 1
         assert controller._weight_update_ctrl is None
 
+    def test_destroy_continues_worker_cleanup_when_weight_update_destroy_fails(self):
+        class FailingWeightUpdateController:
+            def __init__(self):
+                self.destroy_count = 0
+
+            def destroy(self):
+                self.destroy_count += 1
+                raise RuntimeError("weight update cleanup failed")
+
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        weight_update_controller = FailingWeightUpdateController()
+        controller._weight_update_ctrl = weight_update_controller
+        controller._service_roles = ["actor"]
+
+        controller.destroy()
+
+        assert weight_update_controller.destroy_count == 1
+        scheduler.delete_workers.assert_called_once_with(role="actor")
+        assert controller._weight_update_ctrl is weight_update_controller
+        assert controller._service_roles == []
+
     def test_connect_engine_failure_releases_weight_update_controller(
         self, monkeypatch
     ):

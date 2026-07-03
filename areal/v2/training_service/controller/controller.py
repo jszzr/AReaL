@@ -1234,12 +1234,14 @@ class GatewayTrainController:
 
     def _cleanup_runtime_state(self) -> None:
         weight_update_ctrl = self._weight_update_ctrl
-        self._weight_update_ctrl = None
         if weight_update_ctrl is not None:
             try:
                 weight_update_ctrl.destroy()
             except Exception:
                 logger.error("Failed to destroy WeightUpdateController", exc_info=True)
+            else:
+                if self._weight_update_ctrl is weight_update_ctrl:
+                    self._weight_update_ctrl = None
 
         if self._router_addr and self._model_addr:
             try:

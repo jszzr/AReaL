@@ -45,6 +45,32 @@ def _force_reap_process(process: subprocess.Popen[bytes]) -> None:
         process.stdout.close()
 
 
+class _ScriptedGatewayProcess:
+    def __init__(
+        self,
+        wait_effects: list[int | BaseException],
+        *,
+        kill_error: BaseException | None = None,
+    ) -> None:
+        self.pid = 12345
+        self.wait_effects = wait_effects
+        self.kill_error = kill_error
+        self.wait_timeouts: list[float | None] = []
+        self.kill_count = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeouts.append(timeout)
+        effect = self.wait_effects.pop(0)
+        if isinstance(effect, BaseException):
+            raise effect
+        return effect
+
+    def kill(self) -> None:
+        self.kill_count += 1
+        if self.kill_error is not None:
+            raise self.kill_error
+
+
 @pytest.fixture()
 def ctrl() -> WeightUpdateController:
     c = WeightUpdateController(
@@ -249,6 +275,47 @@ class TestLifecycle:
             for process in spawned:
                 _force_reap_process(process)
 
+    def test_initialize_preserves_primary_error_when_rollback_fails(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        process = _spawn_gateway_with_inherited_stdout()
+        primary_error = RuntimeError("health check failed")
+        cleanup_error = RuntimeError("cleanup failed")
+        cleanup_attempted = False
+
+        def fail_health_check():
+            raise primary_error
+
+        def fail_cleanup():
+            nonlocal cleanup_attempted
+            cleanup_attempted = True
+            raise cleanup_error
+
+        controller = WeightUpdateController()
+        monkeypatch.setattr(
+            controller_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: process,
+        )
+        monkeypatch.setattr(controller, "_wait_for_health", fail_health_check)
+        monkeypatch.setattr(controller, "destroy", fail_cleanup)
+
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                controller.initialize()
+
+            assert cleanup_attempted is True
+            assert exc_info.value is primary_error
+            assert any(
+                "cleanup failed" in note
+                for note in getattr(exc_info.value, "__notes__", [])
+            )
+        finally:
+            try:
+                WeightUpdateController.destroy(controller)
+            finally:
+                _force_reap_process(process)
+
     def test_destroy_reaps_gateway_and_releases_inherited_output(self):
         controller = WeightUpdateController()
         process = _spawn_gateway_with_inherited_stdout()
@@ -262,6 +329,20 @@ class TestLifecycle:
             readable, _, _ = select.select([process.stdout], [], [], 1.0)
             assert readable == [process.stdout]
             assert process.stdout.read() == b""
+        finally:
+            _force_reap_process(process)
+
+    def test_destroy_is_idempotent(self):
+        controller = WeightUpdateController()
+        process = _spawn_gateway_with_inherited_stdout()
+        controller._gateway_proc = process
+
+        try:
+            controller.destroy()
+            controller.destroy()
+
+            assert process.returncode is not None
+            assert controller._gateway_proc is None
         finally:
             _force_reap_process(process)
 
@@ -279,8 +360,79 @@ class TestLifecycle:
             assert process.returncode is not None
             assert controller._session is None
             assert controller._gateway_proc is None
+            session.close.assert_called_once_with()
         finally:
             _force_reap_process(process)
+
+    def test_destroy_uses_blocking_wait_after_kill_when_tree_cleanup_fails(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        tree_cleanup_attempted = False
+
+        def fail_tree_cleanup(_pid):
+            nonlocal tree_cleanup_attempted
+            tree_cleanup_attempted = True
+            raise RuntimeError("tree cleanup failed")
+
+        process = _ScriptedGatewayProcess(
+            [subprocess.TimeoutExpired(cmd="gateway", timeout=1), -9]
+        )
+        controller = WeightUpdateController()
+        controller._gateway_proc = process
+        monkeypatch.setattr(controller_module, "kill_process_tree", fail_tree_cleanup)
+
+        controller.destroy()
+
+        assert tree_cleanup_attempted is True
+        assert process.wait_timeouts == [1, None]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is None
+
+    def test_destroy_waits_after_process_exits_before_kill(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        process = _ScriptedGatewayProcess(
+            [subprocess.TimeoutExpired(cmd="gateway", timeout=1), -9],
+            kill_error=ProcessLookupError(),
+        )
+        controller = WeightUpdateController()
+        controller._gateway_proc = process
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+
+        controller.destroy()
+
+        assert process.wait_timeouts == [1, None]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is None
+
+    def test_destroy_retains_gateway_owner_when_final_wait_fails(self, monkeypatch):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        wait_error = OSError("wait failed")
+        process = _ScriptedGatewayProcess(
+            [
+                subprocess.TimeoutExpired(cmd="gateway", timeout=1),
+                wait_error,
+                -9,
+            ]
+        )
+        controller = WeightUpdateController()
+        controller._gateway_proc = process
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+
+        with pytest.raises(OSError, match="wait failed") as exc_info:
+            controller.destroy()
+
+        assert exc_info.value is wait_error
+        assert controller._gateway_proc is process
+
+        controller.destroy()
+
+        assert process.wait_timeouts == [1, None, 1]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is None
 
     def test_full_lifecycle(self, ctrl):
         connect_resp = _mock_response(200, {"pair_name": "pair0"})
