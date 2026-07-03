@@ -242,6 +242,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session_ids: list[str],
         group_id: str | None = None,
         trajectory_id: int | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._export_interactions_once(
             session,
@@ -249,6 +250,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             request_id=str(uuid.uuid4()),
             group_id=group_id,
             trajectory_id=trajectory_id,
+            lease_id=lease_id,
         )
 
     @async_http_retry
@@ -259,6 +261,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         request_id: str,
         group_id: str | None = None,
         trajectory_id: int | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -271,6 +274,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "style": self.export_style,
             "remove_session": True,
         }
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
         async with session.post(url, json=payload, headers=headers) as resp:
             await _raise_for_status_without_retrying_client_errors(
                 resp, "export trajectories"
@@ -432,6 +437,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 [export_request["session_id"]],
                 group_id=export_request.get("group_id"),
                 trajectory_id=export_request["trajectory_id"],
+                lease_id=lease_id,
             )
             if not traj:
                 return None

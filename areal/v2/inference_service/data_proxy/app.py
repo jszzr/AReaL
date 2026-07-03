@@ -34,7 +34,10 @@ from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
     CancelSessionsRequest,
+    ExportReplayCapacityError,
     ExportReplayConflictError,
+    ExportReplayExpiredError,
+    ExportReplayResultTooLargeError,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     ReadyNotification,
@@ -377,6 +380,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         app.state.config = config
         app.state.session_store = SessionStore(
             set_reward_finish_timeout=config.set_reward_finish_timeout,
+            max_export_replay_records=config.max_export_replay_records,
+            export_replay_ttl_seconds=config.export_replay_ttl_seconds,
+            max_export_replay_result_bytes=config.max_export_replay_result_bytes,
+            max_export_replay_total_bytes=config.max_export_replay_total_bytes,
         )
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
@@ -885,59 +892,144 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         request_fingerprint = body.replay_fingerprint()
-        async with export_lock:
+        try:
+            reservation = store.reserve_export_replay(
+                body.request_id, request_fingerprint
+            )
+        except ExportReplayConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ExportReplayExpiredError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        except ExportReplayCapacityError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not reservation.is_owner:
+            if reservation.payload is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Export request_id {body.request_id} is still pending",
+                )
+            return ExportTrajectoriesResponse(traj=reservation.payload)
+
+        try:
+            await export_lock.acquire()
+        except BaseException:
+            store.release_export_replay(body.request_id, request_fingerprint)
+            raise
+        try:
             try:
-                cached = store.get_export_replay(body.request_id, request_fingerprint)
-            except ExportReplayConflictError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if cached is not None:
-                return ExportTrajectoriesResponse(traj=cached)
-
-            merged: dict[str, InteractionWithTokenLogpReward] = {}
-            prepared: list[tuple[SessionData, int]] = []
-
-            for sid in body.session_ids:
-                session = store.get_session(sid)
-                if session is None:
-                    continue
-
-                try:
-                    prepared_id, interactions = session.prepare_trajectory_export(
-                        discount=body.discount,
-                        style=body.style,
-                        trajectory_id=body.trajectory_id,
+                if len(set(body.session_ids)) != len(body.session_ids):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="session_ids must contain unique values",
                     )
+
+                sessions: list[SessionData] = []
+                missing_session_ids: list[str] = []
+                for sid in body.session_ids:
+                    session = store.get_session(sid)
+                    if session is None:
+                        missing_session_ids.append(sid)
+                    else:
+                        sessions.append(session)
+                if missing_session_ids:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            "Export sessions not found: "
+                            + ", ".join(missing_session_ids)
+                        ),
+                    )
+
+                session_group_ids = {session.group_id for session in sessions}
+                if len(session_group_ids) != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="All export sessions must belong to the same group",
+                    )
+                actual_group_id = next(iter(session_group_ids))
+                if body.group_id is not None and body.group_id != actual_group_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"group_id {body.group_id} does not own the requested "
+                            "sessions"
+                        ),
+                    )
+                if body.remove_session and body.group_id is not None:
+                    group_members = store.session_ids_for_group(body.group_id)
+                    if set(body.session_ids) != group_members:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Destructive group export must include every session "
+                                f"owned by group_id {body.group_id}"
+                            ),
+                        )
+
+                session_lease_ids = {session.lease_id for session in sessions}
+                if len(session_lease_ids) != 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="All export sessions must belong to the same lease",
+                    )
+                actual_lease_id = next(iter(session_lease_ids))
+                if body.lease_id != actual_lease_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"lease_id {body.lease_id} does not own the requested "
+                            "sessions"
+                        ),
+                    )
+
+                merged: dict[str, InteractionWithTokenLogpReward] = {}
+                prepared: list[tuple[SessionData, int]] = []
+                for session in sessions:
+                    try:
+                        prepared_id, interactions = session.prepare_trajectory_export(
+                            discount=body.discount,
+                            style=body.style,
+                            trajectory_id=body.trajectory_id,
+                        )
+                    except KeyError as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Session {session.session_id} is not ready: {exc}",
+                        ) from exc
                     prepared.append((session, prepared_id))
                     merged.update(interactions)
-                except KeyError:
-                    continue
 
-            if all(v.has_tensor_data for v in merged.values()):
-                traj = concat_padded_tensors(
-                    [v.to_tensor_dict() for v in merged.values()]
-                )
-                traj = RTensor.remotize(traj, node_addr=config.serving_addr)
-            else:
-                traj = concat_string_interactions(merged)
+                if all(v.has_tensor_data for v in merged.values()):
+                    traj = concat_padded_tensors(
+                        [v.to_tensor_dict() for v in merged.values()]
+                    )
+                    traj = RTensor.remotize(traj, node_addr=config.serving_addr)
+                else:
+                    traj = concat_string_interactions(merged)
 
-            serialized = serialize_value(traj)
-            try:
-                replayable = store.record_export_replay(
-                    body.request_id,
-                    request_fingerprint,
-                    serialized,
-                )
-            except ExportReplayConflictError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                serialized = serialize_value(traj)
+                try:
+                    replayable = store.finish_export_replay(
+                        body.request_id,
+                        request_fingerprint,
+                        serialized,
+                    )
+                except ExportReplayResultTooLargeError as exc:
+                    raise HTTPException(status_code=507, detail=str(exc)) from exc
 
-            for session, prepared_id in prepared:
-                session.commit_trajectory_export(prepared_id)
+                for session, prepared_id in prepared:
+                    session.commit_trajectory_export(prepared_id)
 
-            if body.remove_session:
-                for sid in body.session_ids:
-                    store.remove_session(sid)
-                await _close_admissions_for_sessions(set(body.session_ids))
-            return ExportTrajectoriesResponse(traj=replayable)
+                if body.remove_session:
+                    for sid in body.session_ids:
+                        store.remove_session(sid)
+                    await _close_admissions_for_sessions(set(body.session_ids))
+                return ExportTrajectoriesResponse(traj=replayable)
+            except BaseException:
+                store.release_export_replay(body.request_id, request_fingerprint)
+                raise
+        finally:
+            export_lock.release()
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

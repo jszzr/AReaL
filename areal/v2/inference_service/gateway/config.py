@@ -23,4 +23,8 @@ class GatewayConfig:
     forward_timeout: float = 120.0  # seconds for forwarding to data proxy
     max_pending_request_owners: int = 4096
     max_pending_export_cleanups: int = 4096
+    max_request_replay_records: int = 4096
+    request_replay_ttl_seconds: float = 300.0
+    max_request_replay_result_bytes: int = 16 * 1024 * 1024
+    max_request_replay_total_bytes: int = 64 * 1024 * 1024
     log_level: str = "warning"

@@ -509,8 +509,8 @@ class TestDataProxyExternalEndpoints:
             },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert not_ready.status_code == 200
-        assert not_ready.json()["traj"] == {}
+        assert not_ready.status_code == 409
+        assert "not ready" in not_ready.json()["detail"]
 
         set_reward = await data_proxy_client.post(
             "/rl/set_reward",
@@ -620,8 +620,8 @@ class TestDataProxyExternalEndpoints:
             },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert exported_again.status_code == 200
-        assert exported_again.json()["traj"] == {}
+        assert exported_again.status_code == 404
+        assert "__hitl__" in exported_again.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_unregistered_model_falls_through_to_internal(

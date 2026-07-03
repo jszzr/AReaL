@@ -27,6 +27,8 @@ from areal.v2.inference_service.gateway.admission import (
     OnlineLeaseCapacityError,
     OnlineLeaseRegistry,
     ReplayableHTTPResult,
+    RequestReplayCapacityError,
+    RequestReplayExpiredError,
     RequestReplayRegistry,
     RequestWorkerBinding,
     RequestWorkerOwnership,
@@ -112,8 +114,14 @@ def create_app(config: GatewayConfig) -> FastAPI:
     if config.max_pending_request_owners < 1:
         raise ValueError("max_pending_request_owners must be >= 1")
     online_lease_registry = OnlineLeaseRegistry()
-    start_request_registry = RequestReplayRegistry()
-    export_request_registry = RequestReplayRegistry()
+    replay_registry_options = {
+        "max_records": config.max_request_replay_records,
+        "retry_ttl_seconds": config.request_replay_ttl_seconds,
+        "max_result_bytes": config.max_request_replay_result_bytes,
+        "max_total_result_bytes": config.max_request_replay_total_bytes,
+    }
+    start_request_registry = RequestReplayRegistry(**replay_registry_options)
+    export_request_registry = RequestReplayRegistry(**replay_registry_options)
     pending_export_group_cleanups: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     reserved_export_group_cleanups: set[str] = set()
     export_group_cleanup_lock = asyncio.Lock()
@@ -805,6 +813,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
             reservation = await start_request_registry.reserve(
                 resolved_request_id, fingerprint
             )
+        except RequestReplayExpiredError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=410)
+        except RequestReplayCapacityError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
         if not reservation.is_owner:
@@ -812,6 +824,8 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 cached = await start_request_registry.wait(
                     reservation, timeout=config.forward_timeout
                 )
+            except RequestReplayExpiredError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=410)
             except TimeoutError:
                 return JSONResponse(
                     {"error": f"Start request {resolved_request_id} is still pending"},
@@ -823,21 +837,47 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 media_type=cached.media_type,
             )
 
-        async def _finish(result: ReplayableHTTPResult) -> Response:
-            await start_request_registry.finish(resolved_request_id, result)
+        start_replay_settled = False
+
+        async def _finish(
+            result: ReplayableHTTPResult,
+            *,
+            forget_binding: RequestWorkerBinding | None = None,
+        ) -> Response:
+            """Commit replay before releasing worker ownership, despite cancel."""
+
+            async def _critical_finalize() -> None:
+                nonlocal start_replay_settled
+                await start_request_registry.finish(resolved_request_id, result)
+                # Once the replay result (or an explicit expired fence) exists,
+                # cancellation must not compensate a successfully registered
+                # session. Mark that linearization point before the non-safety-
+                # critical ownership bookkeeping that follows.
+                start_replay_settled = True
+                if forget_binding is not None:
+                    await _forget_start_worker(resolved_request_id, forget_binding)
+
+            finalize_task = asyncio.create_task(_critical_finalize())
+            await _await_critical_task(finalize_task, "Start replay settlement")
             return Response(
                 content=result.content,
                 status_code=result.status_code,
                 media_type=result.media_type,
             )
 
-        async def _finish_json(payload: dict, status_code: int) -> Response:
+        async def _finish_json(
+            payload: dict,
+            status_code: int,
+            *,
+            forget_binding: RequestWorkerBinding | None = None,
+        ) -> Response:
             return await _finish(
                 ReplayableHTTPResult(
                     status_code=status_code,
                     content=json.dumps(payload).encode(),
                     media_type="application/json",
-                )
+                ),
+                forget_binding=forget_binding,
             )
 
         async def _release_json(payload: dict, status_code: int) -> Response:
@@ -849,9 +889,15 @@ def create_app(config: GatewayConfig) -> FastAPI:
             return await _release(result)
 
         async def _release(result: ReplayableHTTPResult) -> Response:
-            await start_request_registry.release_pending(
-                resolved_request_id, fingerprint, result
-            )
+            async def _critical_release() -> None:
+                nonlocal start_replay_settled
+                await start_request_registry.release_pending(
+                    resolved_request_id, fingerprint, result
+                )
+                start_replay_settled = True
+
+            release_task = asyncio.create_task(_critical_release())
+            await _await_critical_task(release_task, "Start replay release")
             return Response(
                 content=result.content,
                 status_code=result.status_code,
@@ -897,7 +943,17 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         downstream_admission_id = resolved_request_id
         if delivery_mode == "callback":
-            lease = await online_lease_registry.try_acquire()
+            try:
+                lease = await online_lease_registry.try_acquire()
+            except asyncio.CancelledError:
+                await _release(
+                    ReplayableHTTPResult(
+                        status_code=503,
+                        content=b'{"error":"start owner cancelled; retry"}',
+                        media_type="application/json",
+                    )
+                )
+                raise
             if lease is None:
                 no_capacity = ReplayableHTTPResult(
                     status_code=429,
@@ -906,14 +962,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     ).encode(),
                     media_type="application/json",
                 )
-                await start_request_registry.release_pending(
-                    resolved_request_id, fingerprint, no_capacity
-                )
-                return Response(
-                    content=no_capacity.content,
-                    status_code=no_capacity.status_code,
-                    media_type=no_capacity.media_type,
-                )
+                return await _release(no_capacity)
             downstream_admission_id = lease.lease_id
             body_json.update(
                 {
@@ -1055,7 +1104,6 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         group_id: str | None = None
         sessions: list[dict[str, str]] = []
-        start_success_settled = False
         if resp.status_code == 201:
             try:
                 resp_data = resp.json()
@@ -1088,14 +1136,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 )
 
                 async def _finalize_registered_start() -> Response:
-                    nonlocal start_success_settled
-                    if lease is None:
-                        assert start_worker_binding is not None
-                        response = await _finish_json(resp_data, 201)
-                        await _forget_start_worker(
-                            resolved_request_id, start_worker_binding
-                        )
-                    else:
+                    if lease is not None:
                         (
                             active,
                             deferred_binding,
@@ -1117,16 +1158,22 @@ def create_app(config: GatewayConfig) -> FastAPI:
                                 status_code,
                             )
                         else:
-                            response = await _finish_json(resp_data, 201)
-                    start_success_settled = True
-                    return response
+                            return await _finish_json(resp_data, 201)
+                        return response
+
+                    assert start_worker_binding is not None
+                    return await _finish_json(
+                        resp_data,
+                        201,
+                        forget_binding=start_worker_binding,
+                    )
 
                 return await _await_critical_task(
                     asyncio.create_task(_finalize_registered_start()),
                     "Registered start settlement",
                 )
             except asyncio.CancelledError:
-                if start_success_settled:
+                if start_replay_settled:
                     raise
                 cancelled_binding = OnlineLeaseBinding(
                     admission_id=downstream_admission_id,
@@ -1160,14 +1207,12 @@ def create_app(config: GatewayConfig) -> FastAPI:
                             start_worker_binding,
                             cancelled_binding,
                         )
-                    await start_request_registry.release_pending(
-                        resolved_request_id,
-                        fingerprint,
+                    await _release(
                         ReplayableHTTPResult(
                             status_code=503,
                             content=b'{"error":"start_session owner cancelled; retry"}',
                             media_type="application/json",
-                        ),
+                        )
                     )
 
                 compensation_task = asyncio.create_task(_compensate_cancelled_start())
@@ -1273,16 +1318,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         if result.status_code >= 500:
             return await _release(result)
         assert start_worker_binding is not None
-
-        async def _finalize_terminal_pull_start() -> Response:
-            response = await _finish(result)
-            await _forget_start_worker(resolved_request_id, start_worker_binding)
-            return response
-
-        return await _await_critical_task(
-            asyncio.create_task(_finalize_terminal_pull_start()),
-            "Terminal pull start settlement",
-        )
+        return await _finish(result, forget_binding=start_worker_binding)
 
     # =========================================================================
     # POST /rl/set_reward — session key or admin key (HITL)
@@ -1448,9 +1484,23 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         session_ids: list[str] = body_json.get("session_ids") or []
         group_id: str | None = body_json.get("group_id")
+        lease_id: str | None = body_json.get("lease_id")
+        remove_session = body_json.get("remove_session", True)
 
         if not session_ids:
             return JSONResponse({"error": "session_ids is required"}, status_code=400)
+        if lease_id is not None and (
+            not isinstance(lease_id, str) or not lease_id.strip()
+        ):
+            return JSONResponse(
+                {"error": "lease_id must be a non-empty string when provided"},
+                status_code=422,
+            )
+        if not isinstance(remove_session, bool):
+            return JSONResponse(
+                {"error": "remove_session must be a boolean"}, status_code=422
+            )
+        destructive_group_cleanup = group_id is not None and remove_session
 
         request_id = body_json.get("request_id")
         if (
@@ -1472,6 +1522,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
         )
         try:
             reservation = await export_request_registry.reserve(request_id, fingerprint)
+        except RequestReplayExpiredError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=410)
+        except RequestReplayCapacityError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
         if not reservation.is_owner:
@@ -1479,12 +1533,42 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 cached = await export_request_registry.wait(
                     reservation, timeout=config.forward_timeout
                 )
+            except RequestReplayExpiredError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=410)
             except TimeoutError:
                 return JSONResponse(
                     {"error": f"Export request {request_id} is still pending"},
                     status_code=504,
                 )
-            if group_id is not None:
+            if cached.replay_worker_addr is not None:
+                if cached.replay_worker_id is None:  # pragma: no cover - invariant
+                    return JSONResponse(
+                        {"error": "Export replay marker has no worker incarnation"},
+                        status_code=500,
+                    )
+                replay_headers = _forwarding_headers(dict(request.headers))
+                replay_headers[WORKER_ID_HEADER] = cached.replay_worker_id
+                try:
+                    replay_response = await forward_request(
+                        f"{cached.replay_worker_addr}/export_trajectories",
+                        body,
+                        replay_headers,
+                        config.forward_timeout,
+                        client=_client(),
+                    )
+                except Exception as exc:
+                    return JSONResponse(
+                        {"error": f"Data proxy export replay failed: {exc}"},
+                        status_code=502,
+                    )
+                if destructive_group_cleanup:
+                    await _retry_export_group_cleanup_if_pending(group_id)
+                return Response(
+                    content=replay_response.content,
+                    status_code=replay_response.status_code,
+                    media_type=replay_response.headers.get("content-type"),
+                )
+            if destructive_group_cleanup:
                 await _retry_export_group_cleanup_if_pending(group_id)
             return Response(
                 content=cached.content,
@@ -1492,11 +1576,71 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 media_type=cached.media_type,
             )
 
-        cleanup_slot_reserved = False
-        if group_id is not None:
-            admitted, cleanup_slot_reserved = await _reserve_export_group_cleanup(
-                group_id
+        async def _release_export_replay(result: ReplayableHTTPResult) -> None:
+            release_task = asyncio.create_task(
+                export_request_registry.release_pending(request_id, fingerprint, result)
             )
+            await _await_critical_task(release_task, "Export replay release")
+
+        if lease_id is not None:
+            try:
+                delivered = await online_lease_registry.mark_delivered(
+                    lease_id,
+                    ttl_seconds=config.forward_timeout + 30.0,
+                    group_id=group_id,
+                    session_ids=tuple(session_ids),
+                )
+            except asyncio.CancelledError:
+                await _release_export_replay(
+                    ReplayableHTTPResult(
+                        status_code=503,
+                        content=b'{"error":"export owner cancelled; retry"}',
+                        media_type="application/json",
+                    )
+                )
+                raise
+            except ValueError as exc:
+                result = ReplayableHTTPResult(
+                    status_code=409,
+                    content=json.dumps({"error": str(exc)}).encode(),
+                    media_type="application/json",
+                )
+                await _release_export_replay(result)
+                return Response(
+                    content=result.content,
+                    status_code=result.status_code,
+                    media_type=result.media_type,
+                )
+            if not delivered:
+                result = ReplayableHTTPResult(
+                    status_code=410,
+                    content=json.dumps(
+                        {"error": f"Online lease {lease_id} is no longer exportable"}
+                    ).encode(),
+                    media_type="application/json",
+                )
+                await _release_export_replay(result)
+                return Response(
+                    content=result.content,
+                    status_code=result.status_code,
+                    media_type=result.media_type,
+                )
+
+        cleanup_slot_reserved = False
+        if destructive_group_cleanup:
+            try:
+                admitted, cleanup_slot_reserved = await _reserve_export_group_cleanup(
+                    group_id
+                )
+            except asyncio.CancelledError:
+                await _release_export_replay(
+                    ReplayableHTTPResult(
+                        status_code=503,
+                        content=b'{"error":"export owner cancelled; retry"}',
+                        media_type="application/json",
+                    )
+                )
+                raise
             if not admitted:
                 result = ReplayableHTTPResult(
                     status_code=503,
@@ -1510,9 +1654,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     ).encode(),
                     media_type="application/json",
                 )
-                await export_request_registry.release_pending(
-                    request_id, fingerprint, result
-                )
+                await _release_export_replay(result)
                 return Response(
                     content=result.content,
                     status_code=result.status_code,
@@ -1541,13 +1683,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 await _release_export_group_cleanup_reservation(group_id)
 
             if terminal:
+                if result.status_code == 200 and lease_id is not None:
+                    await online_lease_registry.complete(lease_id)
                 await export_request_registry.finish(request_id, result)
                 assert export_worker_binding is not None
                 await _forget_export_worker(request_id, export_worker_binding)
             else:
-                await export_request_registry.release_pending(
-                    request_id, fingerprint, result
-                )
+                await _release_export_replay(result)
 
             if cleanup_required:
                 await _ensure_export_group_cleanup(group_id)
@@ -1675,10 +1817,25 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 media_type=result.media_type,
             )
 
+        replay_result = result
+        if (
+            resp.status_code == 200
+            and len(result.content) > config.max_request_replay_result_bytes
+        ):
+            # The DataProxy owns the durable-in-process destructive-export
+            # replay. Keep only a compact routing marker at the Gateway rather
+            # than duplicating a potentially large trajectory payload.
+            replay_result = ReplayableHTTPResult(
+                status_code=result.status_code,
+                content=b"",
+                media_type=result.media_type,
+                replay_worker_addr=worker_addr,
+                replay_worker_id=worker_id,
+            )
         await _settle_export_ownership(
-            result,
+            replay_result,
             terminal=True,
-            cleanup_required=resp.status_code == 200 and group_id is not None,
+            cleanup_required=resp.status_code == 200 and destructive_group_cleanup,
         )
         return Response(
             content=result.content,

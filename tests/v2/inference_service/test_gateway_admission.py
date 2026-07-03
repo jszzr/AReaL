@@ -139,6 +139,39 @@ class TestOnlineLeaseRegistry:
         assert await registry.try_acquire() is None
 
     @pytest.mark.asyncio
+    async def test_delivered_lease_uses_export_deadline_and_completes_without_cleanup(
+        self, monkeypatch
+    ):
+        now = 100.0
+        monkeypatch.setattr(admission_module.time, "monotonic", lambda: now)
+        registry = OnlineLeaseRegistry()
+        lease = OnlineLease("lease-delivered", expected_version=0, ttl_seconds=10.0)
+        binding = OnlineLeaseBinding(
+            admission_id=lease.lease_id,
+            worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
+            group_id="group-delivered",
+            session_ids=("session-delivered",),
+        )
+        await registry.grant(lease)
+        await registry.try_acquire()
+        await registry.bind(lease.lease_id, binding)
+        await registry.finish_start(lease.lease_id)
+
+        now = 105.0
+        assert await registry.mark_delivered(lease.lease_id, ttl_seconds=20.0) is True
+        now = 111.0
+        assert await registry.expire_stale(now=now) == []
+        assert await registry.complete(lease.lease_id) is True
+        now = 1000.0
+        assert await registry.expire_stale(now=now) == []
+        assert await registry.pending_cleanup_bindings() == []
+        assert await registry.cancel_and_take_binding(lease.lease_id) == (
+            False,
+            None,
+        )
+
+    @pytest.mark.asyncio
     async def test_terminal_lease_retains_cleanup_until_acknowledged(self):
         registry = OnlineLeaseRegistry()
         lease = OnlineLease("lease-cleanup", expected_version=0)
@@ -259,6 +292,363 @@ class TestRequestReplayRegistry:
         await registry.release_pending("request-1", "fingerprint", transient)
 
         assert await registry.wait(replay, timeout=0.1) == transient
+
+    @pytest.mark.asyncio
+    async def test_expired_terminal_result_becomes_fence_not_a_new_owner(
+        self, monkeypatch
+    ):
+        now = 100.0
+        monkeypatch.setattr(admission_module.time, "monotonic", lambda: now)
+        registry = RequestReplayRegistry(
+            max_records=2,
+            retry_ttl_seconds=10.0,
+            max_result_bytes=128,
+            max_total_result_bytes=256,
+        )
+        owner = await registry.reserve("request-1", "fingerprint")
+        assert owner.is_owner is True
+        await registry.finish("request-1", ReplayableHTTPResult(201, b"created"))
+
+        now = 111.0
+        with pytest.raises(RuntimeError, match="retry horizon expired"):
+            await registry.reserve("request-1", "fingerprint")
+
+    @pytest.mark.asyncio
+    async def test_pending_records_are_bounded_and_exact_replays_still_join(self):
+        registry = RequestReplayRegistry(
+            max_records=1,
+            retry_ttl_seconds=10.0,
+            max_result_bytes=128,
+            max_total_result_bytes=256,
+        )
+        owner = await registry.reserve("request-1", "fingerprint")
+
+        replay = await registry.reserve("request-1", "fingerprint")
+        assert owner.is_owner is True
+        assert replay.is_owner is False
+        with pytest.raises(RuntimeError, match="replay capacity"):
+            await registry.reserve("request-2", "fingerprint-2")
+
+    @pytest.mark.asyncio
+    async def test_oversized_terminal_result_keeps_only_an_expired_fence(self):
+        registry = RequestReplayRegistry(
+            max_records=2,
+            retry_ttl_seconds=10.0,
+            max_result_bytes=4,
+            max_total_result_bytes=8,
+        )
+        owner = await registry.reserve("request-1", "fingerprint")
+        replay = await registry.reserve("request-1", "fingerprint")
+        assert owner.is_owner is True
+
+        replayable = await registry.finish(
+            "request-1", ReplayableHTTPResult(200, b"too-large")
+        )
+
+        assert replayable is False
+        with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
+            await registry.wait(replay, timeout=0.1)
+        with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
+            await registry.reserve("request-1", "fingerprint")
+
+    @pytest.mark.asyncio
+    async def test_total_result_bytes_are_bounded_without_evicting_old_result(self):
+        registry = RequestReplayRegistry(
+            max_records=2,
+            retry_ttl_seconds=10.0,
+            max_result_bytes=8,
+            max_total_result_bytes=8,
+        )
+        await registry.reserve("request-1", "fingerprint-1")
+        assert await registry.finish("request-1", ReplayableHTTPResult(200, b"123456"))
+        await registry.reserve("request-2", "fingerprint-2")
+
+        assert not await registry.finish(
+            "request-2", ReplayableHTTPResult(200, b"1234")
+        )
+        first = await registry.reserve("request-1", "fingerprint-1")
+        assert await registry.wait(first) == ReplayableHTTPResult(200, b"123456")
+        with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
+            await registry.reserve("request-2", "fingerprint-2")
+
+
+class TestGatewayReplayLedgerBoundaries:
+    @pytest.mark.asyncio
+    async def test_start_returns_503_when_new_request_id_cannot_be_admitted(self):
+        app, client = _configured_app_client(
+            GatewayConfig(
+                admin_api_key=ADMIN_KEY,
+                router_addr="http://mock-router:8081",
+                max_request_replay_records=1,
+            )
+        )
+        await app.state.start_request_registry.reserve("occupied", "fingerprint")
+
+        async with client:
+            response = await client.post(
+                "/rl/start_session",
+                json={
+                    "request_id": "new-request",
+                    "task_id": "capacity-test",
+                    "delivery_mode": "pull",
+                },
+                headers=_headers(),
+            )
+
+        assert response.status_code == 503
+        assert "replay capacity" in response.json()["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_acquiring_callback_lease_releases_replay_owner(self):
+        app, client = _app_client()
+        registry = app.state.online_lease_registry
+        acquire_started = asyncio.Event()
+        never_acquire = asyncio.Event()
+
+        async def _blocking_acquire():
+            acquire_started.set()
+            await never_acquire.wait()
+
+        request_id = "cancel-before-lease-acquire"
+        async with client:
+            with patch.object(registry, "try_acquire", side_effect=_blocking_acquire):
+                task = asyncio.create_task(
+                    client.post(
+                        "/rl/start_session",
+                        json={
+                            "request_id": request_id,
+                            "task_id": "cancel-before-lease",
+                            "delivery_mode": "callback",
+                        },
+                        headers=_headers(),
+                    )
+                )
+                await acquire_started.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        record = app.state.start_request_registry._records.get(request_id)
+        assert record is None or record.result is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_marking_lease_delivered_releases_export_owner(self):
+        app, client = _app_client()
+        registry = app.state.online_lease_registry
+        delivery_started = asyncio.Event()
+        never_deliver = asyncio.Event()
+
+        async def _blocking_delivery(*_args, **_kwargs):
+            delivery_started.set()
+            await never_deliver.wait()
+
+        request_id = "cancel-before-delivery-mark"
+        async with client:
+            with patch.object(
+                registry, "mark_delivered", side_effect=_blocking_delivery
+            ):
+                task = asyncio.create_task(
+                    client.post(
+                        "/export_trajectories",
+                        json={
+                            "request_id": request_id,
+                            "session_ids": ["session-1"],
+                            "group_id": "group-1",
+                            "lease_id": "lease-1",
+                        },
+                        headers=_headers(),
+                    )
+                )
+                await delivery_started.wait()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        record = app.state.export_request_registry._records.get(request_id)
+        assert record is None or record.result is not None
+
+    @pytest.mark.asyncio
+    async def test_start_returns_410_after_retry_horizon_instead_of_reexecuting(self):
+        app, client = _configured_app_client(
+            GatewayConfig(
+                admin_api_key=ADMIN_KEY,
+                router_addr="http://mock-router:8081",
+                request_replay_ttl_seconds=0.001,
+            )
+        )
+        fingerprint = json.dumps(
+            {"delivery_mode": "pull", "task_id": "expired-replay"},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        await app.state.start_request_registry.reserve("expired-request", fingerprint)
+        await app.state.start_request_registry.finish(
+            "expired-request", ReplayableHTTPResult(201, b"created")
+        )
+        await asyncio.sleep(0.01)
+
+        async with client:
+            response = await client.post(
+                "/rl/start_session",
+                json={
+                    "request_id": "expired-request",
+                    "task_id": "expired-replay",
+                    "delivery_mode": "pull",
+                },
+                headers=_headers(),
+            )
+
+        assert response.status_code == 410
+        assert "retry horizon expired" in response.json()["error"]
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_large_export_replays_at_data_proxy_without_gateway_payload_copy(
+        self, mock_query, mock_forward, mock_revoke
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        response_body = {"traj": {"tokens": list(range(64))}}
+        mock_forward.return_value = httpx.Response(200, json=response_body)
+        mock_revoke.return_value = True
+        app, client = _configured_app_client(
+            GatewayConfig(
+                admin_api_key=ADMIN_KEY,
+                router_addr="http://mock-router:8081",
+                max_request_replay_result_bytes=32,
+                max_request_replay_total_bytes=64,
+            )
+        )
+        request_body = {
+            "request_id": "delegated-large-export",
+            "session_ids": ["session-1"],
+            "group_id": "group-1",
+        }
+
+        async with client:
+            first = await client.post(
+                "/export_trajectories", json=request_body, headers=_headers()
+            )
+            replay = await client.post(
+                "/export_trajectories", json=request_body, headers=_headers()
+            )
+
+        assert first.status_code == replay.status_code == 200
+        assert first.json() == replay.json() == response_body
+        mock_query.assert_awaited_once()
+        assert mock_forward.await_count == 2
+        mock_revoke.assert_awaited_once()
+        cached = app.state.export_request_registry._records[
+            "delegated-large-export"
+        ].result
+        assert cached is not None
+        assert cached.content == b""
+        assert cached.replay_worker_addr == WORKER_ADDR
+        assert cached.replay_worker_id == WORKER_ID
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_non_destructive_export_does_not_revoke_router_group(
+        self, mock_query, mock_forward, mock_revoke
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        mock_forward.return_value = httpx.Response(200, json={"traj": {}})
+        _, client = _app_client()
+
+        async with client:
+            response = await client.post(
+                "/export_trajectories",
+                json={
+                    "request_id": "non-destructive-export",
+                    "session_ids": ["session-1"],
+                    "group_id": "group-1",
+                    "remove_session": False,
+                },
+                headers=_headers(),
+            )
+
+        assert response.status_code == 200
+        mock_revoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_callback_export_transitions_delivered_then_completed(
+        self, mock_query, mock_forward, mock_revoke, mock_register
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        mock_revoke.return_value = True
+        app, client = _app_client()
+        registry = app.state.online_lease_registry
+
+        async def _forward(url, *_args, **_kwargs):
+            if url.endswith("/rl/start_session"):
+                return httpx.Response(
+                    201,
+                    json={
+                        "group_id": "callback-export-group",
+                        "sessions": [
+                            {
+                                "session_id": "callback-export-session",
+                                "session_api_key": "callback-export-key",
+                            }
+                        ],
+                    },
+                )
+            assert registry._records["callback-export-lease"].state is (
+                admission_module.OnlineLeaseState.DELIVERED
+            )
+            return httpx.Response(200, json={"traj": {"rewards": [1.0]}})
+
+        mock_forward.side_effect = _forward
+        async with client:
+            granted = await client.post(
+                "/internal/online_leases",
+                json={
+                    "lease_id": "callback-export-lease",
+                    "expected_version": 0,
+                    "ttl_seconds": 30.0,
+                },
+                headers=_headers(),
+            )
+            started = await client.post(
+                "/rl/start_session",
+                json={
+                    "request_id": "callback-export-start",
+                    "task_id": "callback-export-task",
+                    "delivery_mode": "callback",
+                },
+                headers=_headers(),
+            )
+            exported = await client.post(
+                "/export_trajectories",
+                json={
+                    "request_id": "callback-export-request",
+                    "session_ids": ["callback-export-session"],
+                    "group_id": "callback-export-group",
+                    "lease_id": "callback-export-lease",
+                },
+                headers=_headers(),
+            )
+            deleted = await client.delete(
+                "/internal/online_leases/callback-export-lease",
+                headers=_headers(),
+            )
+
+        assert granted.status_code == 201
+        assert started.status_code == 201
+        assert exported.status_code == 200
+        assert registry._records["callback-export-lease"].state is (
+            admission_module.OnlineLeaseState.COMPLETED
+        )
+        assert deleted.json()["cancelled"] is False
+        assert mock_forward.await_count == 2
 
 
 class TestRequestWorkerOwnershipRegistry:
@@ -1548,6 +1938,67 @@ class TestGatewayOnlineAdmission:
         assert mock_query.await_count == 1
         assert mock_forward.await_count == 1
         assert mock_register.await_count == 1
+        mock_revoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_pull_success_settles_replay_before_forgetting_worker_on_cancel(
+        self, mock_query, mock_forward, mock_register, mock_revoke
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        response_body = {
+            "group_id": "group-cancel-after-commit",
+            "sessions": [
+                {
+                    "session_id": "session-cancel-after-commit",
+                    "session_api_key": "key-cancel-after-commit",
+                }
+            ],
+        }
+        mock_forward.return_value = httpx.Response(201, json=response_body)
+        app, client = _app_client()
+        registry = app.state.start_request_workers
+        original_forget = registry.forget
+        worker_forgotten = asyncio.Event()
+        allow_forget_return = asyncio.Event()
+
+        async def _blocking_forget(*args, **kwargs):
+            result = await original_forget(*args, **kwargs)
+            worker_forgotten.set()
+            await allow_forget_return.wait()
+            return result
+
+        request_body = {
+            "task_id": "task-cancel-after-commit",
+            "delivery_mode": "pull",
+            "request_id": "request-cancel-after-commit",
+        }
+        async with client:
+            with patch.object(registry, "forget", side_effect=_blocking_forget):
+                start_task = asyncio.create_task(
+                    client.post(
+                        "/rl/start_session", json=request_body, headers=_headers()
+                    )
+                )
+                await worker_forgotten.wait()
+                start_task.cancel()
+                await asyncio.sleep(0)
+                allow_forget_return.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await start_task
+
+            replay = await client.post(
+                "/rl/start_session", json=request_body, headers=_headers()
+            )
+
+        assert replay.status_code == 201
+        assert replay.json() == response_body
+        mock_query.assert_awaited_once()
+        mock_forward.assert_awaited_once()
+        mock_register.assert_awaited_once()
         mock_revoke.assert_not_awaited()
 
     @pytest.mark.asyncio

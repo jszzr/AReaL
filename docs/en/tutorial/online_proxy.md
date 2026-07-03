@@ -76,6 +76,8 @@ The outcomes are:
 - `201`: a session was created and bound to one trainer lease;
 - `429`: no trainer waiter is available, and no session was created;
 - `409`: an identity, worker epoch, or replay invariant was violated;
+- `410`: the request ID is known, but its response retry horizon has elapsed;
+- `503`: the bounded replay/ownership ledger cannot admit a new request ID;
 - `422`: the request is invalid, for example callback mode without `request_id`.
 
 Retry `429` with bounded backoff and the same request ID. Callback delivery currently
@@ -168,7 +170,30 @@ curl -X POST http://<gateway>/export_trajectories \
 
 If the response is lost, replay the identical body. The Gateway remembers the selected
 worker and the Data Proxy replays the original serialized result instead of popping the
-trajectory twice. Use a new ID for different parameters or a genuinely new export.
+trajectory twice. Large successful exports are stored only at the Data Proxy; the
+Gateway keeps a compact worker-incarnation marker and delegates an identical replay to
+that proxy. Use a new ID for different parameters or a genuinely new export.
+
+Group export is all-or-nothing. `session_ids` must be unique, every session must exist
+and have the requested ready trajectory, and every session must belong to the same
+`group_id`. A destructive group export must include every current member of that group,
+so Router cleanup cannot orphan an omitted session. Validation happens before any
+trajectory is consumed. Callback exports also carry the owning `lease_id`; the
+controller adds it automatically.
+
+Replay ledgers have an explicit in-process horizon. By default, response bytes are
+retained for 300 seconds; afterward the request ID remains as a payload-free fence and
+returns `410` instead of executing again. Pending requests, replayable responses, and
+expired fences share a fixed record capacity; a new ID receives `503` when it is full.
+Per-result and total response-byte limits prevent replay data from growing without a
+bound. A Data Proxy returns `507` before consuming a trajectory if its serialized export
+cannot fit its replay byte budget.
+
+The relevant programmatic settings are `GatewayConfig.max_request_replay_records`,
+`GatewayConfig.request_replay_ttl_seconds`,
+`GatewayConfig.max_request_replay_result_bytes`,
+`GatewayConfig.max_request_replay_total_bytes`, and the corresponding
+`DataProxyConfig.max_export_replay_*` / `export_replay_ttl_seconds` fields.
 
 ## Failure and concurrency guarantees
 
@@ -183,10 +208,12 @@ trajectory twice. Use a new ID for different parameters or a genuinely new expor
 - The inference CLI reads the admin-only `/worker_epoch` snapshot once after a new proxy
   becomes healthy and uses it as the registration CAS predecessor. A `409` fails the
   launch instead of rereading and overwriting a concurrent successor.
-- Leases expire after the controller-owned timeout. Cleanup independently retries worker
-  cancellation and Router revocation.
-- Callback acknowledgements and start/export results retain bounded replay tombstones,
-  so a lost success response is safe to retry.
+- An unclaimed lease expires after the controller-owned timeout. Once callback export
+  begins, the lease enters a delivered phase whose deadline covers the bounded Gateway
+  forward; a successful destructive export completes it. Cleanup independently retries
+  worker cancellation and Router revocation.
+- Start/export request IDs are never silently evicted within one process. Response
+  payloads compact to `410` fences, and capacity exhaustion backpressures new IDs.
 
 ## Fixed Held-Out Evaluation (V2 Only)
 
@@ -248,6 +275,12 @@ over a smaller, selected subset.
 These are orchestration guarantees on a trusted control plane. The internal lease API
 uses the same admin credential, so the gate is not a security boundary against a
 malicious holder of `rollout.admin_api_key`.
+
+Replay and ownership ledgers are currently in memory. A Gateway or Data Proxy process
+restart loses their records, so the protocol does **not** yet provide exactly-once
+destructive export across process restarts. Production deployments that need that
+guarantee must add a durable shared ledger (or keep the services alive and reconcile the
+job externally) before retrying an ambiguous request after a restart.
 
 ## FAQ
 

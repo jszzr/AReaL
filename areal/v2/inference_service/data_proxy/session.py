@@ -89,13 +89,14 @@ class ExportTrajectoriesRequest(BaseModel):
     """Request to export trajectories for one or more sessions.
 
     All sessions are exported and merged into a single interactions dict.
-    ``group_id`` is optional metadata used by the gateway for router cleanup;
-    the data proxy itself does not use it.
+    ``group_id`` and ``lease_id`` bind destructive cleanup to the session
+    group and callback lease that actually own the requested trajectories.
     """
 
     request_id: str = Field(min_length=1)
     session_ids: list[str]
     group_id: str | None = None
+    lease_id: str | None = None
     trajectory_id: int | None = None
     discount: float = 1.0
     style: str = "individual"
@@ -120,6 +121,34 @@ class ExportTrajectoriesResponse(BaseModel):
 
 class ExportReplayConflictError(ValueError):
     """Raised when one request ID is reused for a different export request."""
+
+
+class ExportReplayCapacityError(RuntimeError):
+    """Raised when the bounded export replay ledger cannot admit a new ID."""
+
+
+class ExportReplayExpiredError(RuntimeError):
+    """Raised when an export ID is fenced after its response retry horizon."""
+
+
+class ExportReplayResultTooLargeError(RuntimeError):
+    """Raised before commit when an export cannot fit in the replay ledger."""
+
+
+@dataclass(frozen=True)
+class ExportReplayReservation:
+    """Atomic export replay lookup result."""
+
+    is_owner: bool
+    payload: dict[str, Any] | None = None
+
+
+@dataclass
+class _ExportReplayRecord:
+    fingerprint: str
+    payload_json: str | None = None
+    terminal_at: float | None = None
+    expired_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -453,14 +482,32 @@ class SessionStore:
         self,
         set_reward_finish_timeout: float = 0.0,
         max_export_replay_records: int = MAX_EXPORT_REPLAY_RECORDS,
+        export_replay_ttl_seconds: float = 300.0,
+        max_export_replay_result_bytes: int = 16 * 1024 * 1024,
+        max_export_replay_total_bytes: int = 64 * 1024 * 1024,
     ):
         if max_export_replay_records <= 0:
             raise ValueError("max_export_replay_records must be positive")
+        if export_replay_ttl_seconds <= 0:
+            raise ValueError("export_replay_ttl_seconds must be positive")
+        if max_export_replay_result_bytes < 0:
+            raise ValueError("max_export_replay_result_bytes must be non-negative")
+        if max_export_replay_total_bytes < 0:
+            raise ValueError("max_export_replay_total_bytes must be non-negative")
+        if max_export_replay_result_bytes > max_export_replay_total_bytes:
+            raise ValueError(
+                "max_export_replay_result_bytes must be <= "
+                "max_export_replay_total_bytes"
+            )
         self._sessions: dict[str, SessionData] = {}
         self._api_key_to_session: dict[str, str] = {}
         self._session_to_api_key: dict[str, str] = {}
-        self._export_replays: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._export_replays: dict[str, _ExportReplayRecord] = {}
         self._max_export_replay_records = max_export_replay_records
+        self._export_replay_ttl_seconds = export_replay_ttl_seconds
+        self._max_export_replay_result_bytes = max_export_replay_result_bytes
+        self._max_export_replay_total_bytes = max_export_replay_total_bytes
+        self._export_replay_total_bytes = 0
         self._lock = threading.Lock()
         self._admin_api_key: str = "areal-admin-key"
         self._set_reward_finish_timeout = set_reward_finish_timeout
@@ -475,6 +522,117 @@ class SessionStore:
             f"request_id {request_id} was replayed with a different export request"
         )
 
+    def _compact_expired_export_replays_locked(self, now: float) -> None:
+        for record in self._export_replays.values():
+            if (
+                record.payload_json is None
+                or record.terminal_at is None
+                or record.terminal_at + self._export_replay_ttl_seconds > now
+            ):
+                continue
+            self._export_replay_total_bytes -= len(record.payload_json.encode("utf-8"))
+            record.payload_json = None
+            record.expired_reason = "export replay retry horizon expired"
+
+    def reserve_export_replay(
+        self,
+        request_id: str,
+        request_fingerprint: str,
+    ) -> ExportReplayReservation:
+        """Reserve a new export or return its detached cached response.
+
+        Pending, completed, and compact expired records all count toward the
+        same hard capacity.  This is intentional: forgetting an expired ID
+        would permit a destructive export to execute again.
+        """
+
+        with self._lock:
+            self._compact_expired_export_replays_locked(time.monotonic())
+            record = self._export_replays.get(request_id)
+            if record is not None:
+                if record.fingerprint != request_fingerprint:
+                    raise self._export_replay_conflict(request_id)
+                if record.expired_reason is not None:
+                    raise ExportReplayExpiredError(record.expired_reason)
+                if record.payload_json is None:
+                    return ExportReplayReservation(is_owner=False)
+                return ExportReplayReservation(
+                    is_owner=False,
+                    payload=json.loads(record.payload_json),
+                )
+            if len(self._export_replays) >= self._max_export_replay_records:
+                raise ExportReplayCapacityError(
+                    "Export replay capacity is exhausted; retry an existing "
+                    "request_id or restart with a durable replay ledger"
+                )
+            self._export_replays[request_id] = _ExportReplayRecord(
+                fingerprint=request_fingerprint
+            )
+            return ExportReplayReservation(is_owner=True)
+
+    def release_export_replay(
+        self,
+        request_id: str,
+        request_fingerprint: str,
+    ) -> bool:
+        """Release an uncommitted reservation after a side-effect-free failure."""
+
+        with self._lock:
+            record = self._export_replays.get(request_id)
+            if (
+                record is None
+                or record.fingerprint != request_fingerprint
+                or record.terminal_at is not None
+                or record.payload_json is not None
+            ):
+                return False
+            self._export_replays.pop(request_id, None)
+            return True
+
+    def finish_export_replay(
+        self,
+        request_id: str,
+        request_fingerprint: str,
+        serialized_traj: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Make an export replayable before its trajectories are consumed."""
+
+        payload_json = json.dumps(
+            serialized_traj,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_bytes = len(payload_json.encode("utf-8"))
+        with self._lock:
+            self._compact_expired_export_replays_locked(time.monotonic())
+            record = self._export_replays.get(request_id)
+            if record is None:
+                raise RuntimeError(f"Unknown export request_id {request_id}")
+            if record.fingerprint != request_fingerprint:
+                raise self._export_replay_conflict(request_id)
+            if record.expired_reason is not None:
+                raise ExportReplayExpiredError(record.expired_reason)
+            if record.payload_json is not None:
+                return json.loads(record.payload_json)
+            if (
+                payload_bytes > self._max_export_replay_result_bytes
+                or self._export_replay_total_bytes + payload_bytes
+                > self._max_export_replay_total_bytes
+            ):
+                # The trajectory is still intact at this point.  Releasing the
+                # pending ID is safe and lets the caller retry after capacity
+                # changes or use a differently configured proxy.
+                self._export_replays.pop(request_id, None)
+                raise ExportReplayResultTooLargeError(
+                    "Export response exceeds replay byte limits; trajectory was "
+                    "not consumed"
+                )
+            record.payload_json = payload_json
+            record.terminal_at = time.monotonic()
+            self._export_replay_total_bytes += payload_bytes
+            return json.loads(payload_json)
+
     def get_export_replay(
         self,
         request_id: str,
@@ -482,13 +640,17 @@ class SessionStore:
     ) -> dict[str, Any] | None:
         """Return a detached JSON snapshot for a completed export replay."""
         with self._lock:
+            self._compact_expired_export_replays_locked(time.monotonic())
             record = self._export_replays.get(request_id)
             if record is None:
                 return None
-            stored_fingerprint, payload_json = record
-            if stored_fingerprint != request_fingerprint:
+            if record.fingerprint != request_fingerprint:
                 raise self._export_replay_conflict(request_id)
-            self._export_replays.move_to_end(request_id)
+            if record.expired_reason is not None:
+                raise ExportReplayExpiredError(record.expired_reason)
+            if record.payload_json is None:
+                return None
+            payload_json = record.payload_json
         return json.loads(payload_json)
 
     def record_export_replay(
@@ -497,29 +659,18 @@ class SessionStore:
         request_fingerprint: str,
         serialized_traj: dict[str, Any],
     ) -> dict[str, Any]:
-        """Cache a JSON-only export result and return a detached snapshot."""
-        payload_json = json.dumps(
+        """Backward-compatible reserve-and-finish helper."""
+
+        reservation = self.reserve_export_replay(request_id, request_fingerprint)
+        if not reservation.is_owner:
+            if reservation.payload is None:
+                raise RuntimeError(f"Export request_id {request_id} is still pending")
+            return reservation.payload
+        return self.finish_export_replay(
+            request_id,
+            request_fingerprint,
             serialized_traj,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
         )
-        with self._lock:
-            record = self._export_replays.get(request_id)
-            if record is not None:
-                stored_fingerprint, stored_payload_json = record
-                if stored_fingerprint != request_fingerprint:
-                    raise self._export_replay_conflict(request_id)
-                self._export_replays.move_to_end(request_id)
-                payload_json = stored_payload_json
-            else:
-                self._export_replays[request_id] = (
-                    request_fingerprint,
-                    payload_json,
-                )
-                while len(self._export_replays) > self._max_export_replay_records:
-                    self._export_replays.popitem(last=False)
-        return json.loads(payload_json)
 
     @property
     def admin_api_key(self) -> str:
@@ -603,6 +754,16 @@ class SessionStore:
     def get_session(self, session_id: str) -> SessionData | None:
         with self._lock:
             return self._sessions.get(session_id)
+
+    def session_ids_for_group(self, group_id: str) -> set[str]:
+        """Return the current complete membership of one opaque session group."""
+
+        with self._lock:
+            return {
+                session_id
+                for session_id, session in self._sessions.items()
+                if session.group_id == group_id
+            }
 
     def remove_session(self, session_id: str) -> None:
         with self._lock:

@@ -208,20 +208,84 @@ def test_start_session_request_rejects_unknown_delivery_mode():
 
 
 class TestSessionStore:
-    def test_export_replay_cache_is_bounded_and_returns_json_snapshots(self):
-        store = SessionStore(max_export_replay_records=2)
+    def test_export_replay_expiry_keeps_a_non_executable_fence(self, monkeypatch):
+        now = 100.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
+        store = SessionStore(
+            max_export_replay_records=2,
+            export_replay_ttl_seconds=10.0,
+            max_export_replay_result_bytes=128,
+            max_export_replay_total_bytes=256,
+        )
         first_payload = {"nested": {"value": 1}}
 
-        store.record_export_replay("export-1", "fingerprint-1", first_payload)
-        store.record_export_replay("export-2", "fingerprint-2", {"value": 2})
-        store.record_export_replay("export-3", "fingerprint-3", {"value": 3})
+        owner = store.reserve_export_replay("export-1", "fingerprint-1")
+        assert owner.is_owner is True
+        replayable = store.finish_export_replay(
+            "export-1", "fingerprint-1", first_payload
+        )
+        assert replayable == {"nested": {"value": 1}}
 
         first_payload["nested"]["value"] = 99
-        assert store.get_export_replay("export-1", "fingerprint-1") is None
-        cached = store.get_export_replay("export-2", "fingerprint-2")
-        assert cached == {"value": 2}
-        cached["value"] = 99
-        assert store.get_export_replay("export-2", "fingerprint-2") == {"value": 2}
+        cached = store.reserve_export_replay("export-1", "fingerprint-1")
+        assert cached.is_owner is False
+        assert cached.payload == {"nested": {"value": 1}}
+        cached.payload["nested"]["value"] = 99
+        assert store.reserve_export_replay("export-1", "fingerprint-1").payload == {
+            "nested": {"value": 1}
+        }
+
+        now = 111.0
+        with pytest.raises(RuntimeError, match="retry horizon expired"):
+            store.reserve_export_replay("export-1", "fingerprint-1")
+
+    def test_export_replay_pending_and_terminal_fences_share_record_capacity(self):
+        store = SessionStore(
+            max_export_replay_records=1,
+            export_replay_ttl_seconds=10.0,
+            max_export_replay_result_bytes=128,
+            max_export_replay_total_bytes=256,
+        )
+        owner = store.reserve_export_replay("export-1", "fingerprint-1")
+        duplicate = store.reserve_export_replay("export-1", "fingerprint-1")
+
+        assert owner.is_owner is True
+        assert duplicate.is_owner is False
+        assert duplicate.payload is None
+        with pytest.raises(RuntimeError, match="replay capacity"):
+            store.reserve_export_replay("export-2", "fingerprint-2")
+
+    def test_export_replay_byte_limit_fails_before_destructive_commit(self):
+        store = SessionStore(
+            max_export_replay_records=2,
+            export_replay_ttl_seconds=10.0,
+            max_export_replay_result_bytes=4,
+            max_export_replay_total_bytes=8,
+        )
+        store.reserve_export_replay("export-1", "fingerprint-1")
+
+        with pytest.raises(RuntimeError, match="exceeds replay byte limits"):
+            store.finish_export_replay("export-1", "fingerprint-1", {"too": "large"})
+
+        # No destructive side effect happened, so the same request may retry if
+        # capacity/configuration later permits it.
+        retry = store.reserve_export_replay("export-1", "fingerprint-1")
+        assert retry.is_owner is True
+
+    def test_export_replay_total_bytes_reject_new_payload_without_eviction(self):
+        store = SessionStore(
+            max_export_replay_records=2,
+            export_replay_ttl_seconds=10.0,
+            max_export_replay_result_bytes=16,
+            max_export_replay_total_bytes=16,
+        )
+        store.reserve_export_replay("export-1", "fingerprint-1")
+        first = store.finish_export_replay("export-1", "fingerprint-1", {"v": "1234"})
+        store.reserve_export_replay("export-2", "fingerprint-2")
+
+        with pytest.raises(RuntimeError, match="exceeds replay byte limits"):
+            store.finish_export_replay("export-2", "fingerprint-2", {"v": "5678"})
+        assert store.reserve_export_replay("export-1", "fingerprint-1").payload == first
 
     def test_default_delivery_remains_callback(self):
         store = SessionStore()
@@ -467,6 +531,9 @@ async def test_session_mutations_accept_matching_worker_identity(client, config)
         headers=headers,
     )
     session_id = started.json()["sessions"][0]["session_id"]
+    session = client._transport.app.state.session_store.get_session(session_id)
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
     exported = await client.post(
         "/export_trajectories",
         json={"request_id": "matching-export", "session_ids": [session_id]},
@@ -1367,6 +1434,176 @@ async def test_batch_online_set_reward_completes_that_session(client):
 
 
 @pytest.mark.asyncio
+async def test_group_export_requires_every_session_to_be_ready_without_consuming_any(
+    client,
+):
+    start = await client.post(
+        "/rl/start_session",
+        json={
+            "task_id": "all-ready-export",
+            "delivery_mode": "pull",
+            "group_size": 2,
+        },
+        headers=admin_headers(),
+    )
+    data = start.json()
+    first, second = data["sessions"]
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+        headers=session_headers(first["session_api_key"]),
+    )
+    await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=session_headers(first["session_api_key"]),
+    )
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": "all-ready-export-request",
+            "session_ids": [first["session_id"], second["session_id"]],
+            "group_id": data["group_id"],
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 409
+    assert "not ready" in response.json()["detail"]
+    first_session = client._transport.app.state.session_store.get_session(
+        first["session_id"]
+    )
+    assert first_session is not None
+    assert first_session.has_ready_trajectories
+
+
+@pytest.mark.asyncio
+async def test_group_export_rejects_duplicate_session_ids_without_consuming(client):
+    store = client._transport.app.state.session_store
+    session_id, _ = store.start_session(
+        "duplicate-group-export",
+        delivery_mode=TrajectoryDeliveryMode.PULL,
+        group_id="group-duplicate",
+    )
+    session = store.get_session(session_id)
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": "duplicate-session-export",
+            "session_ids": [session_id, session_id],
+            "group_id": "group-duplicate",
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 422
+    assert session.has_ready_trajectories
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("group_ids", "request_group_id", "detail"),
+    [
+        (("group-a", "group-b"), "group-a", "same group"),
+        (("group-a", "group-a"), "unrelated-group", "does not own"),
+    ],
+)
+async def test_group_export_rejects_group_mismatch_without_consuming(
+    client, group_ids, request_group_id, detail
+):
+    store = client._transport.app.state.session_store
+    sessions = []
+    for index, group_id in enumerate(group_ids):
+        session_id, _ = store.start_session(
+            f"group-mismatch-{index}",
+            delivery_mode=TrajectoryDeliveryMode.PULL,
+            group_id=group_id,
+        )
+        session = store.get_session(session_id)
+        _add_fake_interaction(session)
+        session.set_reward(interaction_id="fake-id", reward=1.0)
+        sessions.append(session)
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": f"group-mismatch-export-{request_group_id}",
+            "session_ids": [session.session_id for session in sessions],
+            "group_id": request_group_id,
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 409
+    assert detail in response.json()["detail"]
+    assert all(session.has_ready_trajectories for session in sessions)
+
+
+@pytest.mark.asyncio
+async def test_destructive_group_export_requires_every_group_member(client):
+    store = client._transport.app.state.session_store
+    sessions = []
+    for index in range(2):
+        session_id, _ = store.start_session(
+            f"partial-group-export-{index}",
+            delivery_mode=TrajectoryDeliveryMode.PULL,
+            group_id="complete-group",
+        )
+        session = store.get_session(session_id)
+        _add_fake_interaction(session)
+        session.set_reward(interaction_id="fake-id", reward=1.0)
+        sessions.append(session)
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": "partial-group-export-request",
+            "session_ids": [sessions[0].session_id],
+            "group_id": "complete-group",
+            "remove_session": True,
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 409
+    assert "every session" in response.json()["detail"]
+    assert all(session.has_ready_trajectories for session in sessions)
+
+
+@pytest.mark.asyncio
+async def test_callback_export_requires_matching_lease_without_consuming(client):
+    store = client._transport.app.state.session_store
+    session_id, _ = store.start_session(
+        "lease-mismatch-export",
+        delivery_mode=TrajectoryDeliveryMode.CALLBACK,
+        lease_id="lease-owner",
+        group_id="lease-group",
+    )
+    session = store.get_session(session_id)
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
+
+    response = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": "lease-mismatch-export-request",
+            "session_ids": [session_id],
+            "group_id": "lease-group",
+            "lease_id": "wrong-lease",
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 409
+    assert "does not own" in response.json()["detail"]
+    assert session.has_ready_trajectories
+
+
+@pytest.mark.asyncio
 async def test_export_trajectories_replays_identical_response_after_session_removal(
     client,
 ):
@@ -1466,13 +1703,27 @@ async def test_export_serialization_failure_does_not_consume_trajectory(
 
 @pytest.mark.asyncio
 async def test_export_trajectories_rejects_conflicting_request_id_reuse(client):
+    store = client._transport.app.state.session_store
+    first_session_id, _ = store.start_session(
+        "conflicting-export-a", delivery_mode=TrajectoryDeliveryMode.PULL
+    )
+    second_session_id, _ = store.start_session(
+        "conflicting-export-b", delivery_mode=TrajectoryDeliveryMode.PULL
+    )
+    for session_id in (first_session_id, second_session_id):
+        session = store.get_session(session_id)
+        _add_fake_interaction(session)
+        session.set_reward(interaction_id="fake-id", reward=1.0)
+
     first_request = ExportTrajectoriesRequest(
         request_id="conflicting-export",
-        session_ids=["missing-a"],
+        session_ids=[first_session_id],
+        remove_session=False,
     )
     conflict_request = ExportTrajectoriesRequest(
         request_id="conflicting-export",
-        session_ids=["missing-b"],
+        session_ids=[second_session_id],
+        remove_session=False,
     )
 
     first = await client.post(
@@ -1619,8 +1870,8 @@ async def test_export_trajectories_not_found(client):
         },
         headers=admin_headers(),
     )
-    assert resp.status_code == 200
-    assert resp.json()["traj"] == {}
+    assert resp.status_code == 404
+    assert "nonexistent" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio

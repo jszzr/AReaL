@@ -13,6 +13,7 @@ from enum import Enum
 class OnlineLeaseState(str, Enum):
     AVAILABLE = "available"
     ACQUIRED = "acquired"
+    DELIVERED = "delivered"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -20,6 +21,14 @@ class OnlineLeaseState(str, Enum):
 
 class OnlineLeaseCapacityError(RuntimeError):
     """The registry cannot accept more externally owned lease state."""
+
+
+class RequestReplayCapacityError(RuntimeError):
+    """The bounded replay ledger cannot admit another request ID."""
+
+
+class RequestReplayExpiredError(RuntimeError):
+    """A request ID is fenced but its replayable response is unavailable."""
 
 
 @dataclass(frozen=True)
@@ -375,11 +384,49 @@ class OnlineLeaseRegistry:
     async def complete(self, lease_id: str) -> bool:
         async with self._lock:
             record = self._records.get(lease_id)
-            if record is None or record.state is not OnlineLeaseState.ACQUIRED:
+            if record is None or record.state not in {
+                OnlineLeaseState.ACQUIRED,
+                OnlineLeaseState.DELIVERED,
+            }:
                 return False
             record.state = OnlineLeaseState.COMPLETED
+            # A successful destructive export consumed the DataProxy session;
+            # Router group cleanup is tracked separately by the Gateway export
+            # reconciler. The lease binding must not be reaped as cancellation.
+            record.cleanup_acknowledged = True
             record.terminal_at = time.monotonic()
             self._purge_terminal_records_locked()
+            return True
+
+    async def mark_delivered(
+        self,
+        lease_id: str,
+        ttl_seconds: float,
+        *,
+        group_id: str | None = None,
+        session_ids: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Enter the bounded export phase and renew its cleanup deadline."""
+
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be > 0")
+        async with self._lock:
+            record = self._records.get(lease_id)
+            if record is None or record.state not in {
+                OnlineLeaseState.ACQUIRED,
+                OnlineLeaseState.DELIVERED,
+            }:
+                return False
+            if record.start_in_flight or record.binding is None:
+                return False
+            if group_id is not None and record.binding.group_id != group_id:
+                raise ValueError(f"Lease {lease_id} does not own group {group_id}")
+            if session_ids is not None and record.binding.session_ids != session_ids:
+                raise ValueError(
+                    f"Lease {lease_id} does not own the requested sessions"
+                )
+            record.state = OnlineLeaseState.DELIVERED
+            record.expires_at = time.monotonic() + ttl_seconds
             return True
 
     async def bind(
@@ -487,6 +534,8 @@ class ReplayableHTTPResult:
     status_code: int
     content: bytes
     media_type: str | None = None
+    replay_worker_addr: str | None = None
+    replay_worker_id: str | None = None
 
 
 @dataclass
@@ -495,6 +544,7 @@ class _RequestReplayRecord:
     ready: asyncio.Event
     result: ReplayableHTTPResult | None = None
     terminal_at: float | None = None
+    expired_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -506,27 +556,62 @@ class RequestReplayReservation:
 
 
 class RequestReplayRegistry:
-    """Deduplicate caller retries before rerunning a state-changing request."""
+    """Bounded in-memory replay ledger for state-changing requests.
 
-    def __init__(self, max_terminal_records: int = 4096) -> None:
-        if max_terminal_records < 1:
-            raise ValueError("max_terminal_records must be >= 1")
+    Request IDs are never silently forgotten.  Completed response bodies are
+    replayable for ``retry_ttl_seconds`` and are then compacted to permanent,
+    payload-free fences.  Because those fences cannot be safely discarded
+    without durable storage or an external request-ID lifetime contract, a
+    full ledger rejects new IDs instead of risking duplicate execution.
+    """
+
+    def __init__(
+        self,
+        max_records: int = 4096,
+        retry_ttl_seconds: float = 300.0,
+        max_result_bytes: int = 16 * 1024 * 1024,
+        max_total_result_bytes: int = 64 * 1024 * 1024,
+        *,
+        max_terminal_records: int | None = None,
+    ) -> None:
+        if max_terminal_records is not None:
+            if max_records != 4096 and max_records != max_terminal_records:
+                raise ValueError(
+                    "max_records and max_terminal_records must match when both "
+                    "are provided"
+                )
+            # Backward-compatible keyword. Its safety semantics are stronger:
+            # the limit now covers pending requests and compact fences too.
+            max_records = max_terminal_records
+        if max_records < 1:
+            raise ValueError("max_records must be >= 1")
+        if retry_ttl_seconds <= 0:
+            raise ValueError("retry_ttl_seconds must be > 0")
+        if max_result_bytes < 0:
+            raise ValueError("max_result_bytes must be >= 0")
+        if max_total_result_bytes < 0:
+            raise ValueError("max_total_result_bytes must be >= 0")
+        if max_result_bytes > max_total_result_bytes:
+            raise ValueError("max_result_bytes must be <= max_total_result_bytes")
         self._records: dict[str, _RequestReplayRecord] = {}
         self._lock = asyncio.Lock()
-        self._max_terminal_records = max_terminal_records
+        self._max_records = max_records
+        self._retry_ttl_seconds = retry_ttl_seconds
+        self._max_result_bytes = max_result_bytes
+        self._max_total_result_bytes = max_total_result_bytes
+        self._total_result_bytes = 0
 
-    def _purge_terminal_records_locked(self) -> None:
-        terminal = sorted(
-            (
-                (request_id, record.terminal_at)
-                for request_id, record in self._records.items()
-                if record.terminal_at is not None
-            ),
-            key=lambda item: item[1],
-        )
-        excess = max(0, len(terminal) - self._max_terminal_records)
-        for request_id, _ in terminal[:excess]:
-            self._records.pop(request_id, None)
+    def _compact_expired_results_locked(self, now: float) -> None:
+        for record in self._records.values():
+            if (
+                record.result is None
+                or record.terminal_at is None
+                or record.terminal_at + self._retry_ttl_seconds > now
+            ):
+                continue
+            self._total_result_bytes -= len(record.result.content)
+            record.result = None
+            record.expired_reason = "request replay retry horizon expired"
 
     async def reserve(
         self, request_id: str, fingerprint: str
@@ -534,12 +619,19 @@ class RequestReplayRegistry:
         """Return an owner/replay handle without a second lookup race."""
 
         async with self._lock:
-            self._purge_terminal_records_locked()
+            self._compact_expired_results_locked(time.monotonic())
             existing = self._records.get(request_id)
             if existing is not None:
                 if existing.fingerprint != fingerprint:
                     raise ValueError(f"Request {request_id} has a conflicting replay")
+                if existing.expired_reason is not None:
+                    raise RequestReplayExpiredError(existing.expired_reason)
                 return RequestReplayReservation(False, existing)
+            if len(self._records) >= self._max_records:
+                raise RequestReplayCapacityError(
+                    "Request replay capacity is exhausted; retry with an existing "
+                    "request_id or restart with a durable replay ledger"
+                )
             record = _RequestReplayRecord(
                 fingerprint=fingerprint,
                 ready=asyncio.Event(),
@@ -566,8 +658,11 @@ class RequestReplayRegistry:
                 record.ready.set()
                 self._records.pop(request_id, None)
 
-    async def finish(self, request_id: str, result: ReplayableHTTPResult) -> None:
+    async def finish(self, request_id: str, result: ReplayableHTTPResult) -> bool:
+        """Settle a request and report whether its response body is replayable."""
+
         async with self._lock:
+            self._compact_expired_results_locked(time.monotonic())
             record = self._records.get(request_id)
             if record is None:
                 raise RuntimeError(f"Unknown request: {request_id}")
@@ -576,11 +671,25 @@ class RequestReplayRegistry:
                     raise RuntimeError(
                         f"Request {request_id} was settled inconsistently"
                     )
-                return
-            record.result = result
+                return True
+            if record.expired_reason is not None:
+                raise RuntimeError(
+                    f"Request {request_id} was already fenced: {record.expired_reason}"
+                )
+            result_bytes = len(result.content)
+            replayable = (
+                result_bytes <= self._max_result_bytes
+                and self._total_result_bytes + result_bytes
+                <= self._max_total_result_bytes
+            )
+            if replayable:
+                record.result = result
+                self._total_result_bytes += result_bytes
+            else:
+                record.expired_reason = "response exceeds replay byte limits"
             record.terminal_at = time.monotonic()
             record.ready.set()
-            self._purge_terminal_records_locked()
+            return replayable
 
     async def wait(
         self, reservation: RequestReplayReservation, timeout: float | None = None
@@ -591,6 +700,8 @@ class RequestReplayRegistry:
             await ready.wait()
         else:
             await asyncio.wait_for(ready.wait(), timeout=timeout)
+        if record.expired_reason is not None:
+            raise RequestReplayExpiredError(record.expired_reason)
         if record.result is None:
             raise RuntimeError("Replay reservation settled without a result")
         return record.result

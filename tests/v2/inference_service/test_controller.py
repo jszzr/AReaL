@@ -1603,17 +1603,25 @@ class TestInferenceServiceWorkflow:
                 "loss_mask": torch.tensor([0, 1], dtype=torch.int32),
             }
         )
+        http_session = AsyncMock()
 
         with patch(
             "areal.v2.inference_service.controller.workflow.stats_tracker"
         ) as mock_st:
             mock_st.get.return_value = MagicMock()
-            result = await workflow._run_online(AsyncMock())
+            result = await workflow._run_online(http_session)
 
         assert result is not None
         assert events == ["reserve", "grant", "wait"]
         controller.wait_for_online_trajectory.assert_awaited_once_with(
             "lease-1", timeout=3.0
+        )
+        workflow._export_interactions.assert_awaited_once_with(
+            http_session,
+            ["sess-1"],
+            group_id=None,
+            trajectory_id=7,
+            lease_id="lease-1",
         )
         workflow._cancel_online_lease.assert_awaited_once()
 

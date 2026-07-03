@@ -67,6 +67,8 @@ curl -X POST http://<gateway>/rl/start_session \
 - `201`：会话已创建，并绑定到一个训练 lease；
 - `429`：当前没有训练 waiter，且没有创建会话；
 - `409`：请求身份、worker epoch 或重放约束冲突；
+- `410`：系统仍记得该 request ID，但响应重试窗口已经结束；
+- `503`：有界重放/所有权账本已满，不能接收新的 request ID；
 - `422`：请求无效，例如 callback 模式缺少 `request_id`。
 
 收到 `429` 后使用有上限的退避和相同 request ID 重试。callback 目前要求 `group_size=1`。
@@ -150,8 +152,23 @@ curl -X POST http://<gateway>/export_trajectories \
   }'
 ```
 
-响应丢失后应原样重放请求。Gateway 会记住选中的 worker，Data Proxy 会重放第一次序列化的结果，而不是再次 弹出轨迹。只有参数变化或真正的新导出才使用新的
-ID。
+响应丢失后应原样重放请求。Gateway 会记住选中的 worker，Data Proxy 会重放第一次序列化的结果，而不是再次 弹出轨迹。对于较大的成功导出，完整
+payload 只保存在 Data Proxy；Gateway 只保存带 worker incarnation 的紧凑 标记，并把相同重放交给该 Data
+Proxy。只有参数变化或真正的新导出才使用新的 ID。
+
+分组导出是 all-or-nothing：`session_ids` 必须唯一；每个 session 都必须存在、具有指定的 ready trajectory，并且
+全部属于同一个 `group_id`。破坏性分组导出必须包含该组当前的所有成员，避免 Router 清理使未列出的 session 失去
+路由。所有检查都在消费任何轨迹之前完成。callback 导出还会携带所属 `lease_id`，controller 会自动补上这个字段。
+
+重放账本具有明确的进程内窗口。默认保留响应内容 300 秒；超过窗口后不会遗忘 request ID，而是把它压缩成不含 payload 的 fence，并返回
+`410`，绝不会静默重做。pending 请求、可重放响应和过期 fence 共用固定的记录容量； 容量满时，新 ID 返回
+`503`。单条与总响应字节上限保证重放数据有界。如果序列化导出无法放入 Data Proxy 的 重放预算，Data Proxy 会在消费轨迹之前返回 `507`。
+
+对应的程序化配置包括 `GatewayConfig.max_request_replay_records`、
+`GatewayConfig.request_replay_ttl_seconds`、
+`GatewayConfig.max_request_replay_result_bytes`、
+`GatewayConfig.max_request_replay_total_bytes`，以及 Data Proxy 中对应的 `max_export_replay_*`
+/ `export_replay_ttl_seconds` 字段。
 
 ## 失败与并发保证
 
@@ -162,8 +179,9 @@ ID。
 - Data Proxy 的健康响应会返回不可变 worker ID；Router 只会把 ID 与已注册 epoch 相同的 `200` 视为健康。
 - 新 proxy 健康后，推理 CLI 只读取一次管理员端点 `/worker_epoch`，并将其作为注册 CAS 的 predecessor。 如果返回
   `409`，本次启动直接失败，不会重读后覆盖并发 successor。
-- lease 在 controller 持有的超时后过期；worker 会话取消和 Router 撤销会独立重试。
-- callback ACK、创建结果和导出结果都保留有界重放 tombstone，因此成功响应丢失后可以安全重试。
+- 尚未领取的 lease 在 controller 持有的超时后过期。callback 导出开始后，lease 进入 delivered 阶段，其新期限 覆盖有界的
+  Gateway 转发；破坏性导出成功后进入 completed。worker 取消和 Router 撤销会独立重试。
+- 同一进程内不会静默淘汰 start/export request ID；响应 payload 会压缩为返回 `410` 的 fence，容量耗尽则对 新 ID 背压。
 
 ## 固定留出集评测（仅限 V2）
 
@@ -215,6 +233,9 @@ with PPOTrainer(
 `rollout.admin_api_key` 持有者的安全边界。
 
 ## FAQ
+
+目前 replay 与 ownership 账本只在内存中。Gateway 或 Data Proxy 进程重启会丢失这些记录，因此该协议尚不能 保证跨进程重启的破坏性导出
+exactly-once。需要这一保证的生产部署，必须先接入持久化共享账本（或保持服务存活并 在外部完成作业对账），再对重启后的歧义请求进行重试。
 
 ## 健康检查
 
