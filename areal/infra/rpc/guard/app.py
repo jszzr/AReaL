@@ -159,6 +159,7 @@ def create_app(state: GuardState) -> Flask:
     Routes provided:
 
     - ``GET  /health`` — health check (extensible via health hooks)
+    - ``GET  /forked_worker_status`` — inspect one forked child's liveness
     - ``POST /alloc_ports`` — allocate free ports
     - ``POST /fork`` — fork a child worker from a raw command
     - ``POST /kill_forked_worker`` — kill a specific forked child
@@ -189,6 +190,37 @@ def create_app(state: GuardState) -> Flask:
         for hook in s._health_hooks:
             result.update(hook())
         return jsonify(result)
+
+    @app.route("/forked_worker_status", methods=["GET"])
+    def forked_worker_status():
+        """Return the liveness and exit code of one forked child."""
+        role = request.args.get("role")
+        worker_index_raw = request.args.get("worker_index")
+        if role is None or worker_index_raw is None:
+            return jsonify({"error": "Missing 'role' or 'worker_index'"}), 400
+        try:
+            worker_index = int(worker_index_raw)
+        except ValueError:
+            return jsonify({"error": "'worker_index' must be an integer"}), 400
+
+        s = get_state()
+        with s.forked_children_lock:
+            child_process = s.forked_children_map.get((role, worker_index))
+        if child_process is None:
+            return (
+                jsonify({"error": f"Forked worker {role}/{worker_index} not found"}),
+                404,
+            )
+
+        returncode = child_process.poll()
+        return jsonify(
+            {
+                "role": role,
+                "worker_index": worker_index,
+                "running": returncode is None,
+                "returncode": returncode,
+            }
+        )
 
     @app.route("/alloc_ports", methods=["POST"])
     def alloc_ports():

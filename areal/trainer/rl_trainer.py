@@ -159,6 +159,18 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        try:
+            self._initialize_impl(config, train_dataset, valid_dataset)
+        except BaseException as exc:
+            self._rollback_failed_initialization(exc)
+            raise
+
+    def _initialize_impl(
+        self,
+        config: PPOConfig,
+        train_dataset: Dataset | None = None,
+        valid_dataset: Dataset | None = None,
+    ) -> None:
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -450,6 +462,47 @@ class PPOTrainer:
 
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
+
+    def _rollback_failed_initialization(self, primary_error: BaseException) -> None:
+        """Release resources owned by a constructor that did not complete."""
+        cleanup_steps: list[tuple[str, Callable[[], Any]]] = []
+        seen: set[int] = set()
+
+        def add_cleanup(attribute: str, method: str) -> None:
+            resource = getattr(self, attribute, None)
+            if resource is None or id(resource) in seen:
+                return
+            cleanup = getattr(resource, method, None)
+            if callable(cleanup):
+                seen.add(id(resource))
+                cleanup_steps.append((f"{attribute}.{method}", cleanup))
+
+        # Reverse the ownership order established by _initialize_impl().
+        add_cleanup("stats_logger", "close")
+        add_cleanup("saver", "finalize")
+        add_cleanup("_valid_rdataset", "close")
+        add_cleanup("_train_rdataset", "close")
+        add_cleanup("data_controller", "destroy")
+        add_cleanup("eval_rollout", "destroy")
+        add_cleanup("rollout", "destroy")
+        add_cleanup("teacher", "destroy")
+        add_cleanup("ref", "destroy")
+        add_cleanup("critic", "destroy")
+        add_cleanup("actor", "destroy")
+
+        for stage, cleanup in cleanup_steps:
+            try:
+                cleanup()
+            except BaseException as cleanup_error:
+                logger.error(
+                    "PPOTrainer initialization rollback failed at %s",
+                    stage,
+                    exc_info=True,
+                )
+                primary_error.add_note(
+                    f"{stage} rollback failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
 
     def _connect_rdataset(
         self,
@@ -954,25 +1007,43 @@ class PPOTrainer:
             self._save_perf_tracer(step=global_step)
 
     def close(self):
-        self.saver.finalize()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+
+        def cleanup(stage: str, operation: Callable[[], Any]) -> None:
+            try:
+                operation()
+            except BaseException as exc:
+                logger.error("PPOTrainer cleanup failed at %s", stage, exc_info=True)
+                cleanup_errors.append((stage, exc))
+
+        cleanup("saver.finalize", self.saver.finalize)
         if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
+            cleanup("train_rdataset.close", self._train_rdataset.close)
         if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
+            cleanup("valid_rdataset.close", self._valid_rdataset.close)
         if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
+            cleanup("data_controller.destroy", self.data_controller.destroy)
+        cleanup("stats_logger.close", self.stats_logger.close)
         if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
+            cleanup("eval_rollout.destroy", self.eval_rollout.destroy)
+        cleanup("rollout.destroy", self.rollout.destroy)
         if self.teacher is not None:
-            self.teacher.destroy()
+            cleanup("teacher.destroy", self.teacher.destroy)
         if self.ref is not None:
-            self.ref.destroy()
+            cleanup("ref.destroy", self.ref.destroy)
         if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
-        perf_tracer.save(force=True)
+            cleanup("critic.destroy", self.critic.destroy)
+        cleanup("actor.destroy", self.actor.destroy)
+        cleanup("perf_tracer.save", lambda: perf_tracer.save(force=True))
+
+        if cleanup_errors:
+            first_stage, first_error = cleanup_errors[0]
+            for stage, error in cleanup_errors[1:]:
+                first_error.add_note(
+                    f"{stage} also failed: {type(error).__name__}: {error}"
+                )
+            first_error.add_note(f"First cleanup failure occurred at {first_stage}")
+            raise first_error
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -1565,5 +1636,17 @@ class PPOTrainer:
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc_value is None:
+                raise
+            logger.error(
+                "PPOTrainer cleanup failed while preserving the training error",
+                exc_info=True,
+            )
+            exc_value.add_note(
+                "Trainer cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         return False

@@ -16,7 +16,6 @@ import os
 import sys
 import threading
 import time
-import traceback
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
@@ -180,6 +179,7 @@ class RolloutControllerV2:
         self._predecessor_worker_ids: dict[str, str | None] = {}
         self._registration_operation_lock = Lock()
         self._registration_state_lock = Lock()
+        self._destroy_lock = Lock()
         self._registration_generation = 0
         self._destroyed = False
 
@@ -225,6 +225,7 @@ class RolloutControllerV2:
 
         # Pipelined initialization state
         self._init_future: concurrent.futures.Future | None = None
+        self._initialization_error: BaseException | None = None
         self._init_lock = threading.Lock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
@@ -252,28 +253,50 @@ class RolloutControllerV2:
 
         self._workers_ready.clear()
         self._shutdown_requested.clear()
-        self._init_future = get_executor("ctrl_init").submit(
+        self._initialization_error = None
+        future = get_executor("ctrl_init").submit(
             self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
         )
+        self._init_future = future
 
         ready_timeout = self.config.workers_ready_timeout
         if not self._workers_ready.wait(timeout=ready_timeout):
             raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
-        if self._init_future.done():
-            self._init_future.result()
+        if future.done():
+            future.result()
 
         if wait:
             self._ensure_initialized()
             return None
-        return self._init_future
+        return future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
+        primary_error: BaseException | None = None
         try:
             self._bg_initialize(*args, **kwargs)
-        except BaseException:
+        except BaseException as exc:
+            primary_error = exc
+            self._initialization_error = exc
             self._workers_ready.set()
+            logger.error(
+                "RolloutControllerV2 initialization failed, rolling back",
+                exc_info=True,
+            )
+            try:
+                self.destroy()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "Rollback cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
+        finally:
+            if primary_error is None and self._shutdown_requested.is_set():
+                # A concurrent destroy may finish before an in-flight scheduler
+                # or HTTP call publishes its acknowledged owner. The initializer
+                # performs the terminal pass once it regains control.
+                self.destroy()
 
     def _bg_initialize(
         self,
@@ -340,6 +363,8 @@ class RolloutControllerV2:
 
     def _ensure_initialized(self) -> None:
         if self._init_future is None:
+            if self._initialization_error is not None:
+                raise self._initialization_error
             return
         with self._init_lock:
             future = self._init_future
@@ -480,7 +505,6 @@ class RolloutControllerV2:
         logger.info("Inference servers: %s", self._inf_addrs)
 
         router_host, router_port = await router_task
-        self._forked_services.append((guard_addr_0, "router", 0))
         self._router_addr = f"http://{format_hostport(router_host, router_port)}"
         logger.info("Router: %s", self._router_addr)
 
@@ -524,7 +548,7 @@ class RolloutControllerV2:
 
         data_proxy_worker_ids = [str(uuid.uuid4()) for _ in range(dp_size)]
 
-        async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str, str]:
+        async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             worker_id = data_proxy_worker_ids[group_idx]
             if self.external_mode:
                 head_worker = inf_workers[group_idx]
@@ -557,7 +581,7 @@ class RolloutControllerV2:
                 worker_index=group_idx,
                 raw_cmd=dp_cmd,
             )
-            return host, port, guard_addr, worker_id
+            return host, port, worker_id
 
         gw_cmd = [
             sys.executable,
@@ -585,16 +609,13 @@ class RolloutControllerV2:
             *[_fork_data_proxy(i) for i in range(dp_size)]
         )
 
-        # Track data-proxies in group order, then gateway — deterministic cleanup.
-        for group_idx, (dp_host, dp_port, dp_guard, worker_id) in enumerate(dp_results):
+        for dp_host, dp_port, worker_id in dp_results:
             self._record_data_proxy_launch(
                 f"http://{format_hostport(dp_host, dp_port)}", worker_id
             )
-            self._forked_services.append((dp_guard, "data-proxy", group_idx))
         logger.info("Data proxies: %s", self._data_proxy_addrs)
 
         gw_host, gw_port = await gw_task
-        self._forked_services.append((guard_addr_0, "gateway", 0))
         self._gateway_addr = f"http://{format_hostport(gw_host, gw_port)}"
         logger.info("Gateway: %s", self._gateway_addr)
 
@@ -698,6 +719,12 @@ class RolloutControllerV2:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
+                owner = (
+                    guard_addr,
+                    "inf-server",
+                    group_idx * nnodes_per_instance + node_rank,
+                )
+                self._forked_services.append(owner)
                 return inf_host, inf_port, guard_addr
 
             node_results = await asyncio.gather(
@@ -705,14 +732,15 @@ class RolloutControllerV2:
             )
 
             head_inf_host, head_inf_port, _ = node_results[0]
-            forked: list[tuple[str, str, int]] = [
+            forked: tuple[tuple[str, str, int], ...] = tuple(
                 (guard_addr, "inf-server", group_idx * nnodes_per_instance + rank)
                 for rank, (_, _, guard_addr) in enumerate(node_results)
-            ]
+            )
             return (head_inf_host, head_inf_port, forked)
 
         group_results = await asyncio.gather(*[_fork_group(i) for i in range(dp_size)])
 
+        health_targets: list[tuple[str, tuple[tuple[str, str, int], ...]]] = []
         for host, port, forked in group_results:
             addr = f"http://{format_hostport(host, port)}"
             self._inf_addrs.append(addr)
@@ -723,15 +751,18 @@ class RolloutControllerV2:
                     process=None,  # type: ignore[arg-type]
                 )
             )
-            self._forked_services.extend(forked)
+            health_targets.append((addr, forked))
 
         # Wait for all inference servers to be healthy in parallel
         await asyncio.gather(
             *[
                 self._async_wait_for_service(
-                    f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
+                    f"{addr}/health",
+                    f"InfServer-{i}",
+                    timeout=cfg.setup_timeout,
+                    process_owners=process_owners,
                 )
-                for i, addr in enumerate(self._inf_addrs)
+                for i, (addr, process_owners) in enumerate(health_targets)
             ]
         )
 
@@ -744,7 +775,7 @@ class RolloutControllerV2:
         data_proxy_addr = data_proxy_addr.rstrip("/")
         with self._registration_operation_lock:
             with self._registration_state_lock:
-                if self._destroyed:
+                if self._destroyed or self._shutdown_requested.is_set():
                     return
                 if worker_id is not None and data_proxy_addr in self._data_proxy_addrs:
                     raise ValueError(
@@ -764,7 +795,11 @@ class RolloutControllerV2:
     ) -> _DataProxyRegistrationSnapshot | None:
         """Atomically freeze the CAS payload for one registration attempt."""
         with self._registration_state_lock:
-            if self._destroyed or not self._data_proxy_addrs:
+            if (
+                self._destroyed
+                or self._shutdown_requested.is_set()
+                or not self._data_proxy_addrs
+            ):
                 return None
 
             state_changed = False
@@ -795,38 +830,112 @@ class RolloutControllerV2:
             )
 
     def _wait_for_service(
-        self, url: str, name: str, timeout: float | None = None
+        self,
+        url: str,
+        name: str,
+        timeout: float | None = None,
+        process_owners: tuple[tuple[str, str, int], ...] = (),
     ) -> None:
         """Wait for a service to become healthy."""
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(f"{name} startup cancelled by controller shutdown")
+            is_healthy = False
             try:
                 resp = self._sync_client.get(url, timeout=2)
-                if resp.status_code == 200:
-                    logger.info("%s is ready at %s", name, url)
-                    return
+                is_healthy = resp.status_code == 200
             except httpx.HTTPError:
                 pass
+            for process_owner in process_owners:
+                returncode = self._forked_worker_returncode(process_owner)
+                if returncode is not None:
+                    _, role, worker_index = process_owner
+                    raise RuntimeError(
+                        f"{name} ({role}/{worker_index}) exited before becoming "
+                        f"healthy with exit code {returncode}"
+                    )
+            if is_healthy:
+                logger.info("%s is ready at %s", name, url)
+                return
             time.sleep(0.1)
         raise TimeoutError(f"{name} did not become healthy at {url} within {timeout}s")
 
     async def _async_wait_for_service(
-        self, url: str, name: str, timeout: float | None = None
+        self,
+        url: str,
+        name: str,
+        timeout: float | None = None,
+        process_owners: tuple[tuple[str, str, int], ...] = (),
     ) -> None:
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
         client = await self._get_async_client()
         while time.monotonic() < deadline:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(f"{name} startup cancelled by controller shutdown")
+            is_healthy = False
             try:
                 resp = await client.get(url, timeout=2.0)
-                if resp.status_code == 200:
-                    logger.info("%s is ready at %s", name, url)
-                    return
+                is_healthy = resp.status_code == 200
             except Exception:
                 pass
+            for process_owner in process_owners:
+                returncode = await self._async_forked_worker_returncode(
+                    client, process_owner
+                )
+                if returncode is not None:
+                    _, role, worker_index = process_owner
+                    raise RuntimeError(
+                        f"{name} ({role}/{worker_index}) exited before becoming "
+                        f"healthy with exit code {returncode}"
+                    )
+            if is_healthy:
+                logger.info("%s is ready at %s", name, url)
+                return
             await asyncio.sleep(0.1)
         raise TimeoutError(f"{name} did not become healthy at {url} within {timeout}s")
+
+    def _forked_worker_returncode(
+        self, process_owner: tuple[str, str, int]
+    ) -> int | None:
+        guard_addr, role, worker_index = process_owner
+        try:
+            response = self._sync_client.get(
+                f"{guard_addr}/forked_worker_status",
+                params={"role": role, "worker_index": worker_index},
+                timeout=2.0,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if payload.get("running", True):
+                return None
+            return int(payload["returncode"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    async def _async_forked_worker_returncode(
+        client: httpx.AsyncClient,
+        process_owner: tuple[str, str, int],
+    ) -> int | None:
+        guard_addr, role, worker_index = process_owner
+        try:
+            response = await client.get(
+                f"{guard_addr}/forked_worker_status",
+                params={"role": role, "worker_index": worker_index},
+                timeout=2.0,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if payload.get("running", True):
+                return None
+            return int(payload["returncode"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            return None
 
     def _register_data_proxies_in_router(self) -> None:
         """Register all data proxy workers in the router and store their worker IDs."""
@@ -1285,82 +1394,115 @@ class RolloutControllerV2:
 
     def destroy(self) -> None:
         """Tear down all services and release resources."""
-        with self._registration_state_lock:
-            if self._destroyed:
-                return
-            self._destroyed = True
-            self._registration_generation += 1
-            self._data_proxy_addrs.clear()
-            self._worker_ids.clear()
-            self._desired_worker_ids.clear()
-            self._predecessor_worker_ids.clear()
-
-        self._shutdown_requested.set()
-        future = self._init_future
-        self._init_future = None
-        if future is not None:
-            future.cancel()
-
-        self._stop_online_callback_server()
-
-        # Destroy workflow executor
-        if self._workflow_executor is not None:
-            self._workflow_executor.destroy()
-            self._workflow_executor = None
-
-        # Kill services forked directly via RPCGuard /fork
-        # (router, data proxies, gateway, and inference servers when applicable)
-        for guard_addr, role, worker_index in reversed(self._forked_services):
-            try:
-                self._kill_forked_service(guard_addr, role, worker_index)
-            except Exception:
-                logger.error(
-                    "Error killing forked service %s/%d: %s",
-                    role,
-                    worker_index,
-                    traceback.format_exc(),
+        with self._destroy_lock:
+            with self._registration_state_lock:
+                has_runtime_owners = bool(
+                    self._callback_server is not None
+                    or self._callback_server_thread is not None
+                    or self._workflow_executor is not None
+                    or self._forked_services
+                    or self._service_roles
+                    or self.workers
+                    or self._async_client is not None
                 )
-        self._forked_services.clear()
+                if self._destroyed and not has_runtime_owners:
+                    return
+                # Fence late registration before any blocking cleanup starts.
+                self._destroyed = True
+                self._registration_generation += 1
+                self._data_proxy_addrs.clear()
+                self._worker_ids.clear()
+                self._desired_worker_ids.clear()
+                self._predecessor_worker_ids.clear()
 
-        # Close shared HTTP clients after all kill requests have been sent
-        self._sync_client.close()
-        if self._async_client is not None:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+
+            def record_cleanup_error(stage: str, exc: BaseException) -> None:
+                logger.error("Cleanup failed at %s", stage, exc_info=True)
+                cleanup_errors.append((stage, exc))
+
+            self._shutdown_requested.set()
+            future = self._init_future
+            self._init_future = None
+            if future is not None:
+                future.cancel()
+
             try:
-                from areal.infra.utils.concurrent import run_async_task
+                self._stop_online_callback_server()
+            except BaseException as exc:
+                record_cleanup_error("online callback server", exc)
 
-                run_async_task(self._async_client.aclose)
-            except Exception:
-                pass
-            self._async_client = None
-            self._async_client_loop = None
+            if self._workflow_executor is not None:
+                try:
+                    self._workflow_executor.destroy()
+                except BaseException as exc:
+                    record_cleanup_error("workflow executor", exc)
+                else:
+                    self._workflow_executor = None
 
-        # RPCGuard's shutdown `finally` block automatically kills all
-        # forked children, so explicit teardown above is best-effort.
-        # Delete all RPCGuard workers via scheduler
-        for role in reversed(self._service_roles):
+            # Kill services forked directly via RPCGuard /fork in reverse order.
+            for owner in reversed(list(self._forked_services)):
+                guard_addr, role, worker_index = owner
+                try:
+                    self._kill_forked_service(guard_addr, role, worker_index)
+                except BaseException as exc:
+                    record_cleanup_error(f"forked service {role}/{worker_index}", exc)
+                else:
+                    self._forked_services.remove(owner)
+
+            # Close shared HTTP clients after all direct kill requests.
             try:
-                self.scheduler.delete_workers(role=role)
-                logger.info("Workers deleted for role: %s", role)
-            except Exception:
-                logger.error(
-                    "Error deleting workers for role %s: %s",
-                    role,
-                    traceback.format_exc(),
-                )
+                self._sync_client.close()
+            except BaseException as exc:
+                record_cleanup_error("sync HTTP client", exc)
+            if self._async_client is not None:
+                try:
+                    from areal.infra.utils.concurrent import run_async_task
 
-        self._service_roles.clear()
-        self.workers.clear()
-        self._server_infos.clear()
-        with self._online_waiters_lock:
-            for waiter in self._online_waiters.values():
-                if not waiter.future.done():
-                    waiter.future.cancel()
-            self._online_waiters.clear()
-            self._online_settlements.clear()
-        self._inf_addrs.clear()
-        self._router_addr = ""
-        self._gateway_addr = ""
-        self._staleness_manager = None
+                    run_async_task(self._async_client.aclose)
+                except BaseException as exc:
+                    record_cleanup_error("async HTTP client", exc)
+                else:
+                    self._async_client = None
+                    self._async_client_loop = None
+
+            # Deleting each guard also reaps any child whose direct kill failed.
+            for role in reversed(list(self._service_roles)):
+                try:
+                    self.scheduler.delete_workers(role=role)
+                except BaseException as exc:
+                    record_cleanup_error(f"worker role {role}", exc)
+                else:
+                    logger.info("Workers deleted for role: %s", role)
+                    self._service_roles.remove(role)
+
+            self.workers.clear()
+            self._server_infos.clear()
+            try:
+                with self._online_waiters_lock:
+                    for waiter in self._online_waiters.values():
+                        if not waiter.future.done():
+                            waiter.future.cancel()
+                    self._online_waiters.clear()
+                    self._online_settlements.clear()
+            except BaseException as exc:
+                record_cleanup_error("online waiters", exc)
+            self._inf_addrs.clear()
+            self._router_addr = ""
+            self._gateway_addr = ""
+            self._staleness_manager = None
+
+            if cleanup_errors:
+                with self._registration_state_lock:
+                    # Permit an explicit retry for any owner retained above.
+                    self._destroyed = False
+                first_stage, first_error = cleanup_errors[0]
+                for stage, error in cleanup_errors[1:]:
+                    first_error.add_note(
+                        f"{stage} also failed: {type(error).__name__}: {error}"
+                    )
+                first_error.add_note(f"First cleanup failure occurred at {first_stage}")
+                raise first_error
 
     # -- Version management ------------------------------------------------
 
@@ -2065,11 +2207,14 @@ class RolloutControllerV2:
             },
         )
         resp.raise_for_status()
-
         self._forked_services.append((guard_addr, role, worker_index))
 
         addr = f"http://{format_hostport(host, port)}"
-        self._wait_for_service(f"{addr}{health_path}", role)
+        self._wait_for_service(
+            f"{addr}{health_path}",
+            role,
+            process_owners=((guard_addr, role, worker_index),),
+        )
 
         return host, port
 
@@ -2083,9 +2228,9 @@ class RolloutControllerV2:
     ) -> tuple[str, int]:
         """Async fork a process on a RPCGuard worker via ``/fork``.
 
-        Returns ``(host, port)`` of the forked service.  The caller is
-        responsible for appending to ``_forked_services`` to maintain
-        deterministic cleanup ordering when multiple forks run concurrently.
+        Returns ``(host, port)`` of the forked service. Ownership is recorded
+        immediately after the guard acknowledges the fork and before readiness
+        polling begins.
         """
         client = await self._get_async_client()
         resp = await client.post(
@@ -2105,9 +2250,14 @@ class RolloutControllerV2:
 
         resp = await client.post(f"{guard_addr}/fork", json=fork_payload, timeout=30.0)
         resp.raise_for_status()
+        self._forked_services.append((guard_addr, role, worker_index))
 
         addr = f"http://{format_hostport(host, port)}"
-        await self._async_wait_for_service(f"{addr}{health_path}", role)
+        await self._async_wait_for_service(
+            f"{addr}{health_path}",
+            role,
+            process_owners=((guard_addr, role, worker_index),),
+        )
 
         return host, port
 
