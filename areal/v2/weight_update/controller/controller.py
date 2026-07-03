@@ -214,27 +214,32 @@ class WeightUpdateController:
         return resp.json()
 
     def destroy(self) -> None:
+        primary_error: BaseException | None = None
+        primary_traceback: TracebackType | None = None
+
+        def _record_cleanup_error(stage: str, cleanup_error: BaseException) -> None:
+            nonlocal primary_error, primary_traceback
+            if primary_error is None:
+                primary_error = cleanup_error
+                primary_traceback = cleanup_error.__traceback__
+                return
+            logger.warning(
+                "%s failed after an earlier cleanup operation was interrupted",
+                stage,
+                exc_info=True,
+            )
+            primary_error.add_note(
+                f"{stage} also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
         if self._pair_name is not None:
             try:
                 self.disconnect()
             except Exception:
                 logger.warning("Failed to disconnect during destroy", exc_info=True)
-
-        session_error: BaseException | None = None
-        session_traceback: TracebackType | None = None
-
-        def _record_process_cleanup_error(
-            stage: str, cleanup_error: BaseException
-        ) -> None:
-            assert session_error is not None
-            logger.warning(
-                "%s failed after gateway HTTP session cleanup was interrupted",
-                stage,
-                exc_info=True,
-            )
-            session_error.add_note(
-                f"{stage} also failed: {type(cleanup_error).__name__}: {cleanup_error}"
-            )
+            except BaseException as exc:
+                logger.warning("Gateway disconnect was interrupted", exc_info=True)
+                _record_cleanup_error("Gateway disconnect", exc)
 
         session = self._session
         if session is not None:
@@ -242,8 +247,7 @@ class WeightUpdateController:
                 session.close()
             except BaseException as exc:
                 logger.warning("Failed to close gateway HTTP session", exc_info=True)
-                session_error = exc
-                session_traceback = exc.__traceback__
+                _record_cleanup_error("Gateway HTTP session cleanup", exc)
             else:
                 if self._session is session:
                     self._session = None
@@ -255,15 +259,13 @@ class WeightUpdateController:
                 kill_process_tree(gateway_proc.pid)
             except Exception as exc:
                 logger.warning("Failed to kill gateway process", exc_info=True)
-                if session_error is not None:
-                    session_error.add_note(
-                        "Gateway process-tree cleanup also failed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                if primary_error is not None:
+                    _record_cleanup_error("Gateway process-tree cleanup", exc)
             except BaseException as exc:
-                if session_error is None:
-                    raise
-                _record_process_cleanup_error("Gateway process-tree cleanup", exc)
+                logger.warning(
+                    "Gateway process-tree cleanup was interrupted", exc_info=True
+                )
+                _record_cleanup_error("Gateway process-tree cleanup", exc)
             try:
                 gateway_proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
@@ -276,28 +278,28 @@ class WeightUpdateController:
                     # The process may exit between wait() timing out and kill().
                     pass
                 except BaseException as exc:
-                    if session_error is None:
+                    if primary_error is None:
                         raise
-                    _record_process_cleanup_error("Gateway process kill", exc)
+                    _record_cleanup_error("Gateway process kill", exc)
                 try:
                     gateway_proc.wait(timeout=1)
                 except BaseException as exc:
-                    if session_error is None:
+                    if primary_error is None:
                         raise
-                    _record_process_cleanup_error("Final gateway process wait", exc)
+                    _record_cleanup_error("Final gateway process wait", exc)
                 else:
                     process_reaped = True
             except BaseException as exc:
-                if session_error is None:
+                if primary_error is None:
                     raise
-                _record_process_cleanup_error("Gateway process wait", exc)
+                _record_cleanup_error("Gateway process wait", exc)
             else:
                 process_reaped = True
             if process_reaped and self._gateway_proc is gateway_proc:
                 self._gateway_proc = None
         if self._gateway_proc is None:
             self._gateway_url = ""
-        if session_error is not None:
-            assert session_traceback is not None
-            raise session_error.with_traceback(session_traceback)
+        if primary_error is not None:
+            assert primary_traceback is not None
+            raise primary_error.with_traceback(primary_traceback)
         logger.info("WeightUpdateController destroyed")

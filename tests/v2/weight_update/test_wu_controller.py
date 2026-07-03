@@ -105,6 +105,33 @@ class _FailOnceSession:
                 raise
 
 
+class _InterruptingDisconnectSession:
+    def __init__(
+        self,
+        disconnect_error: BaseException,
+        close_effects: list[BaseException | None],
+    ) -> None:
+        self.disconnect_error = disconnect_error
+        self.close_effects = close_effects
+        self.post_count = 0
+        self.close_count = 0
+        self.disconnect_traceback = None
+
+    def post(self, *_args, **_kwargs):
+        self.post_count += 1
+        try:
+            raise self.disconnect_error
+        except BaseException as exc:
+            self.disconnect_traceback = exc.__traceback__
+            raise
+
+    def close(self) -> None:
+        self.close_count += 1
+        effect = self.close_effects.pop(0)
+        if effect is not None:
+            raise effect
+
+
 @pytest.fixture()
 def ctrl() -> WeightUpdateController:
     c = WeightUpdateController(
@@ -497,6 +524,127 @@ class TestLifecycle:
             assert session.close.call_count == 2
         finally:
             _force_reap_process(process)
+
+    def test_destroy_preserves_disconnect_interrupt_while_finishing_cleanup(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        primary_error = KeyboardInterrupt("disconnect interrupted")
+        session_error = RuntimeError("session close failed")
+        session = _InterruptingDisconnectSession(
+            primary_error,
+            [session_error, None],
+        )
+        process = _ScriptedGatewayProcess([0])
+        tree_cleanup_pids: list[int] = []
+        controller = WeightUpdateController()
+        controller._pair_name = "pair0"
+        controller._session = session
+        controller._gateway_proc = process
+        controller._gateway_url = GATEWAY_URL
+        monkeypatch.setattr(
+            controller_module,
+            "kill_process_tree",
+            lambda pid: tree_cleanup_pids.append(pid),
+        )
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            controller.destroy()
+
+        assert exc_info.value is primary_error
+        traceback_cursor = exc_info.tb
+        traceback_nodes = []
+        while traceback_cursor is not None:
+            traceback_nodes.append(traceback_cursor)
+            traceback_cursor = traceback_cursor.tb_next
+        assert session.disconnect_traceback in traceback_nodes
+        assert any(
+            "session close failed" in note
+            for note in getattr(primary_error, "__notes__", [])
+        )
+        assert session.post_count == 1
+        assert session.close_count == 1
+        assert tree_cleanup_pids == [process.pid]
+        assert process.wait_timeouts == [1]
+        assert controller._pair_name is None
+        assert controller._session is session
+        assert controller._gateway_proc is None
+        assert controller.gateway_url == ""
+
+        controller.destroy()
+        controller.destroy()
+
+        assert session.post_count == 1
+        assert session.close_count == 2
+        assert tree_cleanup_pids == [process.pid]
+        assert process.wait_timeouts == [1]
+        assert controller._session is None
+
+    def test_destroy_preserves_tree_interrupt_through_fallback_and_owner_retry(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        primary_error = KeyboardInterrupt("tree cleanup interrupted")
+        final_wait_error = OSError("final wait failed")
+        process = _ScriptedGatewayProcess(
+            [
+                subprocess.TimeoutExpired(cmd="gateway", timeout=1),
+                final_wait_error,
+                0,
+            ]
+        )
+        tree_cleanup_calls = 0
+        tree_cleanup_traceback = None
+
+        def interrupt_tree_cleanup_once(_pid: int) -> None:
+            nonlocal tree_cleanup_calls, tree_cleanup_traceback
+            tree_cleanup_calls += 1
+            if tree_cleanup_calls == 1:
+                try:
+                    raise primary_error
+                except BaseException as exc:
+                    tree_cleanup_traceback = exc.__traceback__
+                    raise
+
+        controller = WeightUpdateController()
+        controller._gateway_proc = process
+        controller._gateway_url = GATEWAY_URL
+        monkeypatch.setattr(
+            controller_module,
+            "kill_process_tree",
+            interrupt_tree_cleanup_once,
+        )
+
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            controller.destroy()
+
+        assert exc_info.value is primary_error
+        traceback_cursor = exc_info.tb
+        traceback_nodes = []
+        while traceback_cursor is not None:
+            traceback_nodes.append(traceback_cursor)
+            traceback_cursor = traceback_cursor.tb_next
+        assert tree_cleanup_traceback in traceback_nodes
+        assert any(
+            "final wait failed" in note
+            for note in getattr(primary_error, "__notes__", [])
+        )
+        assert tree_cleanup_calls == 1
+        assert process.wait_timeouts == [1, 1]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is process
+        assert controller.gateway_url == GATEWAY_URL
+
+        controller.destroy()
+        controller.destroy()
+
+        assert tree_cleanup_calls == 2
+        assert process.wait_timeouts == [1, 1, 1]
+        assert process.kill_count == 1
+        assert controller._gateway_proc is None
+        assert controller.gateway_url == ""
 
     @pytest.mark.parametrize(
         "failure_stage",
