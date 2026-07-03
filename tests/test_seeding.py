@@ -33,3 +33,37 @@ def test_set_random_seed_uses_stable_uint32_derivation(monkeypatch, base_seed):
 def test_set_random_seed_rejects_values_outside_uint32(invalid_seed):
     with pytest.raises(ValueError, match="base_seed.*unsigned 32-bit"):
         seeding.set_random_seed(invalid_seed, "actor0")
+
+
+@pytest.mark.parametrize(
+    ("configured_seed", "expected_seed"),
+    [(20260703, 20260703), (None, 42)],
+)
+def test_megatron_model_parallel_rng_uses_worker_seed_before_process_group(
+    configured_seed, expected_seed
+):
+    pytest.importorskip("mbridge")
+    from areal.engine.megatron_engine import MegatronEngine
+
+    engine = MegatronEngine.__new__(MegatronEngine)
+    get_seed_patch = (
+        patch(
+            "areal.engine.megatron_engine.get_seed",
+            side_effect=ValueError("seed is unset"),
+        )
+        if configured_seed is None
+        else patch(
+            "areal.engine.megatron_engine.get_seed", return_value=configured_seed
+        )
+    )
+    with (
+        get_seed_patch,
+        patch(
+            "areal.engine.megatron_engine.tensor_parallel."
+            "model_parallel_cuda_manual_seed"
+        ) as manual_seed,
+    ):
+        engine._seed_model_parallel_rng()
+
+    assert engine.seed == expected_seed
+    manual_seed.assert_called_once_with(expected_seed)

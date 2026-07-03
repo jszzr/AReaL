@@ -243,8 +243,11 @@ class MegatronEngine(TrainEngine):
                     DIST_GROUP_DEFAULT_TIMEOUT.seconds / 60
                 ),
             )
-            # Set megatron model parallel seed
-            tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
+            # The v2 worker seeds global RNGs before engine construction, but
+            # Megatron owns a separate CUDA RNG tracker.  Resolve that worker
+            # seed before model-parallel state is first used rather than
+            # waiting until initialize(), which runs after this method.
+            self._seed_model_parallel_rng()
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
         self._context_and_model_parallel_group = None
@@ -261,6 +264,14 @@ class MegatronEngine(TrainEngine):
             self._context_and_model_parallel_group,
             mpu.get_data_parallel_group(),
         )
+
+    def _seed_model_parallel_rng(self) -> None:
+        """Seed Megatron's CUDA RNG tracker from the process worker seed."""
+        try:
+            self.seed = get_seed()
+        except ValueError:
+            self.seed = 42
+        tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
 
     def _apply_megatron_bridge_lora(self) -> None:
         assert self.model is not None, "Model must be initialized before applying LoRA."
