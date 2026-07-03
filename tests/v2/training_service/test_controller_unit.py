@@ -15,8 +15,8 @@ from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
     _disk_gateway_save_root,
 )
-from areal.v2.weight_update.gateway.config import WeightUpdateResult
 from areal.v2.weight_update.controller.controller import WeightUpdateController
+from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
 MODULE = "areal.v2.training_service.controller.controller"
 
@@ -57,6 +57,8 @@ def _make_rollout() -> RolloutControllerV2:
     rollout = RolloutControllerV2.__new__(RolloutControllerV2)
     rollout._init_future = None
     rollout._inf_addrs = ["http://inference-worker"]
+    rollout.config = SimpleNamespace(api_url=None)
+    rollout.rollout_alloc = SimpleNamespace(backend="sglang")
     return rollout
 
 
