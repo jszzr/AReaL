@@ -1121,6 +1121,7 @@ class PPOTrainer:
 
         # Determine engine class and server args based on backend
         rollout_backend = self.rollout_alloc.backend
+        server_env: dict[str, str] | None = None
         if rollout_backend == "sglang":
             if self.config.rollout.return_routed_experts:
                 self.config.sglang.enable_return_routed_experts = True
@@ -1135,6 +1136,7 @@ class PPOTrainer:
                 pp_size=self.rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
+            server_env = SGLangConfig.build_server_env(self.config.sglang)
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(
@@ -1175,6 +1177,8 @@ class PPOTrainer:
             role="rollout",
             server_args=server_args,
         )
+        if config._version == "v2" and server_env:
+            init_kwargs["server_env"] = server_env
         if is_eval:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos

@@ -2394,6 +2394,7 @@ class TestMultiNodeConfig:
             await controller._async_initialize(
                 server_args=None,
                 server_infos=None,
+                server_env={"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"},
             )
 
         # dp_size=1, nnodes_per_instance=2: total_workers = 2
@@ -2416,6 +2417,7 @@ class TestMultiNodeConfig:
         for fc in fork_calls:
             cmd_str = " ".join(fc["raw_cmd"])
             assert "--dist-init-addr" in cmd_str or "--dist_init_addr" in cmd_str
+            assert fc["env"] == {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
         # Only 1 data proxy (dp_size=1, on head worker only)
         data_proxy_calls = [

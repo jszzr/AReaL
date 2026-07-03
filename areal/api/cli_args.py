@@ -1964,6 +1964,11 @@ class vLLMConfig:
         return vLLMConfig.build_cmd_from_args(args)
 
 
+_SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = (
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
+)
+
+
 @dataclass
 class SGLangConfig:
     """Configuration for SGLang runtime; per-request seeds require enable_deterministic_inference, which may reduce throughput. Refer to:
@@ -2036,9 +2041,26 @@ class SGLangConfig:
         default=False,
         metadata={"help": "Seed opt-in"},
     )
+    enable_batch_invariant_ops_mm_deepgemm: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable DeepGEMM for SGLang batch-invariant matrix multiplication. "
+                "None preserves SGLang's default."
+            )
+        },
+    )
 
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
+
+    @staticmethod
+    def build_server_env(sglang_config: "SGLangConfig") -> dict[str, str]:
+        """Build environment overrides consumed before SGLang imports kernels."""
+        enabled = sglang_config.enable_batch_invariant_ops_mm_deepgemm
+        if enabled is None:
+            return {}
+        return {_SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM: "1" if enabled else "0"}
 
     # Use staticmethod to make OmegaConf happy.
     @staticmethod
@@ -2085,6 +2107,7 @@ class SGLangConfig:
     ):
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        args.pop("enable_batch_invariant_ops_mm_deepgemm", None)
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,

@@ -238,6 +238,7 @@ class RolloutControllerV2:
         server_infos: list[LocalInfServerInfo] | None = None,
         *args: Any,
         wait: bool = False,
+        server_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
         from areal.infra.utils.concurrent import get_executor
@@ -253,7 +254,12 @@ class RolloutControllerV2:
         self._workers_ready.clear()
         self._shutdown_requested.clear()
         self._init_future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
+            self._guarded_bg_initialize,
+            server_args,
+            server_infos,
+            *args,
+            server_env=server_env,
+            **kwargs,
         )
 
         ready_timeout = self.config.workers_ready_timeout
@@ -280,12 +286,18 @@ class RolloutControllerV2:
         server_args: dict[str, Any] | None,
         server_infos: list[LocalInfServerInfo] | None = None,
         *args: Any,
+        server_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
         run_async_task(
-            self._async_initialize, server_args, server_infos, *args, **kwargs
+            self._async_initialize,
+            server_args,
+            server_infos,
+            *args,
+            server_env=server_env,
+            **kwargs,
         )
 
         if self._shutdown_requested.is_set():
@@ -353,6 +365,7 @@ class RolloutControllerV2:
         server_args: dict[str, Any] | None,
         server_infos: list[LocalInfServerInfo] | None = None,
         *args: Any,
+        server_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         from dataclasses import asdict
@@ -476,6 +489,7 @@ class RolloutControllerV2:
                 dp_size,
                 nnodes_per_instance,
                 server_args,
+                server_env=server_env,
             )
         logger.info("Inference servers: %s", self._inf_addrs)
 
@@ -607,6 +621,7 @@ class RolloutControllerV2:
         dp_size: int,
         nnodes_per_instance: int,
         server_args: dict[str, Any] | None,
+        server_env: dict[str, str] | None = None,
     ) -> None:
         if inf_backend == "sglang":
             from areal.api.cli_args import SGLangConfig
@@ -672,7 +687,9 @@ class RolloutControllerV2:
                     "worker_index": group_idx * nnodes_per_instance + node_rank,
                     "raw_cmd": cmd,
                 }
-                if inf_backend == "vllm":
+                if inf_backend == "sglang" and server_env:
+                    fork_payload["env"] = dict(server_env)
+                elif inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
                     )

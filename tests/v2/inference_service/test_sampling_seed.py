@@ -235,9 +235,10 @@ def test_new_seed_fields_preserve_existing_positional_parameter_order():
     sglang_fields = [field.name for field in fields(SGLangConfig)]
 
     assert generation_fields[-3:] == ["lora_name", "use_beam_search", "seed"]
-    assert sglang_fields[-3:] == [
+    assert sglang_fields[-4:] == [
         "enable_multithread_load",
         "enable_deterministic_inference",
+        "enable_batch_invariant_ops_mm_deepgemm",
         "enable_return_routed_experts",
     ]
 
