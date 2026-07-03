@@ -3,8 +3,8 @@
 """Interactive conversation loop against a running Hermes Agent Service.
 
 This is the standalone chat window: it assumes the Agent Service is **already
-running** (started separately with ``areal agent run``) and a per-session
-``sk-sess-*`` key has **already been minted** on the inference gateway (with
+running** (started separately with ``areal agent run``) and an opaque
+per-session key has **already been minted** on the inference gateway (with
 ``start_session.py``). It only opens a ``You:`` prompt and drives the agent.
 
 Each user message becomes one turn of the Hermes conversation, posted to the
@@ -21,7 +21,7 @@ Usage::
 
     # self-evolution: capture the trajectory under a session key
     python hermes_loop.py http://<agent-gateway> --admin-api-key <agent-admin-key> \\
-        --inf-base-url http://<inference-gateway> --session-api-key sk-sess-xxxx
+        --inf-base-url http://<inference-gateway> --session-api-key <session-key>
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def main() -> None:
     parser.add_argument(
         "--session-api-key",
         default="",
-        help="Per-session sk-sess-* key from start_session.py (required for capture)",
+        help="Opaque per-session key from start_session.py (required for capture)",
     )
     args = parser.parse_args()
 

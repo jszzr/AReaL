@@ -9,7 +9,7 @@ exposes an OpenAI-compatible Gateway subprocess — Hermes
 ``AIAgent`` drives an OpenAI-compatible upstream itself.  Each per-session
 agent is therefore bound to its own upstream LLM (base URL + API key + model)
 so that, during training, a session's turns can be attributed to a distinct
-per-session key (``sk-sess-*``).
+opaque per-session key.
 
 Per turn the agent calls ``AIAgent.run_conversation`` with the conversation
 history the DataProxy replays.  Hermes rebuilds its message list from that
@@ -25,7 +25,7 @@ Upstream selection
 Per turn the agent prefers the inference upstream the DataProxy injects via
 ``AgentRequest.metadata['areal_inference']`` (``base_url`` / ``api_key`` /
 ``model``), so a session's LLM calls flow through AReaL's inference service
-under a per-session ``sk-sess-*`` key and get captured for training.  Outside
+under its opaque per-session key and get captured for training.  Outside
 training (e.g. the interactive demo) it falls back to the ``HERMES_UPSTREAM_*``
 environment variables.
 
@@ -80,7 +80,7 @@ class _Upstream:
 
         The DataProxy injects this when a turn opts into AReaL's inference
         service, so the session's LLM calls flow through the gateway under a
-        per-session ``sk-sess-*`` key and get captured for training.
+        per-session opaque key and get captured for training.
         """
         base_url = meta.get("base_url") or ""
         api_key = meta.get("api_key") or ""
@@ -234,7 +234,7 @@ class HermesAgent:
         need not re-supply its upstream once the session is live.  When no agent
         exists yet, an upstream must be resolvable — preferring the per-session
         inference routing the DataProxy injected (self-evolution, calls flow
-        through AReaL's inference service under a ``sk-sess-*`` key), else the
+        through AReaL's inference service under an opaque session key), else the
         process-wide env upstream (e.g. the interactive demo).  If a live
         session's upstream changes (env → AReaL inference), rebuild so the agent
         routes to the new endpoint/key.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -30,6 +31,7 @@ logger = logging.getLogger("InferenceServiceWorkflow")
 _RL_START_SESSION_PATHNAME = "rl/start_session"
 _RL_SET_REWARD_PATHNAME = "rl/set_reward"
 _EXPORT_TRAJECTORIES_PATHNAME = "export_trajectories"
+_ONLINE_LEASES_PATHNAME = "internal/online_leases"
 
 _CONNECTION_ERROR_TYPES: tuple[type[BaseException], ...] = (
     httpx.ConnectError,
@@ -44,10 +46,23 @@ _CONNECTION_ERROR_TYPES: tuple[type[BaseException], ...] = (
 )
 
 
+async def _raise_for_status_without_retrying_client_errors(
+    response: aiohttp.ClientResponse, operation: str
+) -> None:
+    """Keep transport/5xx retryable while failing deterministic 4xx once."""
+
+    status = getattr(response, "status", 200)
+    if isinstance(status, int) and 400 <= status < 500:
+        detail = await response.text()
+        raise ValueError(f"{operation} rejected with HTTP {status}: {detail}")
+    response.raise_for_status()
+
+
 def validate_trajectory_policy_version(
     traj: dict[str, Any], expected_policy_version: int
 ) -> None:
-    """Require every loss-bearing token to come from the expected policy."""
+    """Require every loss-bearing token to come from the admitted policy."""
+
     for field in ("versions", "loss_mask"):
         if field not in traj:
             raise ValueError(
@@ -62,7 +77,6 @@ def validate_trajectory_policy_version(
     )
     versions = provenance["versions"]
     loss_mask = provenance["loss_mask"]
-
     if not isinstance(versions, torch.Tensor) or not isinstance(
         loss_mask, torch.Tensor
     ):
@@ -75,7 +89,6 @@ def validate_trajectory_policy_version(
     selected_versions = versions[loss_mask == 1]
     if selected_versions.numel() == 0:
         raise ValueError("trajectory has no loss-bearing tokens")
-
     observed_versions = sorted(torch.unique(selected_versions.detach().cpu()).tolist())
     if not torch.all(selected_versions == expected_policy_version).item():
         raise ValueError(
@@ -131,6 +144,38 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.expected_policy_version = expected_policy_version
 
     @async_http_retry
+    async def _grant_online_lease(
+        self,
+        session: aiohttp.ClientSession,
+        lease_id: str,
+        expected_version: int,
+    ) -> None:
+        url = f"{self.gateway_addr}/{_ONLINE_LEASES_PATHNAME}"
+        headers = {"Authorization": f"Bearer {self._admin_api_key}"}
+        payload = {
+            "lease_id": lease_id,
+            "expected_version": expected_version,
+            "callback_url": f"http://{self.controller.callback_addr}",
+            "ttl_seconds": max(float(self.timeout or 300.0) + 30.0, 30.0),
+        }
+        async with session.post(url, json=payload, headers=headers) as resp:
+            await _raise_for_status_without_retrying_client_errors(
+                resp, "grant online lease"
+            )
+
+    @async_http_retry
+    async def _cancel_online_lease(
+        self,
+        session: aiohttp.ClientSession,
+        lease_id: str,
+    ) -> None:
+        url = f"{self.gateway_addr}/{_ONLINE_LEASES_PATHNAME}/{lease_id}"
+        headers = {"Authorization": f"Bearer {self._admin_api_key}"}
+        async with session.delete(url, headers=headers) as resp:
+            await _raise_for_status_without_retrying_client_errors(
+                resp, "cancel online lease"
+            )
+
     async def _start_session(
         self,
         session: aiohttp.ClientSession,
@@ -139,15 +184,35 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
     ) -> tuple[str | None, list[tuple[str, str]]]:
         """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...])."""
+        return await self._start_session_once(
+            session,
+            task_id,
+            request_id=str(uuid.uuid4()),
+            group_size=group_size,
+            delivery_mode=delivery_mode,
+        )
+
+    @async_http_retry
+    async def _start_session_once(
+        self,
+        session: aiohttp.ClientSession,
+        task_id: str,
+        request_id: str,
+        group_size: int,
+        delivery_mode: TrajectoryDeliveryMode,
+    ) -> tuple[str | None, list[tuple[str, str]]]:
         url = f"{self.gateway_addr}/{_RL_START_SESSION_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
             "task_id": task_id,
+            "request_id": request_id,
             "group_size": group_size,
             "delivery_mode": delivery_mode.value,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
+            await _raise_for_status_without_retrying_client_errors(
+                resp, "start session"
+            )
             data = await resp.json()
         group_id = data.get("group_id")
         credentials = [
@@ -171,7 +236,6 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         trajectory_id = data.get("trajectory_id")
         return int(trajectory_id) if trajectory_id is not None else None
 
-    @async_http_retry
     async def _export_interactions(
         self,
         session: aiohttp.ClientSession,
@@ -179,9 +243,27 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id: str | None = None,
         trajectory_id: int | None = None,
     ) -> dict[str, Any]:
+        return await self._export_interactions_once(
+            session,
+            session_ids,
+            request_id=str(uuid.uuid4()),
+            group_id=group_id,
+            trajectory_id=trajectory_id,
+        )
+
+    @async_http_retry
+    async def _export_interactions_once(
+        self,
+        session: aiohttp.ClientSession,
+        session_ids: list[str],
+        request_id: str,
+        group_id: str | None = None,
+        trajectory_id: int | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
+            "request_id": request_id,
             "session_ids": session_ids,
             "group_id": group_id,
             "trajectory_id": trajectory_id,
@@ -190,7 +272,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "remove_session": True,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
+            await _raise_for_status_without_retrying_client_errors(
+                resp, "export trajectories"
+            )
             data = await resp.json()
 
         return deserialize_value(data["traj"])
@@ -322,55 +406,85 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self,
         http_session: aiohttp.ClientSession,
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
-        logger.debug("Waiting for next ready online trajectory")
-        export_request = await self.controller.wait_for_online_trajectory(
-            timeout=self.timeout
+        lease_id, expected_version = self.controller.reserve_online_trajectory()
+        logger.debug(
+            "Waiting for online trajectory lease=%s version=%d",
+            lease_id,
+            expected_version,
         )
-        if not export_request:
-            return None
-
-        traj = await self._export_interactions(
-            http_session,
-            [export_request["session_id"]],
-            trajectory_id=export_request["trajectory_id"],
-        )
-        keep_trajectory = False
         try:
+            # The waiter is registered before this publish.  A producer can
+            # therefore never complete into an unowned callback buffer.
+            await self._grant_online_lease(
+                http_session,
+                lease_id,
+                expected_version,
+            )
+            export_request = await self.controller.wait_for_online_trajectory(
+                lease_id,
+                timeout=self.timeout,
+            )
+            if not export_request:
+                return None
+
+            traj = await self._export_interactions(
+                http_session,
+                [export_request["session_id"]],
+                group_id=export_request.get("group_id"),
+                trajectory_id=export_request["trajectory_id"],
+            )
             if not traj:
                 return None
 
-            rewards_tensor = traj.get("rewards")
-            if isinstance(rewards_tensor, RTensor):
-                rewards_tensor = rewards_tensor.to_local()
+            keep_trajectory = False
+            try:
+                # Local policies stamp every generated token and can therefore
+                # prove that loss-bearing tokens match the admitted version.
+                # External APIs expose interactions only; no local policy
+                # provenance exists to validate.
+                is_external = getattr(self.controller, "external_mode", False) is True
+                if not is_external:
+                    await asyncio.to_thread(
+                        validate_trajectory_policy_version,
+                        traj,
+                        expected_version,
+                    )
 
-            if rewards_tensor is not None and len(rewards_tensor) > 0:
-                last_reward = float(rewards_tensor[-1])
-            elif (
-                "interactions" in traj
-                and traj["interactions"]
-                and traj["interactions"][-1].get("reward") is not None
-            ):
-                last_reward = float(traj["interactions"][-1]["reward"])
-            else:
-                logger.warning(
-                    "Exported trajectory is missing rewards. "
-                    "This trajectory will be rejected."
-                )
-                return None
+                rewards_tensor = traj.get("rewards")
+                if isinstance(rewards_tensor, RTensor):
+                    rewards_tensor = rewards_tensor.to_local()
 
-            if self.expected_policy_version is not None:
-                await asyncio.to_thread(
-                    validate_trajectory_policy_version,
-                    traj,
-                    self.expected_policy_version,
-                )
+                if rewards_tensor is not None and len(rewards_tensor) > 0:
+                    last_reward = float(rewards_tensor[-1])
+                elif (
+                    "interactions" in traj
+                    and traj["interactions"]
+                    and traj["interactions"][-1].get("reward") is not None
+                ):
+                    last_reward = float(traj["interactions"][-1]["reward"])
+                else:
+                    logger.warning(
+                        "Exported trajectory is missing rewards. "
+                        "This trajectory will be rejected."
+                    )
+                    return None
 
-            metrics: dict[str, float | int] = {"reward": last_reward}
-            if self.expected_policy_version is not None:
-                metrics["policy_version"] = self.expected_policy_version
-            stats_tracker.get(workflow_context.stat_scope()).scalar(**metrics)
-            keep_trajectory = True
-            return traj
+                stat_values: dict[str, float | int] = {"reward": last_reward}
+                if not is_external:
+                    stat_values["policy_version"] = expected_version
+                stats_tracker.get(workflow_context.stat_scope()).scalar(**stat_values)
+                keep_trajectory = True
+                return traj
+            finally:
+                if not keep_trajectory:
+                    await _clear_trajectory_rtensors(traj)
         finally:
-            if not keep_trajectory:
-                await _clear_trajectory_rtensors(traj)
+            self.controller.cancel_online_trajectory(lease_id)
+            try:
+                await self._cancel_online_lease(http_session, lease_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to cancel online lease %s during cleanup: %s",
+                    lease_id,
+                    exc,
+                )

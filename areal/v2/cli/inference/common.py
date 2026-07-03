@@ -12,6 +12,7 @@ and TaskHandle column formatters.
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import click
 
@@ -170,6 +171,7 @@ def register_internal(
 
     replicas: list[ModelReplica] = []
     spawned_handles: list[TaskHandle] = []
+    confirmed_router_workers: list[tuple[str, str]] = []
 
     try:
         for rank in range(dp):
@@ -211,8 +213,10 @@ def register_internal(
             )
 
             proxy_log = log_dir / f"{model}-data-proxy-{rank}.log"
+            router_worker_id = str(uuid4())
             proxy_spec = build_data_proxy_task_spec(
                 name=f"data_proxy/{model}/{rank}",
+                worker_id=router_worker_id,
                 backend_addr=worker_handle.addr,
                 backend_type=engine,
                 tokenizer_path=tokenizer_path,
@@ -238,16 +242,31 @@ def register_internal(
                 poll_interval=1.0,
             )
 
-            replicas.append(ModelReplica(data_proxy=proxy_handle, worker=worker_handle))
+            replicas.append(
+                ModelReplica(
+                    data_proxy=proxy_handle,
+                    worker=worker_handle,
+                    router_worker_id=router_worker_id,
+                )
+            )
 
         proxy_addrs = [r.data_proxy.addr for r in replicas]
-        for addr in proxy_addrs:
+        for replica in replicas:
+            addr = replica.data_proxy.addr
+            assert replica.router_worker_id is not None
             try:
-                router.register_worker(addr)
+                response = router.register_worker(addr, replica.router_worker_id, None)
             except (ServiceUnreachable, ServiceHTTPError) as exc:
                 raise click.ClickException(
                     f"router register_worker {addr} failed: {exc}"
                 ) from exc
+            echoed_worker_id = response.get("worker_id")
+            if echoed_worker_id != replica.router_worker_id:
+                raise click.ClickException(
+                    f"router register_worker {addr} returned unexpected worker_id "
+                    f"{echoed_worker_id!r}; expected {replica.router_worker_id!r}"
+                )
+            confirmed_router_workers.append((addr, replica.router_worker_id))
 
         try:
             gateway.register_model(
@@ -262,6 +281,16 @@ def register_internal(
             raise click.ClickException(f"gateway register_model failed: {exc}") from exc
 
     except BaseException:
+        for addr, worker_id in reversed(confirmed_router_workers):
+            try:
+                router.unregister_worker(addr, worker_id)
+            except Exception as exc:
+                logger.warning(
+                    "router rollback unregister %s (id=%s) failed: %s",
+                    addr,
+                    worker_id,
+                    exc,
+                )
         if spawned_handles:
             logger.error(
                 "internal register failed; killing %d spawned worker(s)",

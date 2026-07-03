@@ -15,9 +15,13 @@ import pytest_asyncio
 from areal.v2.inference_service.gateway.app import create_app
 from areal.v2.inference_service.gateway.config import GatewayConfig
 from areal.v2.inference_service.gateway.streaming import (
+    RouterDestination,
     RouterKeyRejectedError,
+    RouterSessionRegistrationError,
     RouterUnreachableError,
+    register_session_in_router,
 )
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 # =============================================================================
 # Constants & Config
@@ -176,7 +180,9 @@ class TestAdminEndpoints:
         self, mock_query_router, mock_forward, mock_register, client
     ):
         """Admin key → /rl/start_session → forwarded, response intercepted, session registered."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
         session_resp_data = {
             "group_id": "grp-test-1",
             "sessions": [{"session_id": "task-1-0", "session_api_key": "sess-key-xyz"}],
@@ -185,7 +191,7 @@ class TestAdminEndpoints:
 
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "task-1"},
+            json={"task_id": "task-1", "delivery_mode": "pull"},
             headers=admin_headers(),
         )
         assert resp.status_code == 201
@@ -203,6 +209,71 @@ class TestAdminEndpoints:
             {"session_api_key": "sess-key-xyz", "session_id": "task-1-0"}
         ]  # sessions_list
         assert reg_args.args[2] == WORKER_ADDR  # worker_addr
+        assert reg_args.kwargs["worker_id"] == "worker-epoch-1"
+        assert mock_query_router.call_args.kwargs["new_session"] is True
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_start_session_refresh_routes_to_existing_key_owner(
+        self, mock_query_router, mock_forward, mock_register, client
+    ):
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
+        mock_forward.return_value = httpx.Response(
+            201,
+            json={
+                "group_id": "grp-refresh",
+                "sessions": [
+                    {"session_id": "task-refresh-1", "session_api_key": "old-key"}
+                ],
+            },
+        )
+
+        response = await client.post(
+            "/rl/start_session",
+            json={
+                "task_id": "task-refresh",
+                "api_key": "old-key",
+                "delivery_mode": "pull",
+            },
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 201
+        assert mock_query_router.call_args.args[1] == "old-key"
+        assert mock_query_router.call_args.kwargs["new_session"] is False
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_start_session_rejects_legacy_string_router_result(
+        self, mock_query_router, mock_forward, mock_register, client
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward.return_value = httpx.Response(
+            201,
+            json={
+                "group_id": "grp-legacy-route",
+                "sessions": [
+                    {"session_id": "task-legacy-0", "session_api_key": "key-legacy"}
+                ],
+            },
+        )
+
+        response = await client.post(
+            "/rl/start_session",
+            json={"task_id": "task-legacy", "delivery_mode": "pull"},
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 502
+        assert "worker incarnation" in response.json()["error"]
+        mock_forward.assert_not_awaited()
+        mock_register.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
@@ -212,7 +283,9 @@ class TestAdminEndpoints:
         self, mock_query_router, mock_forward, mock_register, client
     ):
         """If router registration fails after session creation → 502."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
         mock_forward.return_value = httpx.Response(
             201,
             json={
@@ -224,7 +297,7 @@ class TestAdminEndpoints:
 
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "t"},
+            json={"task_id": "t", "delivery_mode": "pull"},
             headers=admin_headers(),
         )
         assert resp.status_code == 502
@@ -237,12 +310,17 @@ class TestAdminEndpoints:
     async def test_admin_export_trajectories(
         self, mock_forward, mock_query_router, mock_revoke, client
     ):
-        mock_query_router.return_value = WORKER_ADDR
-        mock_forward.return_value = httpx.Response(200, json={"interactions": []})
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
+        mock_forward.return_value = httpx.Response(
+            200, json={"traj": {"interactions": []}}
+        )
 
         resp = await client.post(
             "/export_trajectories",
             json={
+                "request_id": "admin-export",
                 "session_ids": ["task-1-0"],
                 "group_id": "grp-test",
                 "discount": 1.0,
@@ -259,15 +337,146 @@ class TestAdminEndpoints:
     @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
     @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_export_response_replays_after_router_mapping_is_removed(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
+        response_body = {"traj": {"rewards": [1.0]}}
+        mock_forward.return_value = httpx.Response(200, json=response_body)
+        mock_revoke.return_value = True
+        request_body = {
+            "request_id": "export-replay-1",
+            "session_ids": ["task-1-0"],
+            "group_id": "grp-test",
+        }
+
+        first = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+        replay = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+
+        assert first.status_code == replay.status_code == 200
+        assert first.json() == replay.json() == response_body
+        mock_query_router.assert_awaited_once()
+        mock_forward.assert_awaited_once()
+        mock_revoke.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_export_lost_worker_response_retries_recalled_worker(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR,
+            worker_id="worker-epoch-1",
+        )
+        mock_forward.side_effect = [
+            httpx.ReadError("response lost after export committed"),
+            httpx.Response(200, json={"traj": {"rewards": [1.0]}}),
+        ]
+        request_body = {
+            "request_id": "export-lost-worker-response",
+            "session_ids": ["task-1-0"],
+        }
+
+        first = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+        retry = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+
+        assert first.status_code == 502
+        assert retry.status_code == 200
+        mock_query_router.assert_awaited_once()
+        assert mock_forward.await_count == 2
+        assert {
+            call.args[2][WORKER_ID_HEADER] for call in mock_forward.await_args_list
+        } == {"worker-epoch-1"}
+        mock_revoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_export_unexpected_router_error_releases_pending_owner(
+        self, mock_query_router, client
+    ):
+        mock_query_router.side_effect = [
+            ValueError("malformed router response"),
+            RouterKeyRejectedError("session not found", 404),
+        ]
+        request_body = {
+            "request_id": "export-router-error",
+            "session_ids": ["task-1-0"],
+        }
+
+        first = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+        retry = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+
+        assert first.status_code == 502
+        assert retry.status_code == 401
+        assert mock_query_router.await_count == 2
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_export_router_cleanup_failure_retries_without_losing_result(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
+        mock_forward.return_value = httpx.Response(
+            200, json={"traj": {"rewards": [1.0]}}
+        )
+        mock_revoke.side_effect = [False, True]
+        request_body = {
+            "request_id": "export-cleanup-retry",
+            "session_ids": ["task-1-0"],
+            "group_id": "grp-test",
+        }
+
+        first = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+        retry = await client.post(
+            "/export_trajectories", json=request_body, headers=admin_headers()
+        )
+
+        assert first.status_code == 200
+        assert retry.status_code == 200
+        assert mock_query_router.await_count == 1
+        assert mock_forward.await_count == 1
+        assert mock_revoke.await_count == 2
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
     async def test_online_export_without_group_id_skips_revoke(
         self, mock_forward, mock_query_router, mock_revoke, client
     ):
-        mock_query_router.return_value = WORKER_ADDR
-        mock_forward.return_value = httpx.Response(200, json={"interactions": []})
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
+        mock_forward.return_value = httpx.Response(
+            200, json={"traj": {"interactions": []}}
+        )
 
         resp = await client.post(
             "/export_trajectories",
             json={
+                "request_id": "online-export",
                 "session_ids": ["__hitl__"],
                 "trajectory_id": 0,
                 "discount": 1.0,
@@ -283,7 +492,7 @@ class TestAdminEndpoints:
         """Admin key → /export_trajectories without session_id → 400."""
         resp = await client.post(
             "/export_trajectories",
-            json={"discount": 1.0},
+            json={"request_id": "missing-session-export", "discount": 1.0},
             headers=admin_headers(),
         )
         assert resp.status_code == 400
@@ -417,16 +626,14 @@ class TestSessionEndpoints:
 
 class TestBroadcast:
     @pytest.mark.asyncio
-    @patch(f"{MODULE}.broadcast_to_workers", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
     @patch(f"{MODULE}.resolve_worker_addr", new_callable=AsyncMock)
     async def test_pause_generation_targets_worker(
-        self, mock_resolve, mock_broadcast, client
+        self, mock_resolve, mock_forward, client
     ):
         """Admin key → /pause_generation/{worker_id} → resolves and targets single worker."""
         mock_resolve.return_value = WORKER_ADDR
-        mock_broadcast.return_value = [
-            {"worker_addr": WORKER_ADDR, "status": 200, "ok": True},
-        ]
+        mock_forward.return_value = httpx.Response(200, json={"message": "paused"})
 
         resp = await client.post(
             "/pause_generation/some-worker-id",
@@ -440,16 +647,14 @@ class TestBroadcast:
         mock_resolve.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch(f"{MODULE}.broadcast_to_workers", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
     @patch(f"{MODULE}.resolve_worker_addr", new_callable=AsyncMock)
     async def test_continue_generation_targets_worker(
-        self, mock_resolve, mock_broadcast, client
+        self, mock_resolve, mock_forward, client
     ):
         """Admin key → /continue_generation/{worker_id} → resolves and targets single worker."""
         mock_resolve.return_value = WORKER_ADDR
-        mock_broadcast.return_value = [
-            {"worker_addr": WORKER_ADDR, "status": 200, "ok": True},
-        ]
+        mock_forward.return_value = httpx.Response(200, json={"message": "continued"})
 
         resp = await client.post(
             "/continue_generation/some-worker-id",
@@ -461,21 +666,14 @@ class TestBroadcast:
         mock_resolve.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch(f"{MODULE}.broadcast_to_workers", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
     @patch(f"{MODULE}.resolve_worker_addr", new_callable=AsyncMock)
     async def test_pause_worker_broadcast_failure(
-        self, mock_resolve, mock_broadcast, client
+        self, mock_resolve, mock_forward, client
     ):
         """Worker returns error → response shows ok=False for that worker."""
         mock_resolve.return_value = WORKER_ADDR
-        mock_broadcast.return_value = [
-            {
-                "worker_addr": WORKER_ADDR,
-                "status": 502,
-                "ok": False,
-                "error": "Connection refused",
-            },
-        ]
+        mock_forward.side_effect = httpx.ConnectError("Connection refused")
 
         resp = await client.post(
             "/pause_generation/some-worker-id",
@@ -488,12 +686,196 @@ class TestBroadcast:
         assert results[0]["ok"] is False
 
 
+class TestTargetedControlWorkerIdentity:
+    @staticmethod
+    async def _request_through_replaced_worker(
+        config: GatewayConfig,
+        *,
+        method: str,
+        gateway_path: str,
+        expected_worker_path: str,
+        worker_status: int,
+    ) -> tuple[httpx.Response, list[httpx.Request]]:
+        """Resolve E1 to A, then make the process at A behave as successor E2."""
+
+        worker_requests: list[httpx.Request] = []
+
+        async def _router_then_successor(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "mock-router":
+                assert request.url.path == "/resolve_worker/epoch-e1"
+                return httpx.Response(200, json={"worker_addr": WORKER_ADDR})
+
+            assert request.url.host == "worker-1"
+            assert request.url.path == expected_worker_path
+            worker_requests.append(request)
+            supplied_worker_id = request.headers.get(WORKER_ID_HEADER)
+            if supplied_worker_id != "epoch-e2":
+                return httpx.Response(
+                    worker_status,
+                    json={"detail": "Data Proxy incarnation mismatch"},
+                )
+            return httpx.Response(200, json={"message": "successor mutated"})
+
+        app = create_app(config)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_router_then_successor)
+        ) as upstream_client:
+            app.state.http_client = upstream_client
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://gateway",
+            ) as gateway_client:
+                response = await gateway_client.request(
+                    method,
+                    gateway_path,
+                    json={"version": 7} if method == "POST" else None,
+                    headers=admin_headers(),
+                )
+
+        return response, worker_requests
+
+    @pytest.mark.asyncio
+    async def test_pause_generation_forwards_resolved_identity_and_preserves_409(
+        self, config
+    ):
+        response, worker_requests = await self._request_through_replaced_worker(
+            config,
+            method="POST",
+            gateway_path="/pause_generation/epoch-e1",
+            expected_worker_path="/pause_generation",
+            worker_status=409,
+        )
+
+        assert len(worker_requests) == 1
+        assert worker_requests[0].headers[WORKER_ID_HEADER] == "epoch-e1"
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Data Proxy incarnation mismatch"}
+
+    @pytest.mark.asyncio
+    async def test_set_version_forwards_resolved_identity_and_preserves_409(
+        self, config
+    ):
+        response, worker_requests = await self._request_through_replaced_worker(
+            config,
+            method="POST",
+            gateway_path="/set_version/epoch-e1",
+            expected_worker_path="/set_version",
+            worker_status=409,
+        )
+
+        assert len(worker_requests) == 1
+        assert worker_requests[0].headers[WORKER_ID_HEADER] == "epoch-e1"
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Data Proxy incarnation mismatch"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "gateway_path", "worker_path"),
+        [
+            (
+                "POST",
+                "/continue_generation/epoch-e1",
+                "/continue_generation",
+            ),
+            (
+                "POST",
+                "/release_memory_occupation/epoch-e1",
+                "/release_memory_occupation",
+            ),
+            (
+                "POST",
+                "/resume_memory_occupation/epoch-e1",
+                "/resume_memory_occupation",
+            ),
+            ("GET", "/get_version/epoch-e1", "/get_version"),
+        ],
+    )
+    async def test_targeted_controls_forward_path_worker_identity(
+        self, config, method, gateway_path, worker_path
+    ):
+        response, worker_requests = await self._request_through_replaced_worker(
+            config,
+            method=method,
+            gateway_path=gateway_path,
+            expected_worker_path=worker_path,
+            worker_status=409,
+        )
+
+        assert len(worker_requests) == 1
+        assert worker_requests[0].headers[WORKER_ID_HEADER] == "epoch-e1"
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Data Proxy incarnation mismatch"}
+
+
 # =============================================================================
 # Router errors
 # =============================================================================
 
 
 class TestRouterErrors:
+    @pytest.mark.asyncio
+    async def test_register_session_preserves_router_409_details(self):
+        async def _stale_registration(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"detail": "worker incarnation worker-epoch-1 is stale"},
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_stale_registration)
+        ) as router_client:
+            with pytest.raises(RouterSessionRegistrationError) as exc_info:
+                await register_session_in_router(
+                    "http://router",
+                    [{"session_id": "session-1", "session_api_key": "key-1"}],
+                    WORKER_ADDR,
+                    2.0,
+                    admin_api_key=ADMIN_KEY,
+                    group_id="group-1",
+                    worker_id="worker-epoch-1",
+                    client=router_client,
+                )
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == "worker incarnation worker-epoch-1 is stale"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route_payload", [{}, {"worker_id": ""}])
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_route_without_worker_id_fails_closed_before_forwarding(
+        self, mock_forward, config, route_payload
+    ):
+        mock_forward.return_value = httpx.Response(200, json={"id": "unexpected"})
+
+        async def _route(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"worker_addr": WORKER_ADDR, **route_payload},
+            )
+
+        app = create_app(config)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_route),
+            base_url=config.router_addr,
+        ) as router_client:
+            app.state.http_client = router_client
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://gateway",
+            ) as gateway_client:
+                response = await gateway_client.post(
+                    "/chat/completions",
+                    json={
+                        "model": "sglang",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                    headers=admin_headers(),
+                )
+
+        assert response.status_code == 502
+        assert "worker_id" in response.json()["error"]
+        mock_forward.assert_not_awaited()
+
     @pytest.mark.asyncio
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
     async def test_router_unreachable_502(self, mock_query_router, client):
@@ -553,7 +935,12 @@ class TestRouterErrors:
 
         resp = await client.post(
             "/export_trajectories",
-            json={"session_ids": ["nonexistent"], "discount": 1.0, "style": "sft"},
+            json={
+                "request_id": "missing-route-export",
+                "session_ids": ["nonexistent"],
+                "discount": 1.0,
+                "style": "sft",
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 401
@@ -573,12 +960,10 @@ class TestStartSessionCapacity:
     async def test_start_session_full_flow(
         self, mock_query_router, mock_forward, mock_register, client
     ):
-        """Full flow: route → forward → register session.
-
-        Gateway no longer manages capacity — that is handled by the
-        router's ``/register_session`` endpoint.
-        """
-        mock_query_router.return_value = WORKER_ADDR
+        """A controller lease admits one callback session end to end."""
+        mock_query_router.return_value = RouterDestination(
+            worker_addr=WORKER_ADDR, worker_id="worker-epoch-1"
+        )
         mock_forward.return_value = httpx.Response(
             201,
             json={
@@ -587,9 +972,20 @@ class TestStartSessionCapacity:
             },
         )
 
+        grant = await client.post(
+            "/internal/online_leases",
+            json={"lease_id": "lease-test", "expected_version": 0},
+            headers=admin_headers(),
+        )
+        assert grant.status_code == 201
+
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "t"},
+            json={
+                "task_id": "t",
+                "delivery_mode": "callback",
+                "request_id": "request-full-flow",
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 201

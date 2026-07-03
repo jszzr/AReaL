@@ -1,138 +1,111 @@
-# Online RL Training
+# V2 Online Proxy
 
-This guide explains how to train language models using the online mode, where the user
-first launches an AReaL RL service that exposes a proxy gateway, and external
-applications (agent runtimes, human evaluators, or any OpenAI-compatible client)
-interact with the model through this gateway. Each interaction is automatically
-collected as RL training data.
+The V2 inference gateway lets an external agent produce trajectories while an AReaL
+trainer consumes them online. The important property is ownership: one trainer waiter
+publishes one finite lease, one producer request consumes it, and the exported
+loss-bearing tokens must come from the policy version captured by that lease.
 
-**Disclaimer:** This API is experimental and subject to change.
-
-## Overview
-
-AReaL supports three execution modes for agent workflows:
-
-| Mode         | Description                                        | Use Case                          |
-| ------------ | -------------------------------------------------- | --------------------------------- |
-| `inline`     | Agent runs in-process with the rollout worker      | Most agent frameworks             |
-| `subproc`    | Agent runs in a subprocess pool                    | Non-async or isolation-heavy code |
-| **`online`** | External users drive the interaction via HTTP APIs | Human feedback, external runtimes |
-
-This guide focuses on **online mode**, which is unique because the agent code lives
-_outside_ of AReaL. AReaL exposes an OpenAI-compatible HTTP API, and any application
-that speaks the chat completions protocol can connect to it.
-
-For the offline training guide, see [agentic RL guide](./agentic_rl.md).
-
-## Architecture
-
-```
-                          External Application
-                         (ZeroClaw, scripts, etc.)
-                                  |
-                      POST /chat/completions
-                      POST /rl/set_reward
-                                  |
-                                  v
-                      +-------------------+
-                      |  Proxy Gateway    |  (FastAPI, stateless router)
-                      |  - Session mgmt   |
-                      |  - Key auth       |
-                      |  - Load balancing |
-                      +-------------------+
-                         /        |        \
-                        v         v         v
-                  +---------+ +---------+ +---------+
-                  | Proxy   | | Proxy   | | Proxy   |
-                  | Worker  | | Worker  | | Worker  |  (one per rollout worker)
-                  +---------+ +---------+ +---------+
-                      |           |           |
-                      v           v           v
-                  +---------+ +---------+ +---------+
-                  | SGLang/ | | SGLang/ | | SGLang/ |
-                  | vLLM    | | vLLM    | | vLLM    |  (inference servers)
-                  +---------+ +---------+ +---------+
-                                  |
-                      Token-level data collected
-                                  |
-                                  v
-                      +-------------------+
-                      |   RL Trainer      |
-                      |   (PPOTrainer)    |
-                      +-------------------+
+```text
+external agent -> Gateway -> Router -> Data Proxy -> SGLang/vLLM
+                     |          |          |
+                 global gate  worker pin  session + token provenance
+                     |
+                  Controller waiter -> export -> training
 ```
 
-**Key components:**
+This page describes only the V2 API. V1 proxy clients and response shapes are not
+interchangeable with it.
 
-- **Proxy Gateway**: A lightweight FastAPI server that routes requests from external
-  applications to backend proxy workers. It manages session lifecycle, authentication,
-  and load balancing.
-- **Proxy Workers**: Backend servers colocated with rollout workers. Each worker manages
-  sessions, records token-level data (token IDs, log probabilities), and exports
-  trajectories for training.
-- **Inference Servers**: SGLang or vLLM servers that perform the actual LLM inference.
+## Start a V2 training service
 
-## Quick Start
-
-### Step 1: Configure Online Mode
-
-Set `rollout.agent.mode` to `online` in your config YAML:
-
-```yaml
-# config.yaml
-rollout:
-  agent:
-    mode: online
-    admin_api_key: "my-secret-admin-key"  # Protect management endpoints
-    session_timeout_seconds: 3600          # Session timeout (default: 1 hour)
-```
-
-### Step 2: Start the RL Service
+Use a configuration with both rollout and actor explicitly set to V2. The Hermes
+example is a working reference:
 
 ```bash
-python3 examples/openclaw/train.py --config examples/openclaw/config.yaml \
-    experiment_name=my-exp trial_name=trial-0 \
-    rollout.backend=sglang:d1 actor.backend=fsdp:d1 \
-    actor.path=Qwen/Qwen3-0.6B \
-    scheduler.type=local \
-    rollout.agent.admin_api_key=my-secret-admin-key
+uv run python3 examples/hermes/train.py \
+  --config examples/hermes/config.yaml \
+  actor.path=/path/to/your_model \
+  rollout.admin_api_key=my-secret-admin-key \
+  actor.admin_api_key=my-actor-key
 ```
 
-After initialization, AReaL prints the gateway address:
+The relevant configuration is:
 
+```yaml
+rollout:
+  _version: v2
+  backend: sglang:d1
+  admin_api_key: my-secret-admin-key
+  request_timeout: 300
+  agent:
+    mode: online
+    export_style: individual
+
+actor:
+  _version: v2
 ```
-(AReaL) RLTrainer INFO: Proxy gateway available at http://x.x.x.x:8090
-```
 
-### Step 3: Start a Session
+Use `rollout.admin_api_key` for the inference gateway. The legacy
+`rollout.agent.admin_api_key` field is not the V2 gateway credential.
 
-Use the provided helper script or any HTTP client:
+After initialization, the trainer logs the gateway address.
+
+## Callback-delivered online episode
+
+### 1. Create a session
 
 ```bash
 curl -X POST http://<gateway>/rl/start_session \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer my-secret-admin-key" \
-  -d '{"task_id": "demo-task-0"}'
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer my-secret-admin-key' \
+  -d '{
+    "task_id": "gsm8k-17",
+    "request_id": "run-42:gsm8k-17",
+    "delivery_mode": "callback",
+    "group_size": 1
+  }'
 ```
 
-You should see the current session ID and the API key for this agent session in the
-output.
+`request_id` is a caller-generated idempotency key for one logical creation. Reuse it
+unchanged after a timeout or lost response. An identical replay returns the original
+credentials without consuming another lease; the same ID with different parameters
+returns `409`.
 
-**Why a unique API key for each agent session?** Since there may be many concurrent
-agent applications running, and they invoke the same endpoint (e.g.,
-"/chat/completions") in the URL, we need a mechanism to differentiate the trajectories
-from different agents. Therefore, we allocate unique API keys for each agent session or
-trajectory, and they have one-to-one relationship. In this way, we can track the
-interactions within the same trajectory and set rewards as well.
+The outcomes are:
 
-### Step 4: Interact with the Model
+- `201`: a session was created and bound to one trainer lease;
+- `429`: no trainer waiter is available, and no session was created;
+- `409`: an identity, worker epoch, or replay invariant was violated;
+- `422`: the request is invalid, for example callback mode without `request_id`.
 
-Use any OpenAI-compatible client. For example, with `curl`:
+Retry `429` with bounded backoff and the same request ID. Callback delivery currently
+requires `group_size=1`.
+
+A successful response is:
+
+```json
+{
+  "group_id": "grp-2a61...",
+  "sessions": [
+    {
+      "session_id": "gsm8k-17-grp-2a61...-0",
+      "session_api_key": "opaque-token"
+    }
+  ]
+}
+```
+
+Both IDs and keys are opaque. Do not parse their textual form or infer worker placement
+from it.
+
+### 2. Run the agent
+
+Use the returned session key for OpenAI-compatible chat calls:
 
 ```bash
 curl http://<gateway>/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-sess-xxxxxxxxxxxx" \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer opaque-token' \
   -d '{
     "model": "default",
     "messages": [{"role": "user", "content": "What is 12 * 15 + 3?"}],
@@ -140,54 +113,75 @@ curl http://<gateway>/chat/completions \
   }'
 ```
 
-Or any evaluation scripts with the OpenAI Python SDK:
+The Data Proxy records the interaction, token IDs, log probabilities, loss mask, and
+local policy version.
 
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://<gateway>",
-    api_key="sk-sess-xxxxxxxxxxxx",
-)
-
-response = client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "What is 12 * 15 + 3?"}],
-)
-print(response.choices[0].message.content)
-```
-
-### Step 5: Assign a Reward and End the Session
-
-After the interaction, assign a reward to provide the RL training signal:
+### 3. Set the reward
 
 ```bash
-curl http://<gateway>/rl/set_reward \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-sess-xxxxxxxxxxxx" \
-  -d '{"reward": 1.0}'
+curl -X POST http://<gateway>/rl/set_reward \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer opaque-token' \
+  -d '{"interaction_id": null, "reward": 1.0}'
 ```
 
-You can also use the completion ID during agent rollout to set rewards for intermediate
-steps.
+When the reward boundary becomes ready, the Data Proxy sends a version-bound callback
+to the exact controller waiter. The controller then exports the trajectory; the
+external producer does not call an `end_session` endpoint.
 
-Then, finish the session with:
+For local SGLang/vLLM policies, AReaL verifies that every loss-bearing token has the
+lease's expected policy version. A stale or mixed-version trajectory is rejected and
+its remote tensor shards are cleared. External API providers do not expose this token
+provenance, so external-mode interaction records are not proof of a provider model
+revision.
+
+## Pull delivery and explicit export
+
+Use pull mode for controller-driven agents, grouped sessions, or a client that will
+explicitly export:
+
+```json
+{
+  "task_id": "manual-episode",
+  "request_id": "run-42:manual-episode",
+  "delivery_mode": "pull",
+  "group_size": 2
+}
+```
+
+Export is destructive, so it also requires a stable request ID:
 
 ```bash
-curl http://<gateway>/rl/end_session \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-sess-xxxxxxxxxxxx" \
-  -d '{}'
+curl -X POST http://<gateway>/export_trajectories \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer my-secret-admin-key' \
+  -d '{
+    "request_id": "run-42:manual-export-0",
+    "session_ids": ["opaque-session-id"],
+    "group_id": "grp-2a61...",
+    "trajectory_id": 0,
+    "discount": 1.0,
+    "style": "individual",
+    "remove_session": true
+  }'
 ```
 
-### Step 6: Batched Sampling
+If the response is lost, replay the identical body. The Gateway remembers the selected
+worker and the Data Proxy replays the original serialized result instead of popping the
+trajectory twice. Use a new ID for different parameters or a genuinely new export.
 
-Integrate Steps 3 through 5 into a single bash script, and then run it concurrently with
-tools like `sbatch`. **You must call `/rl/start_session` again to obtain a new API key
-for each agent session.**
+## Failure and concurrency guarantees
 
-After enough data has been accumulated in AReaL's buffer, AReaL will automatically enter
-the training stage.
+- Admission is global across all Data Proxy workers behind one Gateway.
+- New sessions are distributed independently; session keys remain pinned afterward.
+- Session IDs include a globally unique group identity, and Router registration rejects
+  conflicting ID/key ownership.
+- Router registration is bound to a worker registration epoch, preventing a delayed
+  response from reviving sessions after a process restarts at the same address.
+- Leases expire after the controller-owned timeout. Cleanup independently retries
+  worker cancellation and Router revocation.
+- Callback acknowledgements and start/export results retain bounded replay tombstones,
+  so a lost success response is safe to retry.
 
 ## Fixed Held-Out Evaluation (V2 Only)
 
@@ -246,182 +240,23 @@ over a smaller, selected subset.
 > separate frozen evaluation arm with the same validation split, decoding settings, and
 > reward function before starting online training.
 
+These are orchestration guarantees on a trusted control plane. The internal lease API
+uses the same admin credential, so the gate is not a security boundary against a
+malicious holder of `rollout.admin_api_key`.
+
 ## FAQ
 
-> Q: When will the updated model be loaded for inference?
+## Health
 
-The model will be loaded after every training step. In other words, the model used for
-inference is always the latest. For model saving and checkpointing, see
-[CLI reference](../cli_reference.md)
-
-> Q: How to control the submission rate of the agent script? Will the RL server be
-> overloaded?
-
-AReaL has its internal rate limit, referred to as **staleness control**. If too many
-concurrent requests have been submitted, the gateway will return 429 to the client. See
-[async RL guide](../algorithms/async.md) for details about staleness control.
-
-> Q: Can I use this approach to train OpenClaw?
-
-The approach in this documentation is different from training a personalized agent,
-because:
-
-- OpenClaw assumes single-threaded interaction with the user, meaning that the user
-  cannot open many concurrent sessions that may mutually interfere
-- OpenClaw requires one-time setup with a fixed URL and API key
-
-The core usage difference is that the OpenClaw example uses a **fixed** API key all over
-the interaction. By calling `start_session` multiple times, the old session is
-automatically ended, its trajectory exported for training, and a new session starts with
-the same API key. No reconfiguration of your application is needed between episodes.
-
-For details of training the OpenClaw agent, see
-[OpenClaw example](../../../examples/openclaw/README.md).
-
-## Authentication
-
-Online mode uses a two-tier authentication system:
-
-| Auth Type           | Token                         | Used For                                        |
-| ------------------- | ----------------------------- | ----------------------------------------------- |
-| **Admin API key**   | `rollout.agent.admin_api_key` | `start_session`, `export_trajectories`          |
-| **Session API key** | Issued by `start_session`     | `chat/completions`, `set_reward`, `end_session` |
-
-- The **admin API key** is configured in the YAML and protects management endpoints.
-- The **session API key** is unique per session and scoped to that session's
-  interactions.
-
-## API Reference
-
-All endpoints are served by the proxy gateway.
-
-### Management Endpoints (Admin Auth)
-
-#### `POST /rl/start_session`
-
-Start a new session or refresh an existing one.
-
-**Request body:**
+`GET /health` returns Gateway state, not a worker count:
 
 ```json
 {
-  "task_id": "my-task-0",
-  "api_key": null
+  "status": "ok",
+  "router_addr": "http://127.0.0.1:8081",
+  "available_online_leases": 1
 }
 ```
 
-Pass `api_key` from a previous session to refresh. Omit or set `null` for a new session.
-
-**Response:**
-
-```json
-{
-  "session_id": "my-task-0",
-  "api_key": "sk-sess-xxxxxxxxxxxx"
-}
-```
-
-#### `GET /health`
-
-Health check. Returns the number of backend workers.
-
-### Session Endpoints (Session Auth)
-
-#### `POST /chat/completions`
-
-OpenAI-compatible chat completions endpoint. Tokens and log probabilities are
-automatically recorded.
-
-#### `POST /responses`
-
-OpenAI Responses API endpoint (alternative to chat completions).
-
-#### `POST /v1/messages`
-
-Anthropic Messages API endpoint for Claude-compatible clients.
-
-#### `POST /rl/set_reward`
-
-Assign a reward to an interaction.
-
-**Request body:**
-
-```json
-{
-  "reward": 1.0,
-  "interaction_id": null
-}
-```
-
-If `interaction_id` is null, the reward is assigned to the last interaction.
-
-#### `POST /rl/end_session`
-
-Explicitly end a session and export its trajectory. Used in the **batched sampling**
-pattern where each sample has its own API key. Not needed when using session refresh.
-
-## Error Handling
-
-| HTTP Code | Meaning                            | Action                                     |
-| --------- | ---------------------------------- | ------------------------------------------ |
-| 200       | Success                            | -                                          |
-| 401       | Missing or invalid authentication  | Check your API key                         |
-| 409       | API key already bound to a session | End existing session first, or use refresh |
-| 429       | No capacity available              | Retry after a short delay                  |
-| 502       | Backend worker unreachable         | Check that the RL service is running       |
-
-For HTTP 429 during refresh, the training pipeline may not have cycled yet. Retry after
-a few seconds (default timeout is 120 seconds).
-
-## How Training Works
-
-Training runs **asynchronously** under the hood:
-
-1. External applications interact with the model through the gateway
-1. Each session's interactions are recorded with token-level data
-1. When a session ends (via refresh or explicit end), its trajectory is exported
-1. Once enough trajectories are collected (controlled by `train_dataset.batch_size`),
-   AReaL performs a training step
-1. Updated model weights are transparently served to subsequent sessions
-
-The model improves silently as you collect more episodes. For details on asynchronous
-training and staleness control, see the [Asynchronous RL Guide](../algorithms/async.md).
-
-## Configuration Reference
-
-All online mode settings live under `rollout.agent`:
-
-```yaml
-rollout:
-  agent:
-    mode: online                    # Required: set to "online"
-    admin_api_key: "areal-admin-key"  # Admin key for management endpoints
-    session_timeout_seconds: 3600   # Session timeout in seconds
-    turn_discount: 1.0              # Reward discount for multi-turn conversations
-    export_style: individual        # "individual" or "concat"
-```
-
-| Field                     | Default           | Description                               |
-| ------------------------- | ----------------- | ----------------------------------------- |
-| `mode`                    | `inline`          | Must be `online` for external access      |
-| `admin_api_key`           | `areal-admin-key` | Admin API key (change in production!)     |
-| `session_timeout_seconds` | `3600`            | Auto-cleanup stale sessions after this    |
-| `turn_discount`           | `1.0`             | Geometric discount for multi-turn rewards |
-| `export_style`            | `individual`      | How to export interactions for training   |
-
-## Limitations
-
-- **Scheduler compatibility**: Online mode requires `local` or `slurm` schedulers. The
-  `ray` scheduler is not supported.
-- **Single-controller mode**: Online mode only works in single-controller mode
-  (`scheduler.type=local` or `scheduler.type=slurm`).
-
-## See Also
-
-- [OpenClaw Example](https://github.com/areal-project/AReaL/tree/main/examples/openclaw)
-  \- Complete end-to-end example with ZeroClaw
-- [Agentic RL Tutorial](agentic_rl.md) - Agent framework integration (inline/subproc
-  modes)
-- [Custom Agent Workflows](../customization/agent.md) - Creating custom agent workflows
-- [Agent Workflow Reference](../reference/agent_workflow.md) - Internal architecture
-  details
+The lease count is useful for observation only. Producers should use the atomic
+`start_session` response (`201` or `429`) rather than polling health as a reservation.

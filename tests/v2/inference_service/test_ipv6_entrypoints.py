@@ -10,6 +10,7 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
     )
 
     args = argparse.Namespace(
+        worker_id="worker-ipv6",
         host="::1",
         port=8082,
         backend_addr="http://backend",
@@ -41,6 +42,7 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
 
     config = mock_create_app.call_args.args[0]
     assert config.serving_addr == "[::1]:8082"
+    assert config.worker_id == "worker-ipv6"
     mock_run.assert_called_once()
 
 

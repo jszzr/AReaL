@@ -75,7 +75,7 @@ class TestControllerSetVersion:
         """When gateway_addr is set and data proxies exist, broadcasts to all."""
         ctrl = _make_controller(
             gateway_addr="http://gateway:8000",
-            worker_ids={"dp0": "w1", "dp1": "w2"},
+            worker_ids={"http://dp0:8000": "w1", "http://dp1:8000": "w2"},
         )
         ctrl._data_proxy_addrs = ["http://dp0:8000", "http://dp1:8000"]
 
@@ -92,9 +92,11 @@ class TestControllerSetVersion:
         call_addrs = [call.args[0] for call in mock_post.call_args_list]
         assert "http://dp0:8000" in call_addrs
         assert "http://dp1:8000" in call_addrs
+        worker_ids = {call.args[1] for call in mock_post.call_args_list}
+        assert worker_ids == {"w1", "w2"}
         for call in mock_post.call_args_list:
-            assert call.args[1] == "/set_version"
-            assert call.args[2] == {"version": 10}
+            assert call.args[2] == "/set_version"
+            assert call.args[3] == {"version": 10}
 
 
 # =============================================================================

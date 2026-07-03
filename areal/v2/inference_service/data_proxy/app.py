@@ -33,6 +33,8 @@ from areal.utils.data import concat_padded_tensors
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
+    CancelSessionsRequest,
+    ExportReplayConflictError,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     ReadyNotification,
@@ -42,6 +44,7 @@ from areal.v2.inference_service.data_proxy.session import (
     SetRewardRequest,
     StartSessionRequest,
     StartSessionResponse,
+    TrajectoryDeliveryMode,
 )
 from areal.v2.inference_service.data_proxy.tokenizer_proxy import (
     TokenizerProxy,
@@ -49,8 +52,11 @@ from areal.v2.inference_service.data_proxy.tokenizer_proxy import (
 from areal.v2.inference_service.inf_bridge import InfBridge
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 logger = logging.getLogger("InferenceDataProxy")
+
+_MAX_ADMISSION_TOMBSTONES = 4096
 
 
 # =============================================================================
@@ -139,6 +145,17 @@ def _require_session_key(request: Request, store: SessionStore) -> str:
             status_code=401, detail="Invalid or expired session API key."
         )
     return session.session_id
+
+
+def _require_worker_identity(request: Request, config: DataProxyConfig) -> None:
+    """Reject a control request addressed to another process incarnation."""
+    if config.worker_id is None:
+        return
+    if request.headers.get(WORKER_ID_HEADER) != config.worker_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Data Proxy incarnation mismatch",
+        )
 
 
 def _resolve_session_from_token(
@@ -231,6 +248,9 @@ async def _post_online_ready_callback(
                 json={
                     "session_id": notification.session_id,
                     "trajectory_id": notification.trajectory_id,
+                    "lease_id": notification.lease_id,
+                    "expected_version": notification.expected_version,
+                    "group_id": notification.group_id,
                 },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
                 timeout=timeout,
@@ -316,6 +336,31 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
 def create_app(config: DataProxyConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
+    admission_lock = asyncio.Lock()
+    export_lock = asyncio.Lock()
+    admission_records: dict[str, tuple[str, StartSessionResponse]] = {}
+    cancelled_admissions: dict[str, None] = {}
+
+    def _tombstone_admission_locked(admission_id: str) -> None:
+        cancelled_admissions[admission_id] = None
+        if len(cancelled_admissions) > _MAX_ADMISSION_TOMBSTONES:
+            oldest = next(iter(cancelled_admissions))
+            cancelled_admissions.pop(oldest, None)
+
+    async def _close_admissions_for_sessions(session_ids: set[str]) -> None:
+        """Bound admission replay state to the lifetime of its sessions."""
+
+        if not session_ids:
+            return
+        async with admission_lock:
+            for admission_id, (_, response) in list(admission_records.items()):
+                if any(
+                    credential.session_id in session_ids
+                    for credential in response.sessions
+                ):
+                    admission_records.pop(admission_id, None)
+                    _tombstone_admission_locked(admission_id)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info(
@@ -361,6 +406,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         logger.info("Data proxy shutting down")
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
+    app.state.admission_records = admission_records
+    app.state.cancelled_admissions = cancelled_admissions
     _registered_models: dict[str, dict[str, str | None]] = {}
 
     # =========================================================================
@@ -388,7 +435,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # =========================================================================
 
     @app.post("/pause_generation", response_model=PauseGenerationResponse)
-    async def pause_generation():
+    async def pause_generation(request: Request):
+        _require_worker_identity(request, config)
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -399,7 +447,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         return PauseGenerationResponse(status="ok", paused=True)
 
     @app.post("/continue_generation", response_model=PauseGenerationResponse)
-    async def continue_generation():
+    async def continue_generation(request: Request):
+        _require_worker_identity(request, config)
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -410,7 +459,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         return PauseGenerationResponse(status="ok", paused=False)
 
     @app.post("/release_memory_occupation")
-    async def release_memory_occupation():
+    async def release_memory_occupation(request: Request):
+        _require_worker_identity(request, config)
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -422,6 +472,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/resume_memory_occupation")
     async def resume_memory_occupation(request: Request):
+        _require_worker_identity(request, config)
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -439,6 +490,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/set_version", response_model=SetVersionResponse)
     async def set_version(request: Request):
+        _require_worker_identity(request, config)
         body = await request.json()
         version = body.get("version")
         if version is None or not isinstance(version, int):
@@ -452,7 +504,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         return SetVersionResponse(status="ok", version=version)
 
     @app.get("/get_version", response_model=GetVersionResponse)
-    async def get_version():
+    async def get_version(request: Request):
+        _require_worker_identity(request, config)
         return GetVersionResponse(version=app.state.version)
 
     # =========================================================================
@@ -463,27 +516,116 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def start_session(
         body: StartSessionRequest, request: Request
     ) -> StartSessionResponse:
+        _require_worker_identity(request, config)
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        group_id = f"grp-{uuid.uuid4()}"
         group_size = max(body.group_size, 1)
-        credentials: list[SessionCredentials] = []
-        for i in range(group_size):
+        if body.delivery_mode is TrajectoryDeliveryMode.CALLBACK:
+            if group_size != 1:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Callback delivery currently requires group_size=1",
+                )
+            missing = [
+                name
+                for name, value in (
+                    ("lease_id", body.lease_id),
+                    ("admission_id", body.admission_id),
+                    ("expected_version", body.expected_version),
+                )
+                if value is None
+            ]
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Callback delivery requires {', '.join(missing)}",
+                )
+            if body.lease_id != body.admission_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="lease_id and admission_id must match",
+                )
+            if body.expected_version != app.state.version:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Worker policy version is {app.state.version}, but lease "
+                        f"expects {body.expected_version}"
+                    ),
+                )
+
+        fingerprint = json.dumps(body.model_dump(mode="json"), sort_keys=True)
+
+        async def _create() -> StartSessionResponse:
+            group_id = f"grp-{uuid.uuid4()}"
+            credentials: list[SessionCredentials] = []
             try:
-                session_id, session_api_key = store.start_session(
-                    body.task_id,
-                    body.api_key if i == 0 else None,
-                    delivery_mode=body.delivery_mode,
+                for i in range(group_size):
+                    session_id, session_api_key = store.start_session(
+                        body.task_id,
+                        body.api_key if i == 0 else None,
+                        delivery_mode=body.delivery_mode,
+                        lease_id=body.lease_id,
+                        expected_version=body.expected_version,
+                        group_id=group_id,
+                    )
+                    credentials.append(
+                        SessionCredentials(
+                            session_id=session_id,
+                            session_api_key=session_api_key,
+                        )
+                    )
+            except ValueError as exc:
+                for credential in credentials:
+                    store.remove_session(credential.session_id)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return StartSessionResponse(group_id=group_id, sessions=credentials)
+
+        if body.admission_id is None:
+            return await _create()
+
+        async with admission_lock:
+            if body.admission_id in cancelled_admissions:
+                raise HTTPException(
+                    status_code=410,
+                    detail=f"Admission {body.admission_id} is closed or cancelled",
                 )
-            except ValueError as e:
-                raise HTTPException(status_code=409, detail=str(e))
-            credentials.append(
-                SessionCredentials(
-                    session_id=session_id, session_api_key=session_api_key
+            existing = admission_records.get(body.admission_id)
+            if existing is not None:
+                existing_fingerprint, response = existing
+                if existing_fingerprint != fingerprint:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Admission {body.admission_id} was replayed with a "
+                            "different request"
+                        ),
+                    )
+                return response
+
+            response = await _create()
+            admission_records[body.admission_id] = (fingerprint, response)
+            return response
+
+    @app.post("/rl/cancel_sessions")
+    async def cancel_sessions(body: CancelSessionsRequest, request: Request):
+        store: SessionStore = app.state.session_store
+        _require_admin_key(request, store)
+        async with admission_lock:
+            _tombstone_admission_locked(body.admission_id)
+            session_ids = set(body.session_ids)
+            existing = admission_records.pop(body.admission_id, None)
+            if existing is not None:
+                session_ids.update(
+                    credential.session_id for credential in existing[1].sessions
                 )
-            )
-        return StartSessionResponse(group_id=group_id, sessions=credentials)
+            removed = 0
+            for session_id in session_ids:
+                if store.get_session(session_id) is not None:
+                    store.remove_session(session_id)
+                    removed += 1
+        return {"status": "ok", "removed": removed}
 
     @app.post("/rl/set_reward", response_model=SetRewardResponse)
     async def set_reward(body: SetRewardRequest, request: Request):
@@ -716,6 +858,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
+        _require_worker_identity(request, config)
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
@@ -725,35 +868,60 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 detail="session_ids must be a non-empty list",
             )
 
-        merged: dict[str, InteractionWithTokenLogpReward] = {}
-
-        for sid in body.session_ids:
-            session = store.get_session(sid)
-            if session is None:
-                continue
-
+        request_fingerprint = body.replay_fingerprint()
+        async with export_lock:
             try:
-                _, interactions = session.export_trajectory(
-                    discount=body.discount,
-                    style=body.style,
-                    trajectory_id=body.trajectory_id,
-                )
-                merged.update(interactions)
-            except KeyError:
-                continue
+                cached = store.get_export_replay(body.request_id, request_fingerprint)
+            except ExportReplayConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if cached is not None:
+                return ExportTrajectoriesResponse(traj=cached)
 
-        if all(v.has_tensor_data for v in merged.values()):
-            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
-            traj = RTensor.remotize(traj, node_addr=config.serving_addr)
-        else:
-            traj = concat_string_interactions(merged)
+            merged: dict[str, InteractionWithTokenLogpReward] = {}
+            prepared: list[tuple[SessionData, int]] = []
 
-        if body.remove_session:
             for sid in body.session_ids:
-                store.remove_session(sid)
+                session = store.get_session(sid)
+                if session is None:
+                    continue
 
-        serialized = serialize_value(traj)
-        return ExportTrajectoriesResponse(traj=serialized)
+                try:
+                    prepared_id, interactions = session.prepare_trajectory_export(
+                        discount=body.discount,
+                        style=body.style,
+                        trajectory_id=body.trajectory_id,
+                    )
+                    prepared.append((session, prepared_id))
+                    merged.update(interactions)
+                except KeyError:
+                    continue
+
+            if all(v.has_tensor_data for v in merged.values()):
+                traj = concat_padded_tensors(
+                    [v.to_tensor_dict() for v in merged.values()]
+                )
+                traj = RTensor.remotize(traj, node_addr=config.serving_addr)
+            else:
+                traj = concat_string_interactions(merged)
+
+            serialized = serialize_value(traj)
+            try:
+                replayable = store.record_export_replay(
+                    body.request_id,
+                    request_fingerprint,
+                    serialized,
+                )
+            except ExportReplayConflictError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            for session, prepared_id in prepared:
+                session.commit_trajectory_export(prepared_id)
+
+            if body.remove_session:
+                for sid in body.session_ids:
+                    store.remove_session(sid)
+                await _close_admissions_for_sessions(set(body.session_ids))
+            return ExportTrajectoriesResponse(traj=replayable)
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Set reward for the last interaction in an active session.
 
-Requires the per-session ``sk-sess-*`` key minted by ``start_session.py``.
+Requires the opaque per-session key minted by ``start_session.py``.
 
 Usage:
     python set_reward.py http://host:port --api-key <KEY> --reward 1.0
@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument(
         "--api-key",
         required=True,
-        help="Per-session sk-sess-* key from start_session.py",
+        help="Opaque per-session key from start_session.py",
     )
     parser.add_argument(
         "--reward",

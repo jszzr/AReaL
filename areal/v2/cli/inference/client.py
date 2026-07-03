@@ -26,11 +26,32 @@ class GatewayClient(BaseHTTPClient):
 
 
 class RouterClient(BaseHTTPClient):
-    def register_worker(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
-        return self._post("/register", payload={"worker_addr": addr}, timeout=timeout)
+    def register_worker(
+        self,
+        addr: str,
+        worker_id: str,
+        expected_worker_id: str | None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/register",
+            payload={
+                "worker_addr": addr,
+                "worker_id": worker_id,
+                "expected_worker_id": expected_worker_id,
+            },
+            timeout=timeout,
+        )
 
-    def unregister_worker(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
-        return self._post("/unregister", payload={"worker_addr": addr}, timeout=timeout)
+    def unregister_worker(
+        self, addr: str, worker_id: str, *, timeout: float = 10.0
+    ) -> dict[str, Any]:
+        return self._post(
+            "/unregister",
+            payload={"worker_addr": addr, "worker_id": worker_id},
+            timeout=timeout,
+        )
 
     def remove_model(self, name: str, *, timeout: float = 10.0) -> dict[str, Any]:
         return self._post("/remove_model", payload={"name": name}, timeout=timeout)

@@ -148,6 +148,7 @@ def build_vllm_task_spec(
 def build_data_proxy_task_spec(
     *,
     name: str,
+    worker_id: str,
     backend_addr: str,
     backend_type: str,
     tokenizer_path: str,
@@ -177,6 +178,7 @@ def build_data_proxy_task_spec(
             log_level,
         ]
         cmd.extend(extra_args)
+        cmd.extend(["--worker-id", worker_id])
         return cmd
 
     return TaskSpec(

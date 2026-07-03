@@ -20,6 +20,7 @@ from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 
 def main():
     parser = argparse.ArgumentParser(description="AReaL Data Proxy")
+    parser.add_argument("--worker-id", default=None)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)
     parser.add_argument(
@@ -87,6 +88,7 @@ def main():
         serving_host = gethostip()
 
     config = DataProxyConfig(
+        worker_id=args.worker_id,
         host=args.host,
         port=args.port,
         backend_addr=args.backend_addr,

@@ -65,11 +65,13 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 
 class RegisterWorkerRequest(BaseModel):
     worker_addr: str
+    worker_id: str
+    expected_worker_id: str | None
 
 
 class UnregisterWorkerRequest(BaseModel):
-    worker_addr: str | None = None
-    worker_id: str | None = None
+    worker_addr: str
+    worker_id: str
 
 
 class RouteRequest(BaseModel):
@@ -77,6 +79,7 @@ class RouteRequest(BaseModel):
     path: str | None = None
     session_id: str | None = None
     model: str | None = None
+    new_session: bool = False
 
 
 class SessionEntry(BaseModel):
@@ -87,6 +90,7 @@ class SessionEntry(BaseModel):
 class RegisterSessionRequest(BaseModel):
     sessions: list[SessionEntry]
     worker_addr: str
+    worker_id: str
     group_id: str
 
 
@@ -124,15 +128,19 @@ class HealthResponse(BaseModel):
 class RegisterWorkerResponse(BaseModel):
     status: str
     worker_id: str
+    action: str
 
 
 class UnregisterWorkerResponse(BaseModel):
     status: str
+    removed: bool
     sessions_revoked: int
+    groups_revoked: int
 
 
 class RouteResponse(BaseModel):
     worker_addr: str
+    worker_id: str
     url: str | None = None
     api_key: str | None = None
 
@@ -185,6 +193,7 @@ def create_app(config: RouterConfig) -> FastAPI:
     session_registry = SessionRegistry()
     model_registry = ModelRegistry()
     group_registry = GroupRegistry()
+    ownership_lock = asyncio.Lock()
     strategy = get_strategy(config.routing_strategy)
 
     async def _poll_workers() -> None:
@@ -196,10 +205,12 @@ def create_app(config: RouterConfig) -> FastAPI:
                 try:
                     resp = await app.state.http_client.get(f"{w.worker_addr}/health")
                     await worker_registry.update_health(
-                        w.worker_addr, resp.status_code == 200
+                        w.worker_addr, w.worker_id, resp.status_code == 200
                     )
                 except Exception:
-                    await worker_registry.update_health(w.worker_addr, False)
+                    await worker_registry.update_health(
+                        w.worker_addr, w.worker_id, False
+                    )
 
             await asyncio.gather(*[_check(w) for w in workers])
             await asyncio.sleep(config.poll_interval)
@@ -237,6 +248,22 @@ def create_app(config: RouterConfig) -> FastAPI:
     app.state.model_registry = model_registry
     app.state.group_registry = group_registry
     app.state.strategy = strategy
+    app.state.ownership_lock = ownership_lock
+
+    async def _await_ownership_transition(task: asyncio.Task):
+        """Let an in-memory ownership transition settle before propagating cancel."""
+
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            except BaseException as exc:
+                logger.error(
+                    "Ownership transition failed while its request was cancelled: %s",
+                    exc,
+                )
+            raise
 
     # =========================================================================
     # Health
@@ -260,41 +287,78 @@ def create_app(config: RouterConfig) -> FastAPI:
     @app.post("/register", response_model=RegisterWorkerResponse)
     async def register(body: RegisterWorkerRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
-        worker_id = await worker_registry.register(body.worker_addr)
-        logger.info("Worker registered: %s (id=%s)", body.worker_addr, worker_id)
-        return RegisterWorkerResponse(status="ok", worker_id=worker_id)
+
+        async def _transition() -> str:
+            async with ownership_lock:
+                action = await worker_registry.register(
+                    body.worker_addr,
+                    body.worker_id,
+                    body.expected_worker_id,
+                )
+                if action == "replaced":
+                    assert body.expected_worker_id is not None
+                    await session_registry.revoke_by_worker(
+                        body.worker_addr, body.expected_worker_id
+                    )
+                    await group_registry.revoke_by_worker(
+                        body.worker_addr, body.expected_worker_id
+                    )
+                return action
+
+        try:
+            action = await _await_ownership_transition(
+                asyncio.create_task(_transition())
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info(
+            "Worker registration %s: %s (id=%s)",
+            action,
+            body.worker_addr,
+            body.worker_id,
+        )
+        return RegisterWorkerResponse(
+            status="ok", worker_id=body.worker_id, action=action
+        )
 
     @app.post("/unregister", response_model=UnregisterWorkerResponse)
     async def unregister(body: UnregisterWorkerRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
-        if body.worker_id is not None:
-            worker_addr = await worker_registry.deregister_by_id(body.worker_id)
-            if worker_addr is None:
-                raise HTTPException(
-                    status_code=404, detail=f"Worker ID {body.worker_id} not found"
+
+        async def _transition() -> tuple[bool, int, int]:
+            async with ownership_lock:
+                removed = await worker_registry.unregister(
+                    body.worker_addr, body.worker_id
                 )
-            revoked = await session_registry.revoke_by_worker(worker_addr)
-            logger.info(
-                "Worker unregistered by id: %s addr=%s (revoked %d sessions)",
-                body.worker_id,
-                worker_addr,
-                revoked,
-            )
-            return UnregisterWorkerResponse(status="ok", sessions_revoked=revoked)
-        elif body.worker_addr is not None:
-            await worker_registry.deregister(body.worker_addr)
-            revoked = await session_registry.revoke_by_worker(body.worker_addr)
-            logger.info(
-                "Worker unregistered: %s (revoked %d sessions)",
-                body.worker_addr,
-                revoked,
-            )
-            return UnregisterWorkerResponse(status="ok", sessions_revoked=revoked)
-        else:
-            raise HTTPException(
-                status_code=422,
-                detail="Either 'worker_id' or 'worker_addr' must be provided",
-            )
+                if removed:
+                    sessions_revoked = await session_registry.revoke_by_worker(
+                        body.worker_addr, body.worker_id
+                    )
+                    groups_revoked = await group_registry.revoke_by_worker(
+                        body.worker_addr, body.worker_id
+                    )
+                else:
+                    sessions_revoked = 0
+                    groups_revoked = 0
+                return removed, sessions_revoked, groups_revoked
+
+        removed, sessions_revoked, groups_revoked = await _await_ownership_transition(
+            asyncio.create_task(_transition())
+        )
+        logger.info(
+            "Worker unregister: %s (id=%s, removed=%s, sessions=%d, groups=%d)",
+            body.worker_addr,
+            body.worker_id,
+            removed,
+            sessions_revoked,
+            groups_revoked,
+        )
+        return UnregisterWorkerResponse(
+            status="ok",
+            removed=removed,
+            sessions_revoked=sessions_revoked,
+            groups_revoked=groups_revoked,
+        )
 
     # =========================================================================
     # Routing (admin key required)
@@ -321,11 +385,39 @@ def create_app(config: RouterConfig) -> FastAPI:
             addr_set = set(addrs)
             return [w for w in workers if w.worker_addr in addr_set]
 
+        if body.new_session:
+            if body.api_key is not None or body.session_id is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="new_session cannot be combined with api_key or session_id",
+                )
+            all_workers = await worker_registry.get_all_workers()
+            candidates = _filter_by_model(all_workers, model_addrs)
+            if not candidates:
+                raise HTTPException(status_code=503, detail="No registered workers")
+            worker = strategy.pick(candidates)
+            if worker is None:
+                raise HTTPException(status_code=503, detail="No registered workers")
+            return RouteResponse(
+                worker_addr=worker.worker_addr,
+                worker_id=worker.worker_id,
+            )
+
         # Step B: session_id lookup
         if body.session_id is not None:
-            worker = await session_registry.lookup_by_id(body.session_id)
-            if worker is not None:
-                return RouteResponse(worker_addr=worker)
+            async with ownership_lock:
+                session_route = await session_registry.route_by_id(body.session_id)
+                if session_route is not None:
+                    owner = await worker_registry.get_by_addr(session_route.worker_addr)
+                    if owner is None or owner.worker_id != session_route.worker_id:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Session owner is no longer active",
+                        )
+                    return RouteResponse(
+                        worker_addr=session_route.worker_addr,
+                        worker_id=session_route.worker_id,
+                    )
             if model_addrs is None:
                 raise HTTPException(status_code=404, detail="Session not found")
 
@@ -345,6 +437,7 @@ def create_app(config: RouterConfig) -> FastAPI:
             )
             return RouteResponse(
                 worker_addr=worker.worker_addr,
+                worker_id=worker.worker_id,
                 url=info.url if info else None,
                 api_key=info.api_key if info else None,
             )
@@ -361,25 +454,54 @@ def create_app(config: RouterConfig) -> FastAPI:
             )
 
         # Step C: Session key → pinned worker
-        pinned = await session_registry.lookup_by_key(body.api_key)
-        if pinned is not None:
-            return RouteResponse(worker_addr=pinned)
+        async with ownership_lock:
+            pinned = await session_registry.route_by_key(body.api_key)
+            if pinned is not None:
+                owner = await worker_registry.get_by_addr(pinned.worker_addr)
+                if owner is None or owner.worker_id != pinned.worker_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Session owner is no longer active",
+                    )
+                return RouteResponse(
+                    worker_addr=pinned.worker_addr,
+                    worker_id=pinned.worker_id,
+                )
 
         # Step D: Admin key → pick from model addrs
         if hmac.compare_digest(body.api_key, config.admin_api_key):
-            all_workers = await worker_registry.get_all_workers()
-            candidates = _filter_by_model(all_workers, model_addrs)
-            if not candidates:
-                raise HTTPException(status_code=503, detail="No registered workers")
-            worker = strategy.pick(candidates)
-            if worker is None:
-                raise HTTPException(status_code=503, detail="No registered workers")
-            await session_registry.register_session(
-                body.api_key,
-                "__hitl__",
-                worker.worker_addr,
-            )
-            return RouteResponse(worker_addr=worker.worker_addr)
+            async with ownership_lock:
+                # Another first-use request may have pinned the key after the
+                # optimistic lookup above.
+                pinned = await session_registry.route_by_key(body.api_key)
+                if pinned is not None:
+                    owner = await worker_registry.get_by_addr(pinned.worker_addr)
+                    if owner is None or owner.worker_id != pinned.worker_id:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Session owner is no longer active",
+                        )
+                    return RouteResponse(
+                        worker_addr=pinned.worker_addr,
+                        worker_id=pinned.worker_id,
+                    )
+                all_workers = await worker_registry.get_all_workers()
+                candidates = _filter_by_model(all_workers, model_addrs)
+                if not candidates:
+                    raise HTTPException(status_code=503, detail="No registered workers")
+                worker = strategy.pick(candidates)
+                if worker is None:
+                    raise HTTPException(status_code=503, detail="No registered workers")
+                await session_registry.register_session(
+                    body.api_key,
+                    "__hitl__",
+                    worker.worker_addr,
+                    worker.worker_id,
+                )
+                return RouteResponse(
+                    worker_addr=worker.worker_addr,
+                    worker_id=worker.worker_id,
+                )
 
         # Step E: Unknown key
         raise HTTPException(status_code=404, detail="Unknown API key")
@@ -392,15 +514,45 @@ def create_app(config: RouterConfig) -> FastAPI:
     async def register_session(body: RegisterSessionRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
 
-        for entry in body.sessions:
-            await session_registry.register_session(
-                entry.session_api_key, entry.session_id, body.worker_addr
-            )
-
         session_ids = [e.session_id for e in body.sessions]
-        await group_registry.register_group(
-            body.group_id, body.worker_addr, session_ids
-        )
+        async with ownership_lock:
+            worker = await worker_registry.get_by_addr(body.worker_addr)
+            if worker is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Worker {body.worker_addr} is not registered",
+                )
+            if body.worker_id != worker.worker_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Worker epoch mismatch for {body.worker_addr}: "
+                        f"expected {worker.worker_id}, got {body.worker_id}"
+                    ),
+                )
+            group_created = False
+            try:
+                # Register the immutable group key first. A conflicting HTTP
+                # replay is rejected before any session mapping can be mutated.
+                group_created = await group_registry.register_group(
+                    body.group_id,
+                    body.worker_addr,
+                    session_ids,
+                    body.worker_id,
+                    [entry.session_api_key for entry in body.sessions],
+                )
+                await session_registry.register_sessions(
+                    [
+                        (entry.session_api_key, entry.session_id)
+                        for entry in body.sessions
+                    ],
+                    body.worker_addr,
+                    worker_id=body.worker_id,
+                )
+            except ValueError as exc:
+                if group_created:
+                    await group_registry.revoke(body.group_id)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         return StatusResponse(status="ok")
 
@@ -412,9 +564,10 @@ def create_app(config: RouterConfig) -> FastAPI:
     async def remove_session(body: RemoveSessionRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
 
-        session_ids = await group_registry.revoke(body.group_id)
-        for sid in session_ids:
-            await session_registry.revoke_session(sid)
+        async with ownership_lock:
+            session_ids = await group_registry.revoke(body.group_id)
+            for sid in session_ids:
+                await session_registry.revoke_session(sid)
         return RemoveSessionResponse(
             status="ok",
             removed=len(session_ids) > 0,

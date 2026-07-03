@@ -12,6 +12,7 @@ from areal.v2.inference_service.data_proxy.app import create_app
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 # =============================================================================
 # Fixtures
@@ -125,6 +126,8 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
 
     inf_bridge.pause = AsyncMock(side_effect=_mock_pause)
     inf_bridge.resume = AsyncMock(side_effect=_mock_resume)
+    inf_bridge.offload = AsyncMock()
+    inf_bridge.onload = AsyncMock()
 
     app.state.tokenizer = mock_tokenizer
     app.state.inf_bridge = inf_bridge
@@ -236,3 +239,89 @@ class TestPauseResumeEndpoints:
         resp = await client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["paused"] is True
+
+
+_CONTROL_ENDPOINTS = [
+    pytest.param("/pause_generation", None, "pause", False, id="pause"),
+    pytest.param("/continue_generation", None, "resume", True, id="continue"),
+    pytest.param(
+        "/release_memory_occupation", None, "offload", False, id="release-memory"
+    ),
+    pytest.param(
+        "/resume_memory_occupation",
+        {"tags": ["weights"]},
+        "onload",
+        False,
+        id="resume-memory",
+    ),
+]
+
+
+class TestControlEndpointWorkerIdentity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param({WORKER_ID_HEADER: "epoch-e1"}, id="stale"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("path", "payload", "backend_method", "initially_paused"),
+        _CONTROL_ENDPOINTS,
+    )
+    async def test_configured_worker_rejects_unmatched_identity_without_side_effects(
+        self,
+        app_client,
+        headers,
+        path,
+        payload,
+        backend_method,
+        initially_paused,
+    ):
+        client, app, pause_state = app_client
+        app.state.config.worker_id = "epoch-e2"
+        await pause_state.set_paused(initially_paused)
+
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.post(path, **request_kwargs)
+
+        assert response.status_code == 409
+        getattr(app.state.inf_bridge, backend_method).assert_not_awaited()
+        assert await pause_state.is_paused() is initially_paused
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured_worker_id", "headers"),
+        [
+            pytest.param(None, {}, id="legacy-unconfigured"),
+            pytest.param("epoch-e2", {WORKER_ID_HEADER: "epoch-e2"}, id="matching"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("path", "payload", "backend_method", "initially_paused"),
+        _CONTROL_ENDPOINTS,
+    )
+    async def test_unconfigured_or_matching_identity_reaches_backend(
+        self,
+        app_client,
+        configured_worker_id,
+        headers,
+        path,
+        payload,
+        backend_method,
+        initially_paused,
+    ):
+        client, app, pause_state = app_client
+        app.state.config.worker_id = configured_worker_id
+        await pause_state.set_paused(initially_paused)
+
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.post(path, **request_kwargs)
+
+        assert response.status_code == 200
+        getattr(app.state.inf_bridge, backend_method).assert_awaited_once()

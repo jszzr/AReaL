@@ -18,7 +18,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from threading import Lock
@@ -36,16 +36,47 @@ from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
 from areal.utils import logging, stats_tracker
 from areal.utils.network import format_hostport
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 logger = logging.getLogger("RolloutControllerV2")
 
-_MAX_COMPLETED_ONLINE_RESULTS = 1024
+_MAX_ONLINE_SETTLEMENT_TOMBSTONES = 4096
 _DEFAULT_SERVICE_LOG_LEVEL = "warning"
 
 
 @dataclass
 class _OnlineWaiter:
+    lease_id: str
+    expected_version: int
     future: asyncio.Future
+    delivery: dict[str, Any] | None = None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _OnlineSettlement:
+    """Immutable callback fingerprint retained only for idempotent retries."""
+
+    callback_kind: str
+    expected_version: int
+    details: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class _DataProxyRegistrationIntent:
+    data_proxy_addr: str
+    desired_worker_id: str
+    expected_worker_id: str | None
+
+
+@dataclass(frozen=True)
+class _DataProxyRegistrationSnapshot:
+    generation: int
+    intents: tuple[_DataProxyRegistrationIntent, ...]
+
+
+class _OnlineLeaseConflict(RuntimeError):
+    """A callback does not match a live version-bound online lease."""
 
 
 class _DummyDataLoader:
@@ -135,8 +166,16 @@ class RolloutControllerV2:
         self._data_proxy_addrs: list[str] = []
         self._gateway_addr: str = ""
 
-        # Worker ID mapping (data proxy addr → router-assigned worker_id)
+        # Active worker ID mapping (data proxy addr → router-confirmed worker_id)
         self._worker_ids: dict[str, str] = {}  # data_proxy_addr -> worker_id
+        # Registration intent is stable for the lifetime of one launched data proxy.
+        # _worker_ids remains the public map of router-confirmed active incarnations.
+        self._desired_worker_ids: dict[str, str] = {}
+        self._predecessor_worker_ids: dict[str, str | None] = {}
+        self._registration_operation_lock = Lock()
+        self._registration_state_lock = Lock()
+        self._registration_generation = 0
+        self._destroyed = False
 
         # Version management
         self._version_lock = Lock()
@@ -149,11 +188,10 @@ class RolloutControllerV2:
         self._staleness_manager = None
 
         # Online callback server / waiter state
-        self._online_waiters: deque[_OnlineWaiter] = deque()
+        self._online_waiters: dict[str, _OnlineWaiter] = {}
         self._online_waiters_lock = Lock()
-        self._completed_online_results: deque[dict[str, Any]] = deque(
-            maxlen=_MAX_COMPLETED_ONLINE_RESULTS
-        )
+        self._online_settlements: OrderedDict[str, _OnlineSettlement] = OrderedDict()
+        self._online_settlement_limit = _MAX_ONLINE_SETTLEMENT_TOMBSTONES
         self._callback_app = None
         self._callback_server = None
         self._callback_server_thread: threading.Thread | None = None
@@ -173,7 +211,6 @@ class RolloutControllerV2:
         self._sync_client = httpx.Client(timeout=30.0)
         self._async_client: httpx.AsyncClient | None = None
         self._async_client_loop: asyncio.AbstractEventLoop | None = None
-        self._destroyed = False
 
         # Proxy compatibility (no-ops — gateway IS the proxy)
         self._proxy_started = False
@@ -477,7 +514,10 @@ class RolloutControllerV2:
                 str(agent_cfg.engine_max_tokens),
             ]
 
-        async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
+        data_proxy_worker_ids = [str(uuid.uuid4()) for _ in range(dp_size)]
+
+        async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str, str]:
+            worker_id = data_proxy_worker_ids[group_idx]
             if self.external_mode:
                 head_worker = inf_workers[group_idx]
             else:
@@ -488,9 +528,16 @@ class RolloutControllerV2:
                 ]
             guard_addr = f"http://{format_hostport(head_worker.ip, int(head_worker.worker_ports[0]))}"
             if self.external_mode:
-                dp_cmd = data_proxy_base_cmd + ["--backend-addr", ""]
+                dp_cmd = data_proxy_base_cmd + [
+                    "--worker-id",
+                    worker_id,
+                    "--backend-addr",
+                    "",
+                ]
             else:
                 dp_cmd = data_proxy_base_cmd + [
+                    "--worker-id",
+                    worker_id,
                     "--backend-addr",
                     self._inf_addrs[group_idx],
                     "--backend-type",
@@ -502,7 +549,7 @@ class RolloutControllerV2:
                 worker_index=group_idx,
                 raw_cmd=dp_cmd,
             )
-            return host, port, guard_addr
+            return host, port, guard_addr, worker_id
 
         gw_cmd = [
             sys.executable,
@@ -531,8 +578,10 @@ class RolloutControllerV2:
         )
 
         # Track data-proxies in group order, then gateway — deterministic cleanup.
-        for group_idx, (dp_host, dp_port, dp_guard) in enumerate(dp_results):
-            self._data_proxy_addrs.append(f"http://{format_hostport(dp_host, dp_port)}")
+        for group_idx, (dp_host, dp_port, dp_guard, worker_id) in enumerate(dp_results):
+            self._record_data_proxy_launch(
+                f"http://{format_hostport(dp_host, dp_port)}", worker_id
+            )
             self._forked_services.append((dp_guard, "data-proxy", group_idx))
         logger.info("Data proxies: %s", self._data_proxy_addrs)
 
@@ -680,6 +729,57 @@ class RolloutControllerV2:
 
     # -- Service health checks & registration ------------------------------
 
+    def _record_data_proxy_launch(
+        self, data_proxy_addr: str, worker_id: str | None = None
+    ) -> None:
+        """Track one newly launched process and freeze its registration CAS."""
+        with self._registration_operation_lock:
+            with self._registration_state_lock:
+                if self._destroyed:
+                    return
+                desired_worker_id = worker_id or str(uuid.uuid4())
+                expected_worker_id = self._worker_ids.get(data_proxy_addr)
+                if data_proxy_addr not in self._data_proxy_addrs:
+                    self._data_proxy_addrs.append(data_proxy_addr)
+                self._desired_worker_ids[data_proxy_addr] = desired_worker_id
+                self._predecessor_worker_ids[data_proxy_addr] = expected_worker_id
+                self._registration_generation += 1
+
+    def _freeze_data_proxy_registration_snapshot(
+        self,
+    ) -> _DataProxyRegistrationSnapshot | None:
+        """Atomically freeze the CAS payload for one registration attempt."""
+        with self._registration_state_lock:
+            if self._destroyed or not self._data_proxy_addrs:
+                return None
+
+            state_changed = False
+            for data_proxy_addr in self._data_proxy_addrs:
+                if data_proxy_addr not in self._desired_worker_ids:
+                    self._desired_worker_ids[data_proxy_addr] = str(uuid.uuid4())
+                    state_changed = True
+                if data_proxy_addr not in self._predecessor_worker_ids:
+                    self._predecessor_worker_ids[data_proxy_addr] = (
+                        self._worker_ids.get(data_proxy_addr)
+                    )
+                    state_changed = True
+            if state_changed:
+                self._registration_generation += 1
+
+            return _DataProxyRegistrationSnapshot(
+                generation=self._registration_generation,
+                intents=tuple(
+                    _DataProxyRegistrationIntent(
+                        data_proxy_addr=data_proxy_addr,
+                        desired_worker_id=self._desired_worker_ids[data_proxy_addr],
+                        expected_worker_id=self._predecessor_worker_ids[
+                            data_proxy_addr
+                        ],
+                    )
+                    for data_proxy_addr in self._data_proxy_addrs
+                ),
+            )
+
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
@@ -716,7 +816,13 @@ class RolloutControllerV2:
 
     def _register_data_proxies_in_router(self) -> None:
         """Register all data proxy workers in the router and store their worker IDs."""
-        if not self._data_proxy_addrs:
+        with self._registration_operation_lock:
+            self._register_data_proxies_in_router_serialized()
+
+    def _register_data_proxies_in_router_serialized(self) -> None:
+        """Run one registration snapshot, request, and commit without a new launch."""
+        snapshot = self._freeze_data_proxy_registration_snapshot()
+        if snapshot is None:
             return
 
         from concurrent.futures import ThreadPoolExecutor
@@ -724,31 +830,59 @@ class RolloutControllerV2:
         admin_key = self.config.admin_api_key
         router_addr = self._router_addr
 
-        def _register_one(data_proxy_addr: str) -> tuple[str, str | None]:
+        def _register_one(
+            intent: _DataProxyRegistrationIntent,
+        ) -> tuple[_DataProxyRegistrationIntent, str]:
             # Each thread gets its own httpx.Client because httpx.Client
             # is not thread-safe and must not be shared across threads.
             with httpx.Client() as client:
                 resp = client.post(
                     f"{router_addr}/register",
-                    json={"worker_addr": data_proxy_addr},
+                    json={
+                        "worker_addr": intent.data_proxy_addr,
+                        "worker_id": intent.desired_worker_id,
+                        "expected_worker_id": intent.expected_worker_id,
+                    },
                     headers={"Authorization": f"Bearer {admin_key}"},
                     timeout=5,
                 )
             resp.raise_for_status()
             worker_id = resp.json().get("worker_id")
+            if worker_id != intent.desired_worker_id:
+                raise RuntimeError(
+                    "Router registered a different data proxy incarnation for "
+                    f"{intent.data_proxy_addr}: expected "
+                    f"{intent.desired_worker_id}, got {worker_id}"
+                )
             logger.info(
                 "Registered data proxy %s in router (worker_id=%s)",
-                data_proxy_addr,
+                intent.data_proxy_addr,
                 worker_id,
             )
-            return data_proxy_addr, worker_id
+            return intent, worker_id
 
-        with ThreadPoolExecutor(max_workers=len(self._data_proxy_addrs)) as pool:
-            results = list(pool.map(_register_one, self._data_proxy_addrs))
+        with ThreadPoolExecutor(max_workers=len(snapshot.intents)) as pool:
+            results = list(pool.map(_register_one, snapshot.intents))
 
-        for data_proxy_addr, worker_id in results:
-            if worker_id:
-                self._worker_ids[data_proxy_addr] = worker_id
+        with self._registration_state_lock:
+            if (
+                self._destroyed
+                or self._registration_generation != snapshot.generation
+                or tuple(self._data_proxy_addrs)
+                != tuple(intent.data_proxy_addr for intent in snapshot.intents)
+            ):
+                return
+            for intent, _worker_id in results:
+                if (
+                    self._desired_worker_ids.get(intent.data_proxy_addr)
+                    != intent.desired_worker_id
+                    or intent.data_proxy_addr not in self._predecessor_worker_ids
+                    or self._predecessor_worker_ids[intent.data_proxy_addr]
+                    != intent.expected_worker_id
+                ):
+                    return
+            for intent, worker_id in results:
+                self._worker_ids[intent.data_proxy_addr] = worker_id
 
     def register_model(
         self,
@@ -812,10 +946,34 @@ class RolloutControllerV2:
                     self._handle_online_ready_callback(payload)
                 )
                 return jsonify(result)
+            except _OnlineLeaseConflict as exc:
+                return jsonify({"error": str(exc)}), 409
             except RuntimeError as exc:
                 return jsonify({"error": str(exc)}), 425
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("Online callback handler error: %s", exc, exc_info=True)
+                return jsonify({"error": str(exc)}), 500
+
+        @app.route("/callback/online_failed", methods=["POST"])
+        def online_failed():
+            if request.headers.get("Authorization") != (
+                f"Bearer {self.config.admin_api_key}"
+            ):
+                return jsonify({"error": "Invalid admin API key"}), 403
+            payload = request.get_json() or {}
+            try:
+                if self._callback_loop is None:
+                    raise RuntimeError("Callback loop not ready")
+                result = self._callback_loop.run_until_complete(
+                    self._handle_online_failed_callback(payload)
+                )
+                return jsonify(result)
+            except _OnlineLeaseConflict as exc:
+                return jsonify({"error": str(exc)}), 409
+            except RuntimeError as exc:
+                return jsonify({"error": str(exc)}), 425
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Online failure handler error: %s", exc, exc_info=True)
                 return jsonify({"error": str(exc)}), 500
 
         self._callback_port = int(find_free_ports(1)[0])
@@ -872,72 +1030,256 @@ class RolloutControllerV2:
             raise RuntimeError("Callback server not started")
         return format_hostport(self._callback_host, self._callback_port)
 
-    def _pop_online_waiter(self) -> _OnlineWaiter | None:
-        with self._online_waiters_lock:
-            while self._online_waiters:
-                waiter = self._online_waiters.popleft()
-                if not waiter.future.cancelled():
-                    return waiter
-        return None
+    def reserve_online_trajectory(self) -> tuple[str, int]:
+        """Register a version-bound waiter before its lease becomes visible.
 
-    def _remove_online_waiter(self, future: asyncio.Future) -> None:
-        with self._online_waiters_lock:
-            self._online_waiters = deque(
-                waiter for waiter in self._online_waiters if waiter.future is not future
-            )
+        Registering first closes the race where a fast external producer could
+        complete before the controller had a future ready to receive it.
+        """
 
-    async def wait_for_online_trajectory(
-        self, timeout: float | None = None
-    ) -> dict[str, Any]:
+        lease_id = str(uuid.uuid4())
+        expected_version = self.get_version()
         future = asyncio.get_running_loop().create_future()
         with self._online_waiters_lock:
-            if self._completed_online_results:
-                return self._completed_online_results.popleft()
-            self._online_waiters.append(_OnlineWaiter(future=future))
+            self._online_waiters[lease_id] = _OnlineWaiter(
+                lease_id=lease_id,
+                expected_version=expected_version,
+                future=future,
+            )
+        return lease_id, expected_version
+
+    def cancel_online_trajectory(self, lease_id: str) -> None:
+        """Remove and cancel a reservation without buffering a late callback."""
+
+        with self._online_waiters_lock:
+            waiter = self._online_waiters.pop(lease_id, None)
+        if waiter is not None and not waiter.future.done():
+            waiter.future.cancel()
+
+    def _record_online_settlement_locked(
+        self, lease_id: str, settlement: _OnlineSettlement
+    ) -> None:
+        """Remember a settled callback fingerprint while holding the waiter lock."""
+
+        existing = self._online_settlements.get(lease_id)
+        if existing is not None:
+            if existing != settlement:  # pragma: no cover - internal invariant
+                raise RuntimeError(
+                    f"Conflicting settlement for online lease {lease_id}"
+                )
+            return
+        self._online_settlements[lease_id] = settlement
+        while len(self._online_settlements) > self._online_settlement_limit:
+            self._online_settlements.popitem(last=False)
+
+    async def wait_for_online_trajectory(
+        self, lease_id: str, timeout: float | None = None
+    ) -> dict[str, Any]:
+        with self._online_waiters_lock:
+            waiter = self._online_waiters.get(lease_id)
+        if waiter is None:
+            raise RuntimeError(f"Unknown online lease: {lease_id}")
         try:
             if timeout is None:
-                return await future
-            return await asyncio.wait_for(future, timeout=timeout)
+                return await waiter.future
+            return await asyncio.wait_for(waiter.future, timeout=timeout)
         finally:
-            self._remove_online_waiter(future)
+            with self._online_waiters_lock:
+                current = self._online_waiters.get(lease_id)
+                if current is waiter:
+                    self._online_waiters.pop(lease_id, None)
 
     async def _handle_online_ready_callback(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
         session_id = payload.get("session_id")
         trajectory_id = payload.get("trajectory_id")
-        if not session_id or trajectory_id is None:
-            raise RuntimeError("Missing session_id or trajectory_id")
+        lease_id = payload.get("lease_id")
+        expected_version = payload.get("expected_version")
+        if (
+            not session_id
+            or trajectory_id is None
+            or not lease_id
+            or expected_version is None
+        ):
+            raise _OnlineLeaseConflict(
+                "Missing session_id, trajectory_id, lease_id, or expected_version"
+            )
 
         export_request = {
             "session_id": session_id,
             "trajectory_id": int(trajectory_id),
+            "lease_id": str(lease_id),
+            "expected_version": int(expected_version),
         }
+        group_id = payload.get("group_id")
+        if group_id is not None:
+            export_request["group_id"] = str(group_id)
 
-        waiter = self._pop_online_waiter()
-        if waiter is None:
-            with self._online_waiters_lock:
-                self._completed_online_results.append(export_request)
-        elif waiter.future.cancelled() or waiter.future.done():
-            with self._online_waiters_lock:
-                self._completed_online_results.append(export_request)
-        else:
-            waiter.future.get_loop().call_soon_threadsafe(
-                waiter.future.set_result, export_request
-            )
-        return {
+        callback_settlement = _OnlineSettlement(
+            callback_kind="ready",
+            expected_version=int(expected_version),
+            details=(
+                str(session_id),
+                int(trajectory_id),
+                str(group_id) if group_id is not None else None,
+            ),
+        )
+        callback_ack = {
             "status": "ok",
             "session_id": session_id,
             "trajectory_id": int(trajectory_id),
+            "lease_id": str(lease_id),
         }
+
+        with self._online_waiters_lock:
+            settled = self._online_settlements.get(str(lease_id))
+            if settled is not None:
+                if settled == callback_settlement:
+                    return callback_ack
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} is already settled by another callback"
+                )
+            waiter = self._online_waiters.get(str(lease_id))
+            if waiter is None or waiter.future.cancelled():
+                raise _OnlineLeaseConflict(f"Unknown or cancelled lease: {lease_id}")
+            if waiter.expected_version != int(expected_version):
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} expects policy version "
+                    f"{waiter.expected_version}, got {expected_version}"
+                )
+            if waiter.delivery is not None:
+                if waiter.delivery == export_request:
+                    return callback_ack
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} was already settled by another trajectory"
+                )
+            if waiter.future.done():
+                raise _OnlineLeaseConflict(f"Lease {lease_id} is already settled")
+            waiter.delivery = export_request
+
+        delivery_ack: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def _deliver() -> None:
+            try:
+                with self._online_waiters_lock:
+                    current = self._online_waiters.get(str(lease_id))
+                    if (
+                        current is not waiter
+                        or waiter.future.cancelled()
+                        or waiter.future.done()
+                    ):
+                        raise _OnlineLeaseConflict(
+                            f"Lease {lease_id} was cancelled before delivery"
+                        )
+                    waiter.future.set_result(export_request)
+                    self._record_online_settlement_locked(
+                        str(lease_id), callback_settlement
+                    )
+                delivery_ack.set_result(None)
+            except BaseException as exc:
+                delivery_ack.set_exception(exc)
+
+        waiter.future.get_loop().call_soon_threadsafe(_deliver)
+        try:
+            await asyncio.wrap_future(delivery_ack)
+        except BaseException:
+            with self._online_waiters_lock:
+                current = self._online_waiters.get(str(lease_id))
+                if current is waiter and waiter.future.cancelled():
+                    self._online_waiters.pop(str(lease_id), None)
+            raise
+        return callback_ack
+
+    async def _handle_online_failed_callback(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        lease_id = payload.get("lease_id")
+        expected_version = payload.get("expected_version")
+        reason = payload.get("reason")
+        if not lease_id or expected_version is None or not reason:
+            raise _OnlineLeaseConflict(
+                "Missing lease_id, expected_version, or failure reason"
+            )
+
+        callback_settlement = _OnlineSettlement(
+            callback_kind="failed",
+            expected_version=int(expected_version),
+            details=(str(reason),),
+        )
+        callback_ack = {"status": "ok", "lease_id": str(lease_id)}
+
+        with self._online_waiters_lock:
+            settled = self._online_settlements.get(str(lease_id))
+            if settled is not None:
+                if settled == callback_settlement:
+                    return callback_ack
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} is already settled by another callback"
+                )
+            waiter = self._online_waiters.get(str(lease_id))
+            if waiter is None or waiter.future.cancelled():
+                raise _OnlineLeaseConflict(f"Unknown or cancelled lease: {lease_id}")
+            if waiter.expected_version != int(expected_version):
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} expects policy version "
+                    f"{waiter.expected_version}, got {expected_version}"
+                )
+            if waiter.delivery is not None:
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} already delivered a trajectory"
+                )
+            if waiter.failure_reason is not None:
+                if waiter.failure_reason == str(reason):
+                    return callback_ack
+                raise _OnlineLeaseConflict(
+                    f"Lease {lease_id} already failed for another reason"
+                )
+            if waiter.future.done():
+                raise _OnlineLeaseConflict(f"Lease {lease_id} is already settled")
+            waiter.failure_reason = str(reason)
+
+        failure_ack: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+        def _fail() -> None:
+            try:
+                with self._online_waiters_lock:
+                    current = self._online_waiters.get(str(lease_id))
+                    if (
+                        current is not waiter
+                        or waiter.future.cancelled()
+                        or waiter.future.done()
+                    ):
+                        raise _OnlineLeaseConflict(
+                            f"Lease {lease_id} was cancelled before failure delivery"
+                        )
+                    waiter.future.set_exception(
+                        RuntimeError(f"Online lease {lease_id} failed: {reason}")
+                    )
+                    self._record_online_settlement_locked(
+                        str(lease_id), callback_settlement
+                    )
+                failure_ack.set_result(None)
+            except BaseException as exc:
+                failure_ack.set_exception(exc)
+
+        waiter.future.get_loop().call_soon_threadsafe(_fail)
+        await asyncio.wrap_future(failure_ack)
+        return callback_ack
 
     # -- Destroy -----------------------------------------------------------
 
     def destroy(self) -> None:
         """Tear down all services and release resources."""
-        if self._destroyed:
-            return
-        self._destroyed = True
+        with self._registration_state_lock:
+            if self._destroyed:
+                return
+            self._destroyed = True
+            self._registration_generation += 1
+            self._data_proxy_addrs.clear()
+            self._worker_ids.clear()
+            self._desired_worker_ids.clear()
+            self._predecessor_worker_ids.clear()
 
         self._shutdown_requested.set()
         future = self._init_future
@@ -996,14 +1338,12 @@ class RolloutControllerV2:
         self.workers.clear()
         self._server_infos.clear()
         with self._online_waiters_lock:
-            for waiter in self._online_waiters:
+            for waiter in self._online_waiters.values():
                 if not waiter.future.done():
                     waiter.future.cancel()
             self._online_waiters.clear()
-            self._completed_online_results.clear()
+            self._online_settlements.clear()
         self._inf_addrs.clear()
-        self._data_proxy_addrs.clear()
-        self._worker_ids.clear()
         self._router_addr = ""
         self._gateway_addr = ""
         self._staleness_manager = None
@@ -1026,10 +1366,11 @@ class RolloutControllerV2:
 
     async def _async_set_version(self, version: int) -> None:
         payload = {"version": version}
+        targets = self._snapshot_data_proxy_control_targets()
         results = await asyncio.gather(
             *[
-                self._async_data_proxy_post(addr, "/set_version", payload)
-                for addr in self._data_proxy_addrs
+                self._async_data_proxy_post(addr, worker_id, "/set_version", payload)
+                for addr, worker_id in targets
             ],
             return_exceptions=True,
         )
@@ -1369,12 +1710,15 @@ class RolloutControllerV2:
         run_async_task(self._async_offload)
 
     async def _async_offload(self) -> None:
-        if not self._data_proxy_addrs:
+        targets = self._snapshot_data_proxy_control_targets()
+        if not targets:
             return
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
-                for addr in self._data_proxy_addrs
+                self._async_data_proxy_post(
+                    addr, worker_id, "/release_memory_occupation", {}
+                )
+                for addr, worker_id in targets
             ),
             return_exceptions=True,
         )
@@ -1392,13 +1736,16 @@ class RolloutControllerV2:
         run_async_task(self._async_onload, tags)
 
     async def _async_onload(self, tags: list[str] | None = None) -> None:
-        if not self._data_proxy_addrs:
+        targets = self._snapshot_data_proxy_control_targets()
+        if not targets:
             return
         payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/resume_memory_occupation", payload)
-                for addr in self._data_proxy_addrs
+                self._async_data_proxy_post(
+                    addr, worker_id, "/resume_memory_occupation", payload
+                )
+                for addr, worker_id in targets
             ),
             return_exceptions=True,
         )
@@ -1416,12 +1763,13 @@ class RolloutControllerV2:
         run_async_task(self._async_pause_generation)
 
     async def _async_pause_generation(self) -> None:
-        if not self._data_proxy_addrs:
+        targets = self._snapshot_data_proxy_control_targets()
+        if not targets:
             return
         results = await asyncio.gather(
             *[
-                self._async_data_proxy_post(addr, "/pause_generation", {})
-                for addr in self._data_proxy_addrs
+                self._async_data_proxy_post(addr, worker_id, "/pause_generation", {})
+                for addr, worker_id in targets
             ],
             return_exceptions=True,
         )
@@ -1439,12 +1787,13 @@ class RolloutControllerV2:
         run_async_task(self._async_continue_generation)
 
     async def _async_continue_generation(self) -> None:
-        if not self._data_proxy_addrs:
+        targets = self._snapshot_data_proxy_control_targets()
+        if not targets:
             return
         results = await asyncio.gather(
             *[
-                self._async_data_proxy_post(addr, "/continue_generation", {})
-                for addr in self._data_proxy_addrs
+                self._async_data_proxy_post(addr, worker_id, "/continue_generation", {})
+                for addr, worker_id in targets
             ],
             return_exceptions=True,
         )
@@ -1497,9 +1846,10 @@ class RolloutControllerV2:
 
     @property
     def worker_ids(self) -> dict[str, str]:
-        """Return mapping from data proxy address to router-assigned worker_id."""
+        """Return mapping from data proxy address to active worker_id."""
         self._ensure_initialized()
-        return dict(self._worker_ids)
+        with self._registration_state_lock:
+            return dict(self._worker_ids)
 
     @property
     def staleness_manager(self):
@@ -1601,6 +1951,7 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            online_kwargs.setdefault("timeout", self.config.request_timeout)
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,
@@ -1792,15 +2143,44 @@ class RolloutControllerV2:
                     pass
         return self._async_client
 
+    def _snapshot_data_proxy_control_targets(self) -> tuple[tuple[str, str], ...]:
+        """Freeze direct-control destinations with their confirmed incarnations.
+
+        Address-only forwarding is unsafe: the process listening at an address may
+        have been replaced after Router registration.  Copy both fields under the
+        registration-state lock so every request in one broadcast remains pinned to
+        the same confirmed incarnation.  An unconfirmed address fails the whole
+        broadcast before any worker can be mutated.
+        """
+        with self._registration_state_lock:
+            targets: list[tuple[str, str]] = []
+            for addr in self._data_proxy_addrs:
+                worker_id = self._worker_ids.get(addr)
+                if not worker_id:
+                    raise RuntimeError(
+                        "Cannot send a direct Data Proxy control request: "
+                        f"{addr} has no router-confirmed worker identity"
+                    )
+                targets.append((addr, worker_id))
+            return tuple(targets)
+
     @async_http_retry
     async def _async_data_proxy_post(
-        self, addr: str, endpoint: str, payload: dict[str, Any]
+        self,
+        addr: str,
+        worker_id: str,
+        endpoint: str,
+        payload: dict[str, Any],
     ) -> None:
         """POST directly to a data proxy, bypassing gateway/router resolution."""
         url = f"{addr}{endpoint}"
         try:
             client = await self._get_async_client()
-            resp = await client.post(url, json=payload)
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={WORKER_ID_HEADER: worker_id},
+            )
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"Data proxy {url} returned {resp.status_code}: {resp.text}"

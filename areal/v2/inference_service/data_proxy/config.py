@@ -20,6 +20,8 @@ class DataProxyConfig:
     # Resolved serving address (host:port) used as node_addr for RTensor shards.
     # Set at startup by __main__.py after the host is resolved.
     serving_addr: str = ""
+    # Immutable process incarnation used to fence delayed control requests.
+    worker_id: str | None = None
 
     # ArealOpenAI client parameters (forwarded from AgentConfig)
     tool_call_parser: str = "qwen"

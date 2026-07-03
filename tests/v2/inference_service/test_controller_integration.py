@@ -22,6 +22,7 @@ import io
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, cast
 
 import httpx
@@ -108,11 +109,13 @@ def _export_trajectory_with_retry(
     wait_timeout: float = 20.0,
 ) -> dict[str, object]:
     deadline = time.time() + wait_timeout
+    request_id = f"integration-export-{uuid.uuid4()}"
     last_response = None
     while time.time() < deadline:
         last_response = httpx.post(
             f"{gateway_url}/export_trajectories",
             json={
+                "request_id": request_id,
                 "session_ids": [session_id],
                 "discount": discount,
                 "style": "individual",
@@ -127,6 +130,31 @@ def _export_trajectory_with_retry(
     assert last_response is not None
     pytest.fail(
         f"export_trajectories did not become ready: {last_response.status_code} {last_response.text}"
+    )
+
+
+def _wait_for_available_online_lease(
+    gateway_url: str,
+    *,
+    timeout: float = 30.0,
+) -> None:
+    """Wait until an online workflow has published producer capacity."""
+
+    deadline = time.time() + timeout
+    last_response: httpx.Response | None = None
+    while time.time() < deadline:
+        last_response = httpx.get(f"{gateway_url}/health", timeout=10.0)
+        if (
+            last_response.status_code == 200
+            and last_response.json().get("available_online_leases", 0) > 0
+        ):
+            return
+        time.sleep(0.1)
+
+    assert last_response is not None
+    pytest.fail(
+        "online workflow did not publish a lease: "
+        f"{last_response.status_code} {last_response.text}"
     )
 
 
@@ -146,7 +174,7 @@ def _do_vlm_chat_session(
 
     resp = httpx.post(
         f"{gw}/rl/start_session",
-        json={"task_id": task_id},
+        json={"task_id": task_id, "delivery_mode": "pull"},
         headers={"Authorization": f"Bearer {admin}"},
         timeout=30.0,
     )
@@ -894,7 +922,10 @@ class TestControllerFullInitialization:
         # --- start session ---
         resp = httpx.post(
             f"{gw}/rl/start_session",
-            json={"task_id": "full-init-chat-test"},
+            json={
+                "task_id": "full-init-chat-test",
+                "delivery_mode": "pull",
+            },
             headers={"Authorization": f"Bearer {admin_key}"},
             timeout=30.0,
         )
@@ -1064,11 +1095,30 @@ class TestControllerOnlineWorkflow:
         )
         assert isinstance(task_id, int)
 
+        _wait_for_available_online_lease(gateway_url)
+        start_resp = requests.post(
+            f"{gateway_url}/rl/start_session",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {admin_key}",
+            },
+            json={
+                "task_id": f"online-roundtrip-{task_id}",
+                "delivery_mode": "callback",
+                "request_id": f"online-roundtrip-request-{task_id}",
+            },
+            timeout=30.0,
+        )
+        assert start_resp.status_code == 201, start_resp.text
+        session = start_resp.json()["sessions"][0]
+        session_id = session["session_id"]
+        session_api_key = session["session_api_key"]
+
         chat_resp = requests.post(
             f"{gateway_url}/chat/completions",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {admin_key}",
+                "Authorization": f"Bearer {session_api_key}",
             },
             json={
                 "model": "default",
@@ -1085,14 +1135,14 @@ class TestControllerOnlineWorkflow:
             f"{gateway_url}/rl/set_reward",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {admin_key}",
+                "Authorization": f"Bearer {session_api_key}",
             },
             json={"reward": 1.0},
             timeout=10.0,
         )
         assert reward_resp.status_code == 200, reward_resp.text
         reward_data = reward_resp.json()
-        assert reward_data["session_id"] == "__hitl__"
+        assert reward_data["session_id"] == session_id
         assert reward_data["trajectory_id"] == 0
 
         result = gateway_controller_full_init_online.wait_for_task(
@@ -1119,7 +1169,10 @@ class TestControllerOnlineWorkflow:
 
         start_resp = httpx.post(
             f"{gateway_url}/rl/start_session",
-            json={"task_id": "reward-timeout-export"},
+            json={
+                "task_id": "reward-timeout-export",
+                "delivery_mode": "pull",
+            },
             headers={"Authorization": f"Bearer {admin_key}"},
             timeout=30.0,
         )

@@ -16,12 +16,14 @@ from areal.v2.inference_service.data_proxy.app import (
 )
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import (
+    ExportTrajectoriesRequest,
     ReadyNotification,
     SessionData,
     SessionStore,
     StartSessionRequest,
     TrajectoryDeliveryMode,
 )
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 # =============================================================================
 # Fixtures
@@ -206,6 +208,21 @@ def test_start_session_request_rejects_unknown_delivery_mode():
 
 
 class TestSessionStore:
+    def test_export_replay_cache_is_bounded_and_returns_json_snapshots(self):
+        store = SessionStore(max_export_replay_records=2)
+        first_payload = {"nested": {"value": 1}}
+
+        store.record_export_replay("export-1", "fingerprint-1", first_payload)
+        store.record_export_replay("export-2", "fingerprint-2", {"value": 2})
+        store.record_export_replay("export-3", "fingerprint-3", {"value": 3})
+
+        first_payload["nested"]["value"] = 99
+        assert store.get_export_replay("export-1", "fingerprint-1") is None
+        cached = store.get_export_replay("export-2", "fingerprint-2")
+        assert cached == {"value": 2}
+        cached["value"] = 99
+        assert store.get_export_replay("export-2", "fingerprint-2") == {"value": 2}
+
     def test_default_delivery_remains_callback(self):
         store = SessionStore()
         session_id, _ = store.start_session("callback-task")
@@ -381,6 +398,17 @@ class TestSessionStore:
         assert sid1 == "task-1-0"
         assert sid2 == "task-1-1"
 
+    def test_group_scopes_session_ids_across_worker_local_stores(self):
+        first_worker = SessionStore()
+        second_worker = SessionStore()
+
+        first_id, _ = first_worker.start_session("shared-task", group_id="grp-a")
+        second_id, _ = second_worker.start_session("shared-task", group_id="grp-b")
+
+        assert first_id != second_id
+        assert first_id.startswith("shared-task-grp-a-")
+        assert second_id.startswith("shared-task-grp-b-")
+
     def test_get_or_create_hitl_session_reuses_same_session(self):
         store = SessionStore()
         store.set_admin_key(ADMIN_KEY)
@@ -402,10 +430,58 @@ class TestSessionStore:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/rl/start_session", {"task_id": "stale-owner", "delivery_mode": "pull"}),
+        (
+            "/export_trajectories",
+            {"request_id": "stale-export", "session_ids": ["missing-session"]},
+        ),
+    ],
+)
+@pytest.mark.parametrize("worker_header", [None, "epoch-e1"])
+async def test_session_mutations_reject_missing_or_stale_worker_identity(
+    client, config, path, payload, worker_header
+):
+    config.worker_id = "epoch-e2"
+    headers = admin_headers()
+    if worker_header is not None:
+        headers[WORKER_ID_HEADER] = worker_header
+
+    response = await client.post(path, json=payload, headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Data Proxy incarnation mismatch"
+    assert client._transport.app.state.session_store.session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_session_mutations_accept_matching_worker_identity(client, config):
+    config.worker_id = "epoch-e2"
+    headers = {**admin_headers(), WORKER_ID_HEADER: "epoch-e2"}
+
+    started = await client.post(
+        "/rl/start_session",
+        json={"task_id": "matching-owner", "delivery_mode": "pull"},
+        headers=headers,
+    )
+    session_id = started.json()["sessions"][0]["session_id"]
+    exported = await client.post(
+        "/export_trajectories",
+        json={"request_id": "matching-export", "session_ids": [session_id]},
+        headers=headers,
+    )
+
+    assert started.status_code == 201
+    assert exported.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_start_session_with_admin_key(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "test-task"},
+        json={"task_id": "test-task", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     assert resp.status_code == 201
@@ -415,6 +491,177 @@ async def test_start_session_with_admin_key(client):
     assert len(data["sessions"]) == 1
     assert data["sessions"][0]["session_id"].startswith("test-task-")
     assert "session_api_key" in data["sessions"][0]
+
+
+@pytest.mark.asyncio
+async def test_callback_session_requires_versioned_admission(client):
+    response = await client.post(
+        "/rl/start_session",
+        json={"task_id": "callback-task", "delivery_mode": "callback"},
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 422
+    assert client._transport.app.state.session_store.session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_session_rejects_worker_version_mismatch(client):
+    response = await client.post(
+        "/rl/start_session",
+        json={
+            "task_id": "callback-task",
+            "delivery_mode": "callback",
+            "lease_id": "lease-1",
+            "admission_id": "lease-1",
+            "expected_version": 9,
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 409
+    assert client._transport.app.state.session_store.session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_session_persists_lease_metadata(client):
+    response = await client.post(
+        "/rl/start_session",
+        json={
+            "task_id": "callback-task",
+            "delivery_mode": "callback",
+            "lease_id": "lease-1",
+            "admission_id": "lease-1",
+            "expected_version": 0,
+        },
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 201
+    session_id = response.json()["sessions"][0]["session_id"]
+    session = client._transport.app.state.session_store.get_session(session_id)
+    assert session.lease_id == "lease-1"
+    assert session.expected_version == 0
+    assert session.group_id == response.json()["group_id"]
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
+    assert client._transport.app.state.session_store.pending_online_callbacks() == [
+        ReadyNotification(
+            session_id=session_id,
+            trajectory_id=0,
+            lease_id="lease-1",
+            expected_version=0,
+            group_id=response.json()["group_id"],
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_callback_admission_replay_returns_same_credentials(client):
+    request = {
+        "task_id": "callback-task",
+        "delivery_mode": "callback",
+        "lease_id": "lease-1",
+        "admission_id": "lease-1",
+        "expected_version": 0,
+    }
+
+    first = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+    replay = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
+    assert client._transport.app.state.session_store.session_count == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_admission_conflicting_replay_returns_409(client):
+    first = {
+        "task_id": "callback-task-a",
+        "delivery_mode": "callback",
+        "lease_id": "lease-1",
+        "admission_id": "lease-1",
+        "expected_version": 0,
+    }
+    conflict = {**first, "task_id": "callback-task-b"}
+
+    assert (
+        await client.post("/rl/start_session", json=first, headers=admin_headers())
+    ).status_code == 201
+    response = await client.post(
+        "/rl/start_session", json=conflict, headers=admin_headers()
+    )
+
+    assert response.status_code == 409
+    assert client._transport.app.state.session_store.session_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_callback_admission_cannot_be_recreated(client):
+    request = {
+        "task_id": "callback-task",
+        "delivery_mode": "callback",
+        "lease_id": "lease-1",
+        "admission_id": "lease-1",
+        "expected_version": 0,
+    }
+    started = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+    assert started.status_code == 201
+
+    cancelled = await client.post(
+        "/rl/cancel_sessions",
+        json={"admission_id": "lease-1", "session_ids": []},
+        headers=admin_headers(),
+    )
+    replay = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["removed"] == 1
+    assert replay.status_code == 410
+    assert client._transport.app.state.session_store.session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_export_closes_start_admission_replay_state(client):
+    request = {
+        "task_id": "closed-admission",
+        "delivery_mode": "pull",
+        "admission_id": "pull-admission-1",
+    }
+    started = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+    assert started.status_code == 201
+    session_id = started.json()["sessions"][0]["session_id"]
+    session = client._transport.app.state.session_store.get_session(session_id)
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
+
+    exported = await client.post(
+        "/export_trajectories",
+        json={
+            "request_id": "closed-admission-export",
+            "session_ids": [session_id],
+        },
+        headers=admin_headers(),
+    )
+    replay = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+
+    assert exported.status_code == 200
+    assert replay.status_code == 410
+    assert "closed or cancelled" in replay.text
+    assert "pull-admission-1" not in client._transport.app.state.admission_records
 
 
 @pytest.mark.asyncio
@@ -475,7 +722,7 @@ async def test_chat_completions_with_session_key(client, mock_areal_client):
     # Start session first
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "chat-test"},
+        json={"task_id": "chat-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -538,7 +785,7 @@ async def test_offline_chat_unknown_token_falls_through_to_standalone(client):
 async def test_chat_completions_passes_sampling_params(client, mock_areal_client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "sp-test"},
+        json={"task_id": "sp-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -572,7 +819,7 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
 async def test_set_reward_success(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "reward-test"},
+        json={"task_id": "reward-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -606,7 +853,7 @@ async def test_set_reward_success(client):
 async def test_set_reward_no_interactions(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "reward-empty"},
+        json={"task_id": "reward-empty", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -638,7 +885,7 @@ async def test_set_reward_without_session_key(client):
 async def test_set_reward_auto_finishes(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "end-test"},
+        json={"task_id": "end-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -672,7 +919,7 @@ async def test_set_reward_auto_finishes(client):
 async def test_set_reward_only_once_allowed(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "twice-test"},
+        json={"task_id": "twice-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     api_key = resp.json()["sessions"][0]["session_api_key"]
@@ -706,7 +953,7 @@ async def test_set_reward_only_once_allowed(client):
 
 
 @pytest.mark.asyncio
-async def test_set_reward_timeout_delays_readiness_and_direct_callback(
+async def test_set_reward_timeout_keeps_unleased_hitl_trajectory_pull_only(
     client, monkeypatch
 ):
     app = client._transport.app
@@ -758,7 +1005,7 @@ async def test_set_reward_timeout_delays_readiness_and_direct_callback(
     hitl_session.finalize_if_reward_timeout_elapsed(now=time.time() + 6.0)
     await _flush_ready_trajectories(app)
 
-    assert callback_calls == [("http://controller", ADMIN_KEY, "__hitl__", 0)]
+    assert callback_calls == []
 
 
 @pytest.mark.asyncio
@@ -871,7 +1118,7 @@ async def test_hitl_ready_transition_after_each_online_set_reward(client):
 async def test_online_start_session_returns_generated_session_key(client):
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "batch-1"},
+        json={"task_id": "batch-1", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     assert resp.status_code == 201
@@ -887,7 +1134,7 @@ async def test_online_start_session_returns_generated_session_key(client):
 async def test_batch_session_produces_single_trajectory(client):
     start = await client.post(
         "/rl/start_session",
-        json={"task_id": "batch-traj"},
+        json={"task_id": "batch-traj", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     session_api_key = start.json()["sessions"][0]["session_api_key"]
@@ -913,7 +1160,7 @@ async def test_batch_session_produces_single_trajectory(client):
 async def test_batch_online_set_reward_completes_that_session(client):
     start = await client.post(
         "/rl/start_session",
-        json={"task_id": "batch-complete"},
+        json={"task_id": "batch-complete", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     session_api_key = start.json()["sessions"][0]["session_api_key"]
@@ -933,6 +1180,7 @@ async def test_batch_online_set_reward_completes_that_session(client):
     export_resp = await client.post(
         "/export_trajectories",
         json={
+            "request_id": "batch-complete-export",
             "session_ids": [session_id],
             "trajectory_id": 0,
             "discount": 1.0,
@@ -944,6 +1192,133 @@ async def test_batch_online_set_reward_completes_that_session(client):
     assert "traj" in export_resp.json()
 
 
+@pytest.mark.asyncio
+async def test_export_trajectories_replays_identical_response_after_session_removal(
+    client,
+):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "lost-export-response", "delivery_mode": "pull"},
+        headers=admin_headers(),
+    )
+    session_api_key = start.json()["sessions"][0]["session_api_key"]
+    session_id = start.json()["sessions"][0]["session_id"]
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+        headers=session_headers(session_api_key),
+    )
+    await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=session_headers(session_api_key),
+    )
+    export_request = {
+        "request_id": "export-after-lost-response",
+        "session_ids": [session_id],
+        "trajectory_id": 0,
+        "discount": 1.0,
+        "style": "individual",
+        "remove_session": True,
+    }
+
+    first = await client.post(
+        "/export_trajectories", json=export_request, headers=admin_headers()
+    )
+    assert first.status_code == 200
+    assert client._transport.app.state.session_store.get_session(session_id) is None
+
+    # Simulate an HTTP response that was produced by the server but lost before the
+    # caller observed it.  A retry must not re-run the destructive export.
+    replay = await client.post(
+        "/export_trajectories",
+        json={
+            "style": "individual",
+            "remove_session": True,
+            "trajectory_id": 0,
+            "session_ids": [session_id],
+            "discount": 1.0,
+            "request_id": "export-after-lost-response",
+        },
+        headers=admin_headers(),
+    )
+
+    assert replay.status_code == 200
+    assert replay.content == first.content
+
+
+@pytest.mark.asyncio
+async def test_export_serialization_failure_does_not_consume_trajectory(
+    client, monkeypatch
+):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "serialize-failure", "delivery_mode": "pull"},
+        headers=admin_headers(),
+    )
+    session_id = start.json()["sessions"][0]["session_id"]
+    session = client._transport.app.state.session_store.get_session(session_id)
+    _add_fake_interaction(session)
+    session.set_reward(interaction_id="fake-id", reward=1.0)
+
+    from areal.v2.inference_service.data_proxy import app as data_proxy_app_module
+
+    original_serialize = data_proxy_app_module.serialize_value
+    attempts = 0
+
+    def flaky_serialize(value):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("serialization failed")
+        return original_serialize(value)
+
+    monkeypatch.setattr(data_proxy_app_module, "serialize_value", flaky_serialize)
+    request = {
+        "request_id": "serialize-failure-export",
+        "session_ids": [session_id],
+    }
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        await client.post("/export_trajectories", json=request, headers=admin_headers())
+    assert session.has_ready_trajectories
+
+    retry = await client.post(
+        "/export_trajectories", json=request, headers=admin_headers()
+    )
+    assert retry.status_code == 200
+    assert client._transport.app.state.session_store.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_rejects_conflicting_request_id_reuse(client):
+    first_request = ExportTrajectoriesRequest(
+        request_id="conflicting-export",
+        session_ids=["missing-a"],
+    )
+    conflict_request = ExportTrajectoriesRequest(
+        request_id="conflicting-export",
+        session_ids=["missing-b"],
+    )
+
+    first = await client.post(
+        "/export_trajectories",
+        json=first_request.model_dump(mode="json"),
+        headers=admin_headers(),
+    )
+    conflict = await client.post(
+        "/export_trajectories",
+        json=conflict_request.model_dump(mode="json"),
+        headers=admin_headers(),
+    )
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == (
+        "request_id conflicting-export was replayed with a different export request"
+    )
+
+
 # =============================================================================
 # Coexistence tests — HITL and batch running simultaneously
 # =============================================================================
@@ -953,7 +1328,7 @@ async def test_batch_online_set_reward_completes_that_session(client):
 async def test_hitl_and_batch_can_run_simultaneously(client):
     start = await client.post(
         "/rl/start_session",
-        json={"task_id": "coexist-batch"},
+        json={"task_id": "coexist-batch", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     batch_key = start.json()["sessions"][0]["session_api_key"]
@@ -999,7 +1374,7 @@ async def test_admin_key_still_only_maps_to_hitl_session_while_batch_uses_sessio
 
     start = await client.post(
         "/rl/start_session",
-        json={"task_id": "mapping"},
+        json={"task_id": "mapping", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     batch_key = start.json()["sessions"][0]["session_api_key"]
@@ -1062,7 +1437,12 @@ async def test_chat_completion_without_valid_token_falls_through_to_standalone(
 async def test_export_trajectories_not_found(client):
     resp = await client.post(
         "/export_trajectories",
-        json={"session_ids": ["nonexistent"], "discount": 1.0, "style": "individual"},
+        json={
+            "request_id": "missing-session-export",
+            "session_ids": ["nonexistent"],
+            "discount": 1.0,
+            "style": "individual",
+        },
         headers=admin_headers(),
     )
     assert resp.status_code == 200
@@ -1073,7 +1453,12 @@ async def test_export_trajectories_not_found(client):
 async def test_export_trajectories_without_admin_key(client):
     resp = await client.post(
         "/export_trajectories",
-        json={"session_ids": ["x"], "discount": 1.0, "style": "individual"},
+        json={
+            "request_id": "unauthorized-export",
+            "session_ids": ["x"],
+            "discount": 1.0,
+            "style": "individual",
+        },
     )
     assert resp.status_code == 401
 
@@ -1190,11 +1575,16 @@ async def test_online_export_latest_ready_without_trajectory_id(client):
 
     export_resp = await client.post(
         "/export_trajectories",
-        json={"session_ids": ["__hitl__"], "discount": 1.0, "style": "individual"},
+        json={
+            "request_id": "latest-hitl-export",
+            "session_ids": ["__hitl__"],
+            "discount": 1.0,
+            "style": "individual",
+        },
         headers=admin_headers(),
     )
     assert export_resp.status_code == 200
-    interactions = export_resp.json()["interactions"]
+    interactions = export_resp.json()["traj"]["interactions"]
     assert list(interactions) == ["chatcmpl-test1"]
 
 
@@ -1236,6 +1626,7 @@ async def test_online_export_explicit_trajectory_id(client):
     export_resp = await client.post(
         "/export_trajectories",
         json={
+            "request_id": "explicit-hitl-export",
             "session_ids": ["__hitl__"],
             "trajectory_id": 0,
             "discount": 1.0,
@@ -1245,7 +1636,7 @@ async def test_online_export_explicit_trajectory_id(client):
         headers=admin_headers(),
     )
     assert export_resp.status_code == 200
-    interactions = export_resp.json()["interactions"]
+    interactions = export_resp.json()["traj"]["interactions"]
     assert list(interactions) == ["chatcmpl-test0"]
 
     health = await client.get("/health")
@@ -1273,7 +1664,7 @@ async def test_health_sessions_count_after_start(client):
     # Start a session
     await client.post(
         "/rl/start_session",
-        json={"task_id": "health-test"},
+        json={"task_id": "health-test", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     resp = await client.get("/health")
@@ -1292,7 +1683,7 @@ async def test_full_session_lifecycle(client, mock_areal_client):
     # 1. Start session
     resp = await client.post(
         "/rl/start_session",
-        json={"task_id": "lifecycle"},
+        json={"task_id": "lifecycle", "delivery_mode": "pull"},
         headers=admin_headers(),
     )
     assert resp.status_code == 201
@@ -1324,9 +1715,14 @@ async def test_full_session_lifecycle(client, mock_areal_client):
     # 4. Export trajectories
     resp = await client.post(
         "/export_trajectories",
-        json={"session_ids": [session_id], "discount": 1.0, "style": "individual"},
+        json={
+            "request_id": "full-lifecycle-export",
+            "session_ids": [session_id],
+            "discount": 1.0,
+            "style": "individual",
+        },
         headers=admin_headers(),
     )
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["traj"]
     assert "interactions" in data

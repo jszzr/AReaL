@@ -237,14 +237,19 @@ def gateway_stack(sglang_server, model_path):
     _wait_for_health(gateway_addr, SERVICE_STARTUP_TIMEOUT, "Gateway")
 
     # --- Register the data proxy worker in the router ---
+    worker_id = "gateway-integration-sglang-epoch-1"
     resp = httpx.post(
         f"{router_addr}/register",
-        json={"worker_addr": data_proxy_addr},
+        json={
+            "worker_addr": data_proxy_addr,
+            "worker_id": worker_id,
+            "expected_worker_id": None,
+        },
         headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         timeout=5.0,
     )
     assert resp.status_code == 200, f"Failed to register worker: {resp.text}"
-    worker_id = resp.json()["worker_id"]
+    assert resp.json()["worker_id"] == worker_id
 
     # Wait briefly for router health poller to mark worker healthy
     time.sleep(3)
@@ -329,7 +334,7 @@ class TestGatewayChatCompletions:
             # Start session
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-chat-ns"},
+                json={"task_id": "integ-gw-chat-ns", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201
@@ -376,7 +381,10 @@ class TestGatewayChatCompletions:
             # Start session
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-chat-stream"},
+                json={
+                    "task_id": "integ-gw-chat-stream",
+                    "delivery_mode": "pull",
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201
@@ -447,7 +455,7 @@ class TestGatewayChatCompletions:
             # Start session
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-multi"},
+                json={"task_id": "integ-gw-multi", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201
@@ -516,7 +524,7 @@ class TestGatewaySessionLifecycle:
             # --- start session ---
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-lifecycle"},
+                json={"task_id": "integ-gw-lifecycle", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201, resp.text
@@ -553,11 +561,14 @@ class TestGatewaySessionLifecycle:
             # --- export trajectories ---
             resp = await client.post(
                 f"{gw}/export_trajectories",
-                json={"session_ids": [session_id]},
+                json={
+                    "request_id": "gateway-sglang-export",
+                    "session_ids": [session_id],
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 200, resp.text
-            export_data = resp.json()
+            export_data = resp.json()["traj"]
             assert "interactions" in export_data
             interactions = export_data["interactions"]
             assert len(interactions) == 1
@@ -577,7 +588,7 @@ class TestGatewaySessionLifecycle:
             # Start session
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-pinning"},
+                json={"task_id": "integ-gw-pinning", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201
@@ -739,7 +750,7 @@ class TestGatewayPauseContinue:
             # Start session
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "integ-gw-pause-chat"},
+                json={"task_id": "integ-gw-pause-chat", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201
@@ -869,14 +880,19 @@ def gateway_stack_vllm(vllm_server, model_path):
     _wait_for_health(router_addr, SERVICE_STARTUP_TIMEOUT, "Router (vLLM)")
     _wait_for_health(gateway_addr, SERVICE_STARTUP_TIMEOUT, "Gateway (vLLM)")
 
+    worker_id = "gateway-integration-vllm-epoch-1"
     resp = httpx.post(
         f"{router_addr}/register",
-        json={"worker_addr": data_proxy_addr},
+        json={
+            "worker_addr": data_proxy_addr,
+            "worker_id": worker_id,
+            "expected_worker_id": None,
+        },
         headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         timeout=5.0,
     )
     assert resp.status_code == 200, f"Failed to register worker: {resp.text}"
-    worker_id = resp.json()["worker_id"]
+    assert resp.json()["worker_id"] == worker_id
 
     time.sleep(3)
 
@@ -923,7 +939,7 @@ class TestGatewayVLLM:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{gw}/rl/start_session",
-                json={"task_id": "vllm-gw-lifecycle"},
+                json={"task_id": "vllm-gw-lifecycle", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 201, resp.text
@@ -954,11 +970,14 @@ class TestGatewayVLLM:
 
             resp = await client.post(
                 f"{gw}/export_trajectories",
-                json={"session_ids": [session_id]},
+                json={
+                    "request_id": "gateway-vllm-export",
+                    "session_ids": [session_id],
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
             )
             assert resp.status_code == 200, resp.text
-            interactions = resp.json()["interactions"]
+            interactions = resp.json()["traj"]["interactions"]
             assert len(interactions) == 1
             for _iid, item in interactions.items():
                 assert item["reward"] == 1.0

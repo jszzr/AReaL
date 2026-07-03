@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import threading
 import time
@@ -13,13 +14,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
+MAX_EXPORT_REPLAY_RECORDS = 4096
 
 
 # =============================================================================
@@ -49,6 +51,9 @@ class StartSessionRequest(BaseModel):
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
     group_size: int = 1
     delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK
+    lease_id: str | None = None
+    admission_id: str | None = None
+    expected_version: int | None = None
 
 
 class SessionCredentials(BaseModel):
@@ -63,6 +68,13 @@ class StartSessionResponse(BaseModel):
 
     group_id: str
     sessions: list[SessionCredentials]
+
+
+class CancelSessionsRequest(BaseModel):
+    """Compensating cleanup for an admitted session group."""
+
+    admission_id: str
+    session_ids: list[str]
 
 
 class SetRewardRequest(BaseModel):
@@ -81,6 +93,7 @@ class ExportTrajectoriesRequest(BaseModel):
     the data proxy itself does not use it.
     """
 
+    request_id: str = Field(min_length=1)
     session_ids: list[str]
     group_id: str | None = None
     trajectory_id: int | None = None
@@ -88,11 +101,25 @@ class ExportTrajectoriesRequest(BaseModel):
     style: str = "individual"
     remove_session: bool = True
 
+    def replay_fingerprint(self) -> str:
+        """Return a canonical fingerprint of the export's semantic inputs."""
+        payload = self.model_dump(mode="json", exclude={"request_id"})
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing merged serialized interactions."""
 
     traj: dict[str, Any]
+
+
+class ExportReplayConflictError(ValueError):
+    """Raised when one request ID is reused for a different export request."""
 
 
 @dataclass(frozen=True)
@@ -109,6 +136,9 @@ class RewardResult:
 class ReadyNotification:
     session_id: str
     trajectory_id: int
+    lease_id: str | None = None
+    expected_version: int | None = None
+    group_id: str | None = None
 
 
 @dataclass
@@ -150,9 +180,15 @@ class SessionData:
         session_id: str,
         set_reward_finish_timeout: float = 0.0,
         delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
+        lease_id: str | None = None,
+        expected_version: int | None = None,
+        group_id: str | None = None,
     ):
         self.session_id = session_id
         self.delivery_mode = delivery_mode
+        self.lease_id = lease_id
+        self.expected_version = expected_version
+        self.group_id = group_id
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._last_access_time = time.time()
         self._lock = threading.Lock()
@@ -299,6 +335,9 @@ class SessionData:
                 ReadyNotification(
                     session_id=self.session_id,
                     trajectory_id=ready.trajectory_id,
+                    lease_id=self.lease_id,
+                    expected_version=self.expected_version,
+                    group_id=self.group_id,
                 )
                 for ready in self._ready_trajectories.values()
                 if ready.needs_online_callback and not ready.callback_delivered
@@ -355,6 +394,22 @@ class SessionData:
             If no ready trajectories exist, or the requested
             ``trajectory_id`` is not found.
         """
+        trajectory_id, interactions = self.prepare_trajectory_export(
+            discount=discount,
+            style=style,
+            trajectory_id=trajectory_id,
+        )
+        self.commit_trajectory_export(trajectory_id)
+        return trajectory_id, interactions
+
+    def prepare_trajectory_export(
+        self,
+        discount: float,
+        style: str,
+        trajectory_id: int | None = None,
+    ) -> tuple[int, dict[str, InteractionWithTokenLogpReward]]:
+        """Build an export without consuming it until the caller commits."""
+
         with self._lock:
             if not self._ready_trajectories:
                 raise KeyError(f"No ready trajectories for session {self.session_id}")
@@ -363,7 +418,7 @@ class SessionData:
             if target_trajectory_id is None:
                 target_trajectory_id = next(reversed(self._ready_trajectories))
 
-            ready = self._ready_trajectories.pop(target_trajectory_id, None)
+            ready = self._ready_trajectories.get(target_trajectory_id)
             if ready is None:
                 raise KeyError(
                     f"Trajectory {target_trajectory_id} not found for session {self.session_id}"
@@ -375,6 +430,16 @@ class SessionData:
         )
         return ready.trajectory_id, interactions
 
+    def commit_trajectory_export(self, trajectory_id: int) -> None:
+        """Consume a previously prepared trajectory after serialization succeeds."""
+
+        with self._lock:
+            ready = self._ready_trajectories.pop(trajectory_id, None)
+            if ready is None:
+                raise KeyError(
+                    f"Trajectory {trajectory_id} not found for session {self.session_id}"
+                )
+
 
 # =============================================================================
 # Session Store
@@ -384,22 +449,77 @@ class SessionData:
 class SessionStore:
     """Thread-safe store for session lifecycle management."""
 
-    def __init__(self, set_reward_finish_timeout: float = 0.0):
+    def __init__(
+        self,
+        set_reward_finish_timeout: float = 0.0,
+        max_export_replay_records: int = MAX_EXPORT_REPLAY_RECORDS,
+    ):
+        if max_export_replay_records <= 0:
+            raise ValueError("max_export_replay_records must be positive")
         self._sessions: dict[str, SessionData] = {}
         self._api_key_to_session: dict[str, str] = {}
         self._session_to_api_key: dict[str, str] = {}
+        self._export_replays: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._max_export_replay_records = max_export_replay_records
         self._lock = threading.Lock()
-        self._capacity: int = 0
         self._admin_api_key: str = "areal-admin-key"
         self._set_reward_finish_timeout = set_reward_finish_timeout
-
-    def set_capacity(self, n: int) -> None:
-        with self._lock:
-            self._capacity = n
 
     def set_admin_key(self, key: str) -> None:
         with self._lock:
             self._admin_api_key = key
+
+    @staticmethod
+    def _export_replay_conflict(request_id: str) -> ExportReplayConflictError:
+        return ExportReplayConflictError(
+            f"request_id {request_id} was replayed with a different export request"
+        )
+
+    def get_export_replay(
+        self,
+        request_id: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        """Return a detached JSON snapshot for a completed export replay."""
+        with self._lock:
+            record = self._export_replays.get(request_id)
+            if record is None:
+                return None
+            stored_fingerprint, payload_json = record
+            if stored_fingerprint != request_fingerprint:
+                raise self._export_replay_conflict(request_id)
+            self._export_replays.move_to_end(request_id)
+        return json.loads(payload_json)
+
+    def record_export_replay(
+        self,
+        request_id: str,
+        request_fingerprint: str,
+        serialized_traj: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Cache a JSON-only export result and return a detached snapshot."""
+        payload_json = json.dumps(
+            serialized_traj,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            record = self._export_replays.get(request_id)
+            if record is not None:
+                stored_fingerprint, stored_payload_json = record
+                if stored_fingerprint != request_fingerprint:
+                    raise self._export_replay_conflict(request_id)
+                self._export_replays.move_to_end(request_id)
+                payload_json = stored_payload_json
+            else:
+                self._export_replays[request_id] = (
+                    request_fingerprint,
+                    payload_json,
+                )
+                while len(self._export_replays) > self._max_export_replay_records:
+                    self._export_replays.popitem(last=False)
+        return json.loads(payload_json)
 
     @property
     def admin_api_key(self) -> str:
@@ -410,6 +530,9 @@ class SessionStore:
         task_id: str,
         api_key: str | None = None,
         delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
+        lease_id: str | None = None,
+        expected_version: int | None = None,
+        group_id: str | None = None,
     ) -> tuple[str, str]:
         """Start a new session, returning (session_id, session_api_key).
 
@@ -417,10 +540,11 @@ class SessionStore:
         fresh opaque key is generated.
         """
         with self._lock:
+            session_prefix = f"{task_id}-{group_id}" if group_id else task_id
             idx = 0
-            while f"{task_id}-{idx}" in self._sessions:
+            while f"{session_prefix}-{idx}" in self._sessions:
                 idx += 1
-            session_id = f"{task_id}-{idx}"
+            session_id = f"{session_prefix}-{idx}"
 
             if api_key:
                 session_api_key = api_key
@@ -447,6 +571,9 @@ class SessionStore:
                 session_id=session_id,
                 set_reward_finish_timeout=self._set_reward_finish_timeout,
                 delivery_mode=delivery_mode,
+                lease_id=lease_id,
+                expected_version=expected_version,
+                group_id=group_id,
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key
@@ -468,6 +595,7 @@ class SessionStore:
                 session = SessionData(
                     session_id="__hitl__",
                     set_reward_finish_timeout=self._set_reward_finish_timeout,
+                    delivery_mode=TrajectoryDeliveryMode.PULL,
                 )
                 self._sessions["__hitl__"] = session
             return session

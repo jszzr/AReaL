@@ -12,6 +12,7 @@ from areal.v2.inference_service.data_proxy.app import create_app
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
 
 # =============================================================================
 # Fixtures
@@ -116,6 +117,7 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
 
     inf_bridge.pause = AsyncMock()
     inf_bridge.resume = AsyncMock()
+    inf_bridge.set_version = MagicMock()
 
     app.state.tokenizer = mock_tokenizer
     app.state.inf_bridge = inf_bridge
@@ -200,3 +202,59 @@ class TestVersionEndpoints:
         resp = await client.get("/get_version")
         assert resp.status_code == 200
         assert resp.json()["version"] == 3
+
+
+_VERSION_ENDPOINTS = [
+    pytest.param("POST", "/set_version", {"version": 99}, id="set-version"),
+    pytest.param("GET", "/get_version", None, id="get-version"),
+]
+
+
+class TestVersionEndpointWorkerIdentity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param({WORKER_ID_HEADER: "epoch-e1"}, id="stale"),
+        ],
+    )
+    @pytest.mark.parametrize(("method", "path", "payload"), _VERSION_ENDPOINTS)
+    async def test_configured_worker_rejects_unmatched_identity_before_state_access(
+        self, app_client, headers, method, path, payload
+    ):
+        client, app = app_client
+        app.state.config.worker_id = "epoch-e2"
+        app.state.version = 7
+        app.state.inf_bridge.set_version.reset_mock()
+
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.request(method, path, **request_kwargs)
+
+        assert response.status_code == 409
+        assert app.state.version == 7
+        app.state.inf_bridge.set_version.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured_worker_id", "headers"),
+        [
+            pytest.param(None, {}, id="legacy-unconfigured"),
+            pytest.param("epoch-e2", {WORKER_ID_HEADER: "epoch-e2"}, id="matching"),
+        ],
+    )
+    @pytest.mark.parametrize(("method", "path", "payload"), _VERSION_ENDPOINTS)
+    async def test_unconfigured_or_matching_identity_can_access_version(
+        self, app_client, configured_worker_id, headers, method, path, payload
+    ):
+        client, app = app_client
+        app.state.config.worker_id = configured_worker_id
+
+        request_kwargs = {"headers": headers}
+        if payload is not None:
+            request_kwargs["json"] = payload
+        response = await client.request(method, path, **request_kwargs)
+
+        assert response.status_code == 200

@@ -751,7 +751,7 @@ class TestDataProxyImagePassthrough:
         # 1. Start session
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "vision-lifecycle"},
+            json={"task_id": "vision-lifecycle", "delivery_mode": "pull"},
             headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         )
         assert resp.status_code == 201
@@ -791,6 +791,7 @@ class TestDataProxyImagePassthrough:
         resp = await client.post(
             "/export_trajectories",
             json={
+                "request_id": "vision-lifecycle-export",
                 "session_ids": [session_id],
                 "discount": 1.0,
                 "style": "individual",

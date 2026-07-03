@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from dataclasses import dataclass, field
 
 
@@ -22,6 +21,7 @@ class WorkerInfo:
     is_healthy: bool = True
     active_requests: int = 0
     registered_at: float = field(default_factory=time.time)
+    registered_from_worker_id: str | None = field(default=None, repr=False)
 
 
 class WorkerRegistry:
@@ -30,34 +30,84 @@ class WorkerRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, WorkerInfo] = {}  # worker_addr -> WorkerInfo
         self._id_to_addr: dict[str, str] = {}  # worker_id -> worker_addr
+        # The latest accepted incarnation survives unregister. Without this
+        # tombstone, a delayed first-registration request could resurrect a
+        # retired process at a reused address.
+        self._last_worker_ids: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
-    async def register(self, worker_addr: str) -> str:
-        """Add a worker. Returns existing worker_id if already registered."""
+    async def register(
+        self,
+        worker_addr: str,
+        worker_id: str,
+        expected_worker_id: str | None,
+    ) -> str:
+        """CAS a caller-generated incarnation into ``worker_addr``.
+
+        Returns ``created``, ``replayed``, or ``replaced``. Invalid or stale
+        transitions raise ``ValueError`` without changing registry state.
+        """
+
         async with self._lock:
-            if worker_addr in self._workers:
-                return self._workers[worker_addr].worker_id
-            worker_id = str(uuid.uuid4())
+            current = self._workers.get(worker_addr)
+            if current is not None:
+                if current.worker_id == worker_id:
+                    if current.registered_from_worker_id == expected_worker_id:
+                        return "replayed"
+                    raise ValueError(f"Registration replay mismatch for {worker_addr}")
+                if expected_worker_id != current.worker_id:
+                    raise ValueError(
+                        f"Worker epoch mismatch for {worker_addr}: "
+                        f"expected {current.worker_id}, got {expected_worker_id}"
+                    )
+                action = "replaced"
+            else:
+                if worker_addr not in self._last_worker_ids:
+                    if expected_worker_id is not None:
+                        raise ValueError(
+                            f"Worker {worker_addr} has no predecessor "
+                            f"{expected_worker_id}"
+                        )
+                    action = "created"
+                else:
+                    last_worker_id = self._last_worker_ids[worker_addr]
+                    if (
+                        expected_worker_id != last_worker_id
+                        or worker_id == last_worker_id
+                    ):
+                        raise ValueError(
+                            f"Worker epoch mismatch for retired {worker_addr}: "
+                            f"expected predecessor {last_worker_id}"
+                        )
+                    action = "replaced"
+
+            existing_addr = self._id_to_addr.get(worker_id)
+            if existing_addr is not None and existing_addr != worker_addr:
+                raise ValueError(
+                    f"Worker ID {worker_id} is already active at {existing_addr}"
+                )
+
+            if current is not None:
+                self._id_to_addr.pop(current.worker_id, None)
             self._workers[worker_addr] = WorkerInfo(
-                worker_id=worker_id, worker_addr=worker_addr
+                worker_id=worker_id,
+                worker_addr=worker_addr,
+                registered_from_worker_id=expected_worker_id,
             )
             self._id_to_addr[worker_id] = worker_addr
-            return worker_id
+            self._last_worker_ids[worker_addr] = worker_id
+            return action
 
-    async def deregister(self, worker_addr: str) -> None:
-        """Remove a worker by address. No-op if not found."""
-        async with self._lock:
-            w = self._workers.pop(worker_addr, None)
-            if w is not None:
-                self._id_to_addr.pop(w.worker_id, None)
+    async def unregister(self, worker_addr: str, worker_id: str) -> bool:
+        """Remove only the exact active incarnation, preserving its tombstone."""
 
-    async def deregister_by_id(self, worker_id: str) -> str | None:
-        """Remove a worker by ID. Returns the worker_addr or None if not found."""
         async with self._lock:
-            worker_addr = self._id_to_addr.pop(worker_id, None)
-            if worker_addr is not None:
-                self._workers.pop(worker_addr, None)
-            return worker_addr
+            current = self._workers.get(worker_addr)
+            if current is None or current.worker_id != worker_id:
+                return False
+            self._workers.pop(worker_addr)
+            self._id_to_addr.pop(worker_id, None)
+            return True
 
     async def get_by_id(self, worker_id: str) -> WorkerInfo | None:
         """Look up a worker by its ID."""
@@ -67,12 +117,21 @@ class WorkerRegistry:
                 return None
             return self._workers.get(addr)
 
-    async def update_health(self, worker_addr: str, healthy: bool) -> None:
-        """Set the health flag for a worker."""
+    async def get_by_addr(self, worker_addr: str) -> WorkerInfo | None:
+        async with self._lock:
+            return self._workers.get(worker_addr)
+
+    async def update_health(
+        self, worker_addr: str, expected_worker_id: str, healthy: bool
+    ) -> bool:
+        """Set health only if the probe belongs to the active incarnation."""
+
         async with self._lock:
             w = self._workers.get(worker_addr)
-            if w:
-                w.is_healthy = healthy
+            if w is None or w.worker_id != expected_worker_id:
+                return False
+            w.is_healthy = healthy
+            return True
 
     async def get_healthy_workers(self) -> list[WorkerInfo]:
         """Return only workers with ``is_healthy == True``."""
@@ -89,6 +148,18 @@ class WorkerRegistry:
         async with self._lock:
             return list(self._workers.keys())
 
+    async def contains(self, worker_addr: str) -> bool:
+        async with self._lock:
+            return worker_addr in self._workers
+
+
+@dataclass(frozen=True)
+class SessionRoute:
+    """Immutable worker epoch captured when a session was registered."""
+
+    worker_addr: str
+    worker_id: str
+
 
 class SessionRegistry:
     """Maps session API keys and session IDs to worker addresses.
@@ -100,18 +171,87 @@ class SessionRegistry:
 
     def __init__(self) -> None:
         self._key_to_worker: dict[str, str] = {}  # session_api_key -> worker_addr
+        self._key_to_worker_id: dict[str, str] = {}
+        self._key_to_id: dict[str, str] = {}  # session_api_key -> session_id
         self._id_to_worker: dict[str, str] = {}  # session_id -> worker_addr
+        self._id_to_worker_id: dict[str, str] = {}
         self._id_to_key: dict[str, str] = {}  # session_id -> session_api_key
         self._lock = asyncio.Lock()
 
     async def register_session(
-        self, session_key: str, session_id: str, worker_addr: str
+        self,
+        session_key: str,
+        session_id: str,
+        worker_addr: str,
+        worker_id: str,
     ) -> None:
-        """Store both session_key→worker and session_id→worker. Upsert semantics."""
+        """Register one globally unique session mapping idempotently."""
+        await self.register_sessions(
+            [(session_key, session_id)], worker_addr, worker_id=worker_id
+        )
+
+    async def register_sessions(
+        self,
+        sessions: list[tuple[str, str]],
+        worker_addr: str,
+        worker_id: str,
+    ) -> None:
+        """Atomically register a batch, rejecting key or ID ownership changes."""
+
         async with self._lock:
-            self._key_to_worker[session_key] = worker_addr
-            self._id_to_worker[session_id] = worker_addr
-            self._id_to_key[session_id] = session_key
+            batch_ids: dict[str, str] = {}
+            batch_keys: dict[str, str] = {}
+            keys_to_refresh: dict[str, str] = {}
+            for session_key, session_id in sessions:
+                if session_id in batch_ids and batch_ids[session_id] != session_key:
+                    raise ValueError(f"Session ID {session_id} is duplicated in batch")
+                if session_key in batch_keys and batch_keys[session_key] != session_id:
+                    raise ValueError(
+                        f"Session key for {session_id} is duplicated in batch"
+                    )
+                batch_ids[session_id] = session_key
+                batch_keys[session_key] = session_id
+
+                existing_id_worker = self._id_to_worker.get(session_id)
+                existing_id_worker_id = self._id_to_worker_id.get(session_id)
+                existing_id_key = self._id_to_key.get(session_id)
+                if existing_id_worker is not None and (
+                    existing_id_worker != worker_addr
+                    or existing_id_key != session_key
+                    or existing_id_worker_id != worker_id
+                ):
+                    raise ValueError(
+                        f"Session ID {session_id} is already registered to another owner"
+                    )
+
+                existing_key_worker = self._key_to_worker.get(session_key)
+                existing_key_worker_id = self._key_to_worker_id.get(session_key)
+                existing_key_id = self._key_to_id.get(session_key)
+                if existing_key_worker is not None:
+                    if (
+                        existing_key_worker != worker_addr
+                        or existing_key_worker_id != worker_id
+                    ):
+                        raise ValueError(
+                            f"Session key for {session_id} is already registered "
+                            "to another owner"
+                        )
+                    if existing_key_id is not None and existing_key_id != session_id:
+                        keys_to_refresh[session_key] = existing_key_id
+
+            for session_key, old_session_id in keys_to_refresh.items():
+                # Keep the old ID routable so its ready trajectory can still
+                # be exported. Detach only the refreshed key; revoking the old
+                # group must not invalidate the new session's credentials.
+                self._id_to_key.pop(old_session_id, None)
+
+            for session_key, session_id in sessions:
+                self._key_to_worker[session_key] = worker_addr
+                self._key_to_worker_id[session_key] = worker_id
+                self._key_to_id[session_key] = session_id
+                self._id_to_worker[session_id] = worker_addr
+                self._id_to_worker_id[session_id] = worker_id
+                self._id_to_key[session_id] = session_key
 
     async def lookup_by_key(self, session_key: str) -> str | None:
         """Return the worker address pinned to a session API key, or None."""
@@ -123,22 +263,53 @@ class SessionRegistry:
         async with self._lock:
             return self._id_to_worker.get(session_id)
 
-    async def revoke_by_worker(self, worker_addr: str) -> int:
-        """Remove all sessions pinned to a worker (cascade on deletion).
+    async def route_by_key(self, session_key: str) -> SessionRoute | None:
+        """Return the address and the exact worker epoch stored for a key."""
+
+        async with self._lock:
+            worker_addr = self._key_to_worker.get(session_key)
+            if worker_addr is None:
+                return None
+            return SessionRoute(
+                worker_addr=worker_addr,
+                worker_id=self._key_to_worker_id[session_key],
+            )
+
+    async def route_by_id(self, session_id: str) -> SessionRoute | None:
+        """Return the address and the exact worker epoch stored for an ID."""
+
+        async with self._lock:
+            worker_addr = self._id_to_worker.get(session_id)
+            if worker_addr is None:
+                return None
+            return SessionRoute(
+                worker_addr=worker_addr,
+                worker_id=self._id_to_worker_id[session_id],
+            )
+
+    async def revoke_by_worker(self, worker_addr: str, worker_id: str) -> int:
+        """Remove all sessions pinned to an exact worker incarnation.
 
         Returns the number of session keys removed.
         """
         async with self._lock:
             keys_to_remove = [
-                k for k, v in self._key_to_worker.items() if v == worker_addr
+                k
+                for k, owner_id in self._key_to_worker_id.items()
+                if owner_id == worker_id and self._key_to_worker.get(k) == worker_addr
             ]
             ids_to_remove = [
-                k for k, v in self._id_to_worker.items() if v == worker_addr
+                k
+                for k, owner_id in self._id_to_worker_id.items()
+                if owner_id == worker_id and self._id_to_worker.get(k) == worker_addr
             ]
             for k in keys_to_remove:
                 del self._key_to_worker[k]
+                self._key_to_worker_id.pop(k, None)
+                self._key_to_id.pop(k, None)
             for k in ids_to_remove:
                 self._id_to_key.pop(k, None)
+                self._id_to_worker_id.pop(k, None)
                 del self._id_to_worker[k]
             return len(keys_to_remove)
 
@@ -154,9 +325,12 @@ class SessionRegistry:
             if session_id not in self._id_to_worker:
                 return False
             del self._id_to_worker[session_id]
+            self._id_to_worker_id.pop(session_id, None)
             session_key = self._id_to_key.pop(session_id, None)
             if session_key is not None:
                 self._key_to_worker.pop(session_key, None)
+                self._key_to_worker_id.pop(session_key, None)
+                self._key_to_id.pop(session_key, None)
             return True
 
     async def session_key_for_id(self, session_id: str) -> str | None:
@@ -185,7 +359,9 @@ class GroupInfo:
 
     group_id: str
     worker_addr: str
+    worker_id: str
     session_ids: list[str] = field(default_factory=list)
+    session_api_keys: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
 
@@ -238,17 +414,36 @@ class GroupRegistry:
         self._lock = asyncio.Lock()
 
     async def register_group(
-        self, group_id: str, worker_addr: str, session_ids: list[str]
-    ) -> None:
-        """Store a group mapping. Raises ValueError if group_id already exists."""
+        self,
+        group_id: str,
+        worker_addr: str,
+        session_ids: list[str],
+        worker_id: str,
+        session_api_keys: list[str] | None = None,
+    ) -> bool:
+        """Store a group mapping with idempotent retry semantics."""
+        resolved_api_keys = list(session_api_keys or [])
         async with self._lock:
-            if group_id in self._groups:
-                raise ValueError(f"Group {group_id} already registered")
+            existing = self._groups.get(group_id)
+            if existing is not None:
+                if (
+                    existing.worker_addr == worker_addr
+                    and existing.worker_id == worker_id
+                    and existing.session_ids == list(session_ids)
+                    and existing.session_api_keys == resolved_api_keys
+                ):
+                    return False
+                raise ValueError(
+                    f"Group {group_id} already registered with different sessions"
+                )
             self._groups[group_id] = GroupInfo(
                 group_id=group_id,
                 worker_addr=worker_addr,
+                worker_id=worker_id,
                 session_ids=list(session_ids),
+                session_api_keys=resolved_api_keys,
             )
+            return True
 
     async def lookup(self, group_id: str) -> GroupInfo | None:
         """Return the GroupInfo for a group_id, or None."""
@@ -262,3 +457,16 @@ class GroupRegistry:
             if info is None:
                 return []
             return info.session_ids
+
+    async def revoke_by_worker(self, worker_addr: str, worker_id: str) -> int:
+        """Remove groups owned by an exact incarnation and return their count."""
+
+        async with self._lock:
+            group_ids = [
+                group_id
+                for group_id, info in self._groups.items()
+                if info.worker_addr == worker_addr and info.worker_id == worker_id
+            ]
+            for group_id in group_ids:
+                self._groups.pop(group_id, None)
+            return len(group_ids)

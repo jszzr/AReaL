@@ -142,6 +142,7 @@ class ModelReplica:
 
     data_proxy: TaskHandle
     worker: TaskHandle
+    router_worker_id: str | None = None
 
 
 @dataclass
@@ -164,6 +165,7 @@ class ModelEntry:
             ModelReplica(
                 data_proxy=_handle_from_dict(r["data_proxy"]),
                 worker=_handle_from_dict(r["worker"]),
+                router_worker_id=r.get("router_worker_id"),
             )
             for r in raw.get("replicas", [])
         ]

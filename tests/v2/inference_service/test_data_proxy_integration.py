@@ -233,7 +233,7 @@ class TestChatCompletionsIntegration:
             # --- start session ---
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "integ-chat-ns"},
+                json={"task_id": "integ-chat-ns", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -305,7 +305,7 @@ class TestChatCompletionsIntegration:
             # --- start session ---
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "integ-chat-stream"},
+                json={"task_id": "integ-chat-stream", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -382,7 +382,7 @@ class TestChatCompletionsIntegration:
             # --- start session ---
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "integ-chat-multi"},
+                json={"task_id": "integ-chat-multi", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -457,7 +457,7 @@ class TestChatCompletionsIntegration:
             # --- start session ---
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "integ-chat-reward"},
+                json={"task_id": "integ-chat-reward", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -497,12 +497,15 @@ class TestChatCompletionsIntegration:
             # --- export trajectories ---
             resp = await client.post(
                 "/export_trajectories",
-                json={"session_ids": [session_id]},
+                json={
+                    "request_id": "sglang-lifecycle-export",
+                    "session_ids": [session_id],
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
             assert resp.status_code == 200, resp.text
-            export_data = resp.json()
+            export_data = resp.json()["traj"]
             assert "interactions" in export_data
             interactions = export_data["interactions"]
             assert len(interactions) == 1
@@ -624,7 +627,7 @@ class TestPauseResumeIntegration:
             # Start a session first
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "pause-chat-test"},
+                json={"task_id": "pause-chat-test", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -680,7 +683,7 @@ class TestPauseResumeIntegration:
             # Start session
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "pause-chat-cycle"},
+                json={"task_id": "pause-chat-cycle", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -727,7 +730,7 @@ class TestPauseResumeIntegration:
             # Start session
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "pause-stream-test"},
+                json={"task_id": "pause-stream-test", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -820,7 +823,7 @@ class TestConcurrentPauseDuringGeneration:
             # Start session
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "concurrent-pause-chat"},
+                json={"task_id": "concurrent-pause-chat", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -891,7 +894,10 @@ class TestConcurrentPauseDuringGeneration:
             # Start session
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "concurrent-pause-stream"},
+                json={
+                    "task_id": "concurrent-pause-stream",
+                    "delivery_mode": "pull",
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -979,7 +985,7 @@ class TestChatCompletionsVLLM:
         ) as client:
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "vllm-ns"},
+                json={"task_id": "vllm-ns", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
@@ -1023,12 +1029,15 @@ class TestChatCompletionsVLLM:
 
             resp = await client.post(
                 "/export_trajectories",
-                json={"session_ids": [session_id]},
+                json={
+                    "request_id": "vllm-lifecycle-export",
+                    "session_ids": [session_id],
+                },
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )
             assert resp.status_code == 200, resp.text
-            interactions = resp.json()["interactions"]
+            interactions = resp.json()["traj"]["interactions"]
             assert len(interactions) == 1
             for _key, item in interactions.items():
                 assert item["reward"] == 1.0
@@ -1044,7 +1053,7 @@ class TestChatCompletionsVLLM:
         ) as client:
             resp = await client.post(
                 "/rl/start_session",
-                json={"task_id": "vllm-stream"},
+                json={"task_id": "vllm-stream", "delivery_mode": "pull"},
                 headers={"Authorization": f"Bearer {ADMIN_KEY}"},
                 timeout=10.0,
             )

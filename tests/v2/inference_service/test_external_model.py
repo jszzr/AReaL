@@ -18,6 +18,7 @@ from areal.v2.inference_service.gateway.app import (
 )
 from areal.v2.inference_service.gateway.config import GatewayConfig
 from areal.v2.inference_service.gateway.streaming import (
+    RouterDestination,
     RouterKeyRejectedError,
 )
 from areal.v2.inference_service.router.app import (
@@ -29,6 +30,7 @@ from areal.v2.inference_service.router.state import ModelRegistry
 ADMIN_KEY = "test-admin-key"
 SESSION_KEY = "session-key-abc123"
 WORKER_ADDR = "http://worker-1:18082"
+WORKER_ID = "worker-1-epoch-1"
 ROUTER_MODULE = "areal.v2.inference_service.gateway.app"
 
 
@@ -84,7 +86,11 @@ class TestRouterExternalEndpoints:
     async def test_register_model_success(self, router_client):
         await router_client.post(
             "/register",
-            json={"worker_addr": WORKER_ADDR},
+            json={
+                "worker_addr": WORKER_ADDR,
+                "worker_id": WORKER_ID,
+                "expected_worker_id": None,
+            },
             headers=admin_headers(),
         )
 
@@ -124,7 +130,11 @@ class TestRouterExternalEndpoints:
     async def test_route_model_success(self, router_client):
         await router_client.post(
             "/register",
-            json={"worker_addr": WORKER_ADDR},
+            json={
+                "worker_addr": WORKER_ADDR,
+                "worker_id": WORKER_ID,
+                "expected_worker_id": None,
+            },
             headers=admin_headers(),
         )
         await router_client.post(
@@ -166,7 +176,11 @@ class TestRouterExternalEndpoints:
     async def test_list_models_after_registration(self, router_client):
         await router_client.post(
             "/register",
-            json={"worker_addr": WORKER_ADDR},
+            json={
+                "worker_addr": WORKER_ADDR,
+                "worker_id": WORKER_ID,
+                "expected_worker_id": None,
+            },
             headers=admin_headers(),
         )
         await router_client.post(
@@ -343,7 +357,7 @@ class TestGatewayExternalEndpoints:
         mock_forward,
         gateway_client,
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
         mock_forward.return_value = httpx.Response(
             200,
             json={
@@ -355,7 +369,7 @@ class TestGatewayExternalEndpoints:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_ids": ["ext-1"]},
+            json={"request_id": "gateway-external-export", "session_ids": ["ext-1"]},
             headers=admin_headers(),
         )
         assert resp.status_code == 200
@@ -488,7 +502,11 @@ class TestDataProxyExternalEndpoints:
 
         not_ready = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_ids": ["__hitl__"], "remove_session": False},
+            json={
+                "request_id": "external-not-ready-export",
+                "session_ids": ["__hitl__"],
+                "remove_session": False,
+            },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert not_ready.status_code == 200
@@ -504,7 +522,10 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_ids": ["__hitl__"]},
+            json={
+                "request_id": "external-ready-export",
+                "session_ids": ["__hitl__"],
+            },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
@@ -581,7 +602,10 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_ids": ["__hitl__"]},
+            json={
+                "request_id": "external-stream-export",
+                "session_ids": ["__hitl__"],
+            },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
@@ -590,7 +614,10 @@ class TestDataProxyExternalEndpoints:
 
         exported_again = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_ids": ["__hitl__"]},
+            json={
+                "request_id": "external-stream-export-again",
+                "session_ids": ["__hitl__"],
+            },
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported_again.status_code == 200
@@ -655,7 +682,11 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
     ) as router_client:
         await router_client.post(
             "/register",
-            json={"worker_addr": WORKER_ADDR},
+            json={
+                "worker_addr": WORKER_ADDR,
+                "worker_id": WORKER_ID,
+                "expected_worker_id": None,
+            },
             headers=admin_headers(),
         )
 
@@ -706,12 +737,16 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
             session_id: str | None = None,
             admin_api_key: str | None = None,
             model: str | None = None,
+            new_session: bool = False,
+            return_destination: bool = False,
             client: httpx.AsyncClient | None = None,
-        ) -> str:
+        ) -> str | RouterDestination:
             del router_addr, path, timeout, admin_api_key, client
             payload: dict[str, str] = {}
             if model is not None:
                 payload["model"] = model
+            if new_session:
+                payload["new_session"] = True
             if api_key is not None:
                 payload["api_key"] = api_key
             if session_id is not None:
@@ -726,10 +761,12 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
                     raise RouterKeyRejectedError("not found", 404)
                 if resp.status_code == 503:
                     raise RouterKeyRejectedError("no healthy workers", 503)
-                resp.raise_for_status()
-                return resp.json()["worker_addr"]
             resp.raise_for_status()
-            return resp.json()["worker_addr"]
+            data = resp.json()
+            destination = RouterDestination(
+                worker_addr=data["worker_addr"], worker_id=data["worker_id"]
+            )
+            return destination if return_destination else destination.worker_addr
 
         async def _forward_request(
             upstream_url: str,

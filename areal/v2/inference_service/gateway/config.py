@@ -21,4 +21,6 @@ class GatewayConfig:
     router_addr: str = "http://localhost:8081"
     router_timeout: float = 2.0  # seconds for /route call
     forward_timeout: float = 120.0  # seconds for forwarding to data proxy
+    max_pending_request_owners: int = 4096
+    max_pending_export_cleanups: int = 4096
     log_level: str = "warning"

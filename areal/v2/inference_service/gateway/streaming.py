@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -15,6 +16,12 @@ from areal.infra.utils.http import async_httpx_retry, create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceGateway")
+
+
+@dataclass(frozen=True)
+class RouterDestination:
+    worker_addr: str
+    worker_id: str
 
 
 class RouterUnreachableError(Exception):
@@ -30,6 +37,15 @@ class RouterKeyRejectedError(Exception):
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
+
+
+class RouterSessionRegistrationError(Exception):
+    """Router rejected a session registration with a semantic HTTP error."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
 
 
 @asynccontextmanager
@@ -54,8 +70,10 @@ async def query_router(
     session_id: str | None = None,
     admin_api_key: str | None = None,
     model: str | None = None,
+    new_session: bool = False,
+    return_destination: bool = False,
     client: httpx.AsyncClient | None = None,
-) -> str:
+) -> str | RouterDestination:
     """Ask the Router for a worker address.
 
     POST ``{router_addr}/route`` with ``{"api_key": ..., "path": ...}``
@@ -82,9 +100,11 @@ async def query_router(
     RouterKeyRejectedError
         Router returned 404 (unknown key / session) or 503 (no healthy workers).
     """
-    payload: dict[str, str] = {}
+    payload: dict[str, Any] = {}
     if model is not None:
         payload["model"] = model
+    if new_session:
+        payload["new_session"] = True
     if session_id is not None:
         payload["session_id"] = session_id
     else:
@@ -113,7 +133,17 @@ async def query_router(
                 data.get("detail", data.get("error", "No healthy workers")), 503
             )
         resp.raise_for_status()
-        return resp.json()["worker_addr"]
+        response_data = resp.json()
+        worker_id = response_data.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise RouterUnreachableError(
+                "Router returned HTTP 200 without a non-empty worker_id"
+            )
+        destination = RouterDestination(
+            worker_addr=response_data["worker_addr"],
+            worker_id=worker_id,
+        )
+        return destination if return_destination else destination.worker_addr
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
     except httpx.TimeoutException as exc:
@@ -135,6 +165,7 @@ async def register_session_in_router(
     admin_api_key: str | None = None,
     *,
     group_id: str,
+    worker_id: str,
     client: httpx.AsyncClient | None = None,
 ) -> None:
     """Register session(s) and their group in the Router atomically."""
@@ -146,6 +177,7 @@ async def register_session_in_router(
         payload: dict[str, Any] = {
             "sessions": sessions,
             "worker_addr": worker_addr,
+            "worker_id": worker_id,
             "group_id": group_id,
         }
 
@@ -157,13 +189,54 @@ async def register_session_in_router(
                 timeout=timeout,
             )
 
+        if resp.status_code == 409:
+            try:
+                data = resp.json()
+                detail = data.get("detail", data.get("error", resp.text))
+            except ValueError:
+                detail = resp.text
+            raise RouterSessionRegistrationError(
+                status_code=resp.status_code,
+                detail=detail or "Router rejected session registration",
+            )
         resp.raise_for_status()
+    except RouterSessionRegistrationError:
+        raise
     except httpx.TransportError as exc:
         logger.error("Failed to register session in router: %s", exc)
         raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
     except Exception as exc:
         logger.error("Failed to register session in router: %s", exc)
         raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
+
+
+@async_httpx_retry
+async def notify_online_lease_failure(
+    callback_url: str,
+    admin_api_key: str,
+    lease_id: str,
+    expected_version: int,
+    reason: str,
+    timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """Reliably fail the controller waiter that owns an acquired lease."""
+
+    if not callback_url:
+        raise ValueError(f"Online lease {lease_id} has no callback URL")
+    async with _use_client(client, timeout) as c:
+        response = await c.post(
+            f"{callback_url.rstrip('/')}/callback/online_failed",
+            json={
+                "lease_id": lease_id,
+                "expected_version": expected_version,
+                "reason": reason,
+            },
+            headers={"Authorization": f"Bearer {admin_api_key}"},
+            timeout=timeout,
+        )
+    response.raise_for_status()
 
 
 async def revoke_session_in_router(
@@ -173,7 +246,7 @@ async def revoke_session_in_router(
     timeout: float = 2.0,
     *,
     client: httpx.AsyncClient | None = None,
-) -> None:
+) -> bool:
     """Best-effort removal of a session group from the Router's registry."""
     try:
         async with _use_client(client, timeout) as c:
@@ -187,8 +260,11 @@ async def revoke_session_in_router(
             logger.warning(
                 "remove_session returned %d: %s", resp.status_code, resp.text
             )
+            return False
+        return True
     except Exception as exc:
         logger.warning("Failed to remove group %s in router: %s", group_id, exc)
+        return False
 
 
 @async_httpx_retry

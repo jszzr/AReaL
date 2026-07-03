@@ -232,7 +232,7 @@ class TestSessionKeyUnchanged:
         # Start a session first
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "test-task"},
+            json={"task_id": "test-task", "delivery_mode": "pull"},
             headers=admin_headers(),
         )
         assert resp.status_code == 201

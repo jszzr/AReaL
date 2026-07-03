@@ -21,6 +21,7 @@ from areal.v2.inference_service.data_proxy.session import SessionStore
 from areal.v2.inference_service.gateway.app import create_app as create_gw_app
 from areal.v2.inference_service.gateway.config import GatewayConfig
 from areal.v2.inference_service.gateway.streaming import (
+    RouterDestination,
     RouterKeyRejectedError,
     RouterUnreachableError,
 )
@@ -31,6 +32,7 @@ from areal.v2.inference_service.router.config import RouterConfig
 
 ADMIN_KEY = "areal-admin-key"
 DATA_PROXY_ADDR = "http://data-proxy"
+DATA_PROXY_WORKER_ID = "data-proxy-epoch-1"
 ROUTER_ADDR = "http://router"
 
 
@@ -162,7 +164,11 @@ async def online_stack(monkeypatch):
     ):
         reg_resp = await router_client.post(
             "/register",
-            json={"worker_addr": DATA_PROXY_ADDR},
+            json={
+                "worker_addr": DATA_PROXY_ADDR,
+                "worker_id": DATA_PROXY_WORKER_ID,
+                "expected_worker_id": None,
+            },
             headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         )
         assert reg_resp.status_code == 200
@@ -176,12 +182,16 @@ async def online_stack(monkeypatch):
             session_id: str | None = None,
             admin_api_key: str | None = None,
             model: str | None = None,
+            new_session: bool = False,
+            return_destination: bool = False,
             client: httpx.AsyncClient | None = None,
-        ) -> str:
+        ) -> str | RouterDestination:
             del router_addr, timeout, client
             payload: dict[str, str] = {}
             if model is not None:
                 payload["model"] = model
+            if new_session:
+                payload["new_session"] = True
             if session_id is not None:
                 payload["session_id"] = session_id
             else:
@@ -198,7 +208,11 @@ async def online_stack(monkeypatch):
                 raise RouterKeyRejectedError(detail, resp.status_code)
             if resp.status_code >= 400:
                 raise RouterUnreachableError(resp.text)
-            return resp.json()["worker_addr"]
+            data = resp.json()
+            destination = RouterDestination(
+                worker_addr=data["worker_addr"], worker_id=data["worker_id"]
+            )
+            return destination if return_destination else destination.worker_addr
 
         async def _forward_request(
             url: str,
@@ -228,12 +242,41 @@ async def online_stack(monkeypatch):
             )
             assert resp.status_code == 200
 
+        async def _register_session_in_router(
+            router_addr: str,
+            sessions: list[dict[str, str]],
+            worker_addr: str,
+            timeout: float,
+            admin_api_key: str | None = None,
+            *,
+            group_id: str,
+            worker_id: str,
+            client: httpx.AsyncClient | None = None,
+        ) -> None:
+            del router_addr, timeout, client
+            resp = await router_client.post(
+                "/register_session",
+                json={
+                    "sessions": sessions,
+                    "worker_addr": worker_addr,
+                    "worker_id": worker_id,
+                    "group_id": group_id,
+                },
+                headers={"Authorization": f"Bearer {admin_api_key}"},
+            )
+            resp.raise_for_status()
+
         monkeypatch.setattr(gateway_app_module, "query_router", _query_router)
         monkeypatch.setattr(gateway_app_module, "forward_request", _forward_request)
         monkeypatch.setattr(
             gateway_app_module,
             "revoke_session_in_router",
             _revoke_session_in_router,
+        )
+        monkeypatch.setattr(
+            gateway_app_module,
+            "register_session_in_router",
+            _register_session_in_router,
         )
 
         yield {
@@ -283,11 +326,16 @@ async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stac
 
     export_resp = await gw.post(
         "/export_trajectories",
-        json={"session_ids": ["__hitl__"], "discount": 1.0, "style": "individual"},
+        json={
+            "request_id": "latest-ready-export",
+            "session_ids": ["__hitl__"],
+            "discount": 1.0,
+            "style": "individual",
+        },
         headers=_admin_headers(),
     )
     assert export_resp.status_code == 200
-    assert list(export_resp.json()["interactions"]) == ["chatcmpl-test1"]
+    assert list(export_resp.json()["traj"]["interactions"]) == ["chatcmpl-test1"]
 
     session_registry = router_app.state.session_registry
     assert await session_registry.lookup_by_id("__hitl__") == DATA_PROXY_ADDR
@@ -327,6 +375,7 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
     explicit_resp = await gw.post(
         "/export_trajectories",
         json={
+            "request_id": "explicit-trajectory-export",
             "session_ids": ["__hitl__"],
             "trajectory_id": 0,
             "discount": 1.0,
@@ -336,11 +385,12 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
         headers=_admin_headers(),
     )
     assert explicit_resp.status_code == 200
-    assert list(explicit_resp.json()["interactions"]) == ["chatcmpl-test0"]
+    assert list(explicit_resp.json()["traj"]["interactions"]) == ["chatcmpl-test0"]
 
     latest_resp = await gw.post(
         "/export_trajectories",
         json={
+            "request_id": "latest-trajectory-export",
             "session_ids": ["__hitl__"],
             "discount": 1.0,
             "style": "individual",
@@ -349,11 +399,11 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
         headers=_admin_headers(),
     )
     assert latest_resp.status_code == 200
-    assert list(latest_resp.json()["interactions"]) == ["chatcmpl-test1"]
+    assert list(latest_resp.json()["traj"]["interactions"]) == ["chatcmpl-test1"]
 
 
 @pytest.mark.asyncio
-async def test_online_stack_reward_creates_pending_ready_event_without_callback(
+async def test_online_stack_unleased_hitl_reward_stays_pull_only(
     online_stack,
 ):
     gw = online_stack["gateway_client"]
@@ -372,6 +422,52 @@ async def test_online_stack_reward_creates_pending_ready_event_without_callback(
     assert resp.status_code == 200
 
     notifications = data_proxy_app.state.session_store.pending_online_callbacks()
-    assert len(notifications) == 1
-    assert notifications[0].session_id == "__hitl__"
-    assert notifications[0].trajectory_id == 0
+    assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_online_stack_callback_session_requires_and_carries_lease(online_stack):
+    gw = online_stack["gateway_client"]
+    data_proxy_app = online_stack["data_proxy_app"]
+    router_app = online_stack["router_app"]
+
+    rejected = await gw.post(
+        "/rl/start_session",
+        json={
+            "task_id": "task-1",
+            "delivery_mode": "callback",
+            "request_id": "request-rejected",
+        },
+        headers=_admin_headers(),
+    )
+    assert rejected.status_code == 429
+    assert data_proxy_app.state.session_store.session_count == 0
+
+    grant = await gw.post(
+        "/internal/online_leases",
+        json={"lease_id": "lease-1", "expected_version": 0},
+        headers=_admin_headers(),
+    )
+    assert grant.status_code == 201
+    started = await gw.post(
+        "/rl/start_session",
+        json={
+            "task_id": "task-1",
+            "delivery_mode": "callback",
+            "request_id": "request-admitted",
+        },
+        headers=_admin_headers(),
+    )
+    assert started.status_code == 201
+    session_id = started.json()["sessions"][0]["session_id"]
+    session = data_proxy_app.state.session_store.get_session(session_id)
+    assert session is not None
+    assert session.lease_id == "lease-1"
+    assert session.expected_version == 0
+
+    session_route = await router_app.state.session_registry.route_by_id(session_id)
+    group = await router_app.state.group_registry.lookup(started.json()["group_id"])
+    assert session_route is not None
+    assert group is not None
+    assert session_route.worker_id == DATA_PROXY_WORKER_ID
+    assert group.worker_id == DATA_PROXY_WORKER_ID

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict
 
 from click.testing import CliRunner
 
 from areal.v2.cli.inference.scheduler import TaskHandle
 from areal.v2.cli.inference.state import (
     ModelEntry,
+    ModelReplica,
     ModelState,
     ServiceState,
     store,
@@ -49,6 +51,18 @@ def _placeholder_model() -> ModelEntry:
     return ModelEntry(backend="sglang:d1", replicas=[])
 
 
+def _replica(*, router_worker_id: str | None) -> ModelReplica:
+    return ModelReplica(
+        data_proxy=TaskHandle(
+            host="127.0.0.1", ports=[5001], gpu_devices=[], ref={"pid": 300}
+        ),
+        worker=TaskHandle(
+            host="127.0.0.1", ports=[5000], gpu_devices=[0], ref={"pid": 200}
+        ),
+        router_worker_id=router_worker_id,
+    )
+
+
 def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     _save_service("svc-a")
@@ -65,6 +79,44 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     assert loaded_service.service == "svc-a"
     assert loaded_service.backend == "local"
     assert list(loaded_models.models) == ["m-a"]
+
+
+def test_model_state_round_trips_router_worker_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    model_state = ModelState(
+        service="svc",
+        models={
+            "m": ModelEntry(
+                backend="sglang:d1",
+                replicas=[_replica(router_worker_id="proxy-incarnation-1")],
+            )
+        },
+    )
+
+    model_state.save()
+
+    loaded = ModelState.load("svc")
+    assert loaded.models["m"].replicas[0].router_worker_id == "proxy-incarnation-1"
+
+
+def test_model_state_loads_legacy_replica_without_router_worker_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    raw_replica = asdict(_replica(router_worker_id=None))
+    raw_replica.pop("router_worker_id")
+    store.models_state_path("svc").write_text(
+        json.dumps(
+            {
+                "service": "svc",
+                "models": {"m": {"backend": "sglang:d1", "replicas": [raw_replica]}},
+            }
+        )
+    )
+
+    loaded = ModelState.load("svc")
+
+    assert loaded.models["m"].replicas[0].router_worker_id is None
 
 
 def test_resolve_service_uses_current_then_single_running(tmp_path, monkeypatch):

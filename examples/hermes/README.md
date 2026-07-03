@@ -45,7 +45,7 @@ strict permission rules and an isolated execution environment for your agent run
 ┌──────────────────────────────────────┐   LLM calls (self-evolution)   ┌────────────────────────┐
 │  Agent Service                        │ ─────────────────────────────▶ │  AReaL inference gateway│
 │  (areal agent run)                    │   inf_base_url = http://<gw>   │  (started by train.py) │
-│  Gateway/Router/DataProxy/Worker      │   session key  = sk-sess-*     │                        │
+│  Gateway/Router/DataProxy/Worker      │   opaque session key           │                        │
 │  + in-process Hermes AIAgent          │ ◀───────────────────────────── │  records tokens +      │
 └──────────────────────────────────────┘   model output                 │  logprobs → RL         │
         ▲                                                                └────────────────────────┘
@@ -53,8 +53,9 @@ strict permission rules and an isolated execution environment for your agent run
         │ (the interactive "You:" prompt)                       set_reward.py (score the trajectory)
 ```
 
-One **episode** = the turns collected under a single per-session `sk-sess-*` key (minted
-by `start_session.py`). You score it with `set_reward.py`, then start the next episode.
+One **episode** = the turns collected under one opaque per-session key minted by
+`start_session.py`. You score it with `set_reward.py`, then start the next episode with
+a newly created session.
 
 ## Prerequisites
 
@@ -149,16 +150,17 @@ Note the printed `<agent-gateway>` address.
 
 ### Step 3 — Start a session on the inference gateway
 
-Copy the printed `sk-sess-*` key — forward it to the agent (Step 4) and score the
-episode with it (Step 5). To reuse the key for the next episode (auto-ends and exports
-the previous one):
+Copy the printed opaque session key — forward it to the agent (Step 4) and score the
+episode with it (Step 5). Each invocation creates a new callback episode and key. The
+script prints its `request_id`; if a start response is lost, retry that same logical
+creation with the same `--request-id` rather than starting a second episode:
 
 ```bash
 python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
 ```
 
 These are **your own upstream LLM credentials** (the agent's fallback chat backend),
-**not** the `sk-sess-*` key returned above — fill in your provider's values:
+**not** the opaque session key returned above — fill in your provider's values:
 
 ```bash
 export HERMES_UPSTREAM_BASE_URL="https://your-llm/v1"
@@ -170,7 +172,7 @@ export HERMES_UPSTREAM_MODEL="your-model"
 
 Forward the inference-routing flags so the agent's LLM calls flow through the inference
 gateway under your session key and get captured. You **must** actually interact, or the
-episode has no data. `<your session-api-key>` is the `sk-sess-*` key returned by
+episode has no data. `<your session-api-key>` is the opaque key returned by
 `start_session.py` in Step 3.
 
 ```bash
@@ -182,7 +184,7 @@ python examples/hermes/hermes_loop.py http://<agent-gateway> \
 
 ### Step 5 — Score the episode
 
-Use the same `sk-sess-*` key from Step 3 as `--api-key`:
+Use the same opaque session key from Step 3 as `--api-key`:
 
 ```bash
 python examples/hermes/set_reward.py http://<inf-gateway> \
@@ -197,7 +199,7 @@ Keep the reward in **\[-1, 1\]** for training stability.
 | ------------------ | ---------------------------------------------------------------- |
 | `hermes.py`        | `HermesAgent` — in-process per-session Hermes `AIAgent` runnable |
 | `hermes_loop.py`   | Standalone interactive `You:` prompt against the agent gateway   |
-| `start_session.py` | Mint a per-session `sk-sess-*` key on the inference gateway      |
+| `start_session.py` | Mint an opaque per-session key on the inference gateway          |
 | `set_reward.py`    | Assign a scalar reward to a session's trajectory                 |
 | `train.py`         | RL trainer entry point (embeds the inference gateway)            |
 | `config.yaml`      | Training configuration (v2 controllers, 2-GPU defaults)          |
