@@ -1074,76 +1074,81 @@ class GatewayTrainController:
             )
 
     def update_weights(self, meta: Any) -> None:
-        if self._weight_update_ctrl is None or self.rollout is None:
-            raise RuntimeError(
-                "connect_engine() must be called before update_weights()"
-            )
-        assert meta.version is not None and meta.version > 0, (
-            f"meta.version must be a positive integer, got {meta.version}"
-        )
-        if (
-            meta.type == "disk"
-            and meta.clear_checkpoint_after_load
-            and self._disk_weight_update_root is None
-        ):
-            raise RuntimeError(
-                "Disk weight-update root is unavailable; connect_engine() "
-                "must complete before updating weights"
-            )
-        primary_error: BaseException | None = None
-        pause_completed = False
-        update_succeeded = False
-        try:
-            self.rollout.pause_generation()
-            pause_completed = True
-            result = self._weight_update_ctrl.update_weights(version=meta.version)
-            if result.status != "ok":
+        with self._weight_update_lock:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError("Cannot update weights after shutdown was requested")
+            weight_update_ctrl = self._weight_update_ctrl
+            rollout = self.rollout
+            if weight_update_ctrl is None or rollout is None:
                 raise RuntimeError(
-                    f"Weight update v{meta.version} failed: "
-                    f"{result.error or 'unknown gateway error'}"
+                    "connect_engine() must be called before update_weights()"
                 )
-            update_succeeded = True
-            if meta.type == "disk" and meta.clear_checkpoint_after_load:
-                assert self._disk_weight_update_root is not None
-                checkpoint_path = os.path.join(
-                    self._disk_weight_update_root,
-                    f"weight_update_v{meta.version}",
-                )
-                try:
-                    shutil.rmtree(checkpoint_path)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    logger.warning(
-                        "Failed to remove disk weight-update checkpoint %s: %s",
-                        checkpoint_path,
-                        exc,
-                    )
-            logger.info(
-                "Weight update v%d completed (%s, %.0fms)",
-                meta.version,
-                result.status,
-                result.duration_ms,
+            assert meta.version is not None and meta.version > 0, (
+                f"meta.version must be a positive integer, got {meta.version}"
             )
-        except BaseException as exc:
-            primary_error = exc
-            raise
-        finally:
-            if not pause_completed or update_succeeded:
-                try:
-                    self.rollout.continue_generation()
-                except BaseException:
-                    if primary_error is None:
-                        raise
-                    logger.exception(
-                        "Failed to resume generation while propagating %s",
-                        type(primary_error).__name__,
-                    )
-            else:
-                logger.error(
-                    "Weight update did not complete; leaving rollout generation "
-                    "paused to avoid serving mixed model versions"
+            if (
+                meta.type == "disk"
+                and meta.clear_checkpoint_after_load
+                and self._disk_weight_update_root is None
+            ):
+                raise RuntimeError(
+                    "Disk weight-update root is unavailable; connect_engine() "
+                    "must complete before updating weights"
                 )
+            primary_error: BaseException | None = None
+            pause_completed = False
+            update_succeeded = False
+            try:
+                rollout.pause_generation()
+                pause_completed = True
+                result = weight_update_ctrl.update_weights(version=meta.version)
+                if result.status != "ok":
+                    raise RuntimeError(
+                        f"Weight update v{meta.version} failed: "
+                        f"{result.error or 'unknown gateway error'}"
+                    )
+                update_succeeded = True
+                if meta.type == "disk" and meta.clear_checkpoint_after_load:
+                    assert self._disk_weight_update_root is not None
+                    checkpoint_path = os.path.join(
+                        self._disk_weight_update_root,
+                        f"weight_update_v{meta.version}",
+                    )
+                    try:
+                        shutil.rmtree(checkpoint_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning(
+                            "Failed to remove disk weight-update checkpoint %s: %s",
+                            checkpoint_path,
+                            exc,
+                        )
+                logger.info(
+                    "Weight update v%d completed (%s, %.0fms)",
+                    meta.version,
+                    result.status,
+                    result.duration_ms,
+                )
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                if not pause_completed or update_succeeded:
+                    try:
+                        rollout.continue_generation()
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.exception(
+                            "Failed to resume generation while propagating %s",
+                            type(primary_error).__name__,
+                        )
+                else:
+                    logger.error(
+                        "Weight update did not complete; leaving rollout generation "
+                        "paused to avoid serving mixed model versions"
+                    )
 
     def prepare_batch(
         self,

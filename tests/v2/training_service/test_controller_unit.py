@@ -342,6 +342,85 @@ class TestGatewayTrainControllerWeightUpdate:
 
         assert os.path.join(save_root, "weight_update_v3") == meta.with_version(3).path
 
+    def test_destroy_waits_for_inflight_weight_update(self):
+        update_entered = threading.Event()
+        allow_update = threading.Event()
+        destroy_entered = threading.Event()
+
+        class BlockingWeightUpdateController:
+            def update_weights(self, *, version):
+                update_entered.set()
+                if not allow_update.wait(timeout=2.0):
+                    raise TimeoutError("test did not release weight update")
+                return WeightUpdateResult(
+                    status="ok",
+                    version=version,
+                    duration_ms=10,
+                )
+
+            def destroy(self):
+                destroy_entered.set()
+
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = BlockingWeightUpdateController()
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+        update_errors: list[BaseException] = []
+        destroy_errors: list[BaseException] = []
+
+        def update_weights() -> None:
+            try:
+                controller.update_weights(meta)
+            except BaseException as exc:
+                update_errors.append(exc)
+
+        def destroy() -> None:
+            try:
+                controller.destroy()
+            except BaseException as exc:
+                destroy_errors.append(exc)
+
+        update_thread = threading.Thread(target=update_weights)
+        destroy_thread = threading.Thread(target=destroy)
+        update_thread.start()
+        assert update_entered.wait(timeout=1.0)
+        destroy_thread.start()
+        assert controller._shutdown_requested.wait(timeout=1.0)
+        destroy_advanced_past_update = destroy_entered.wait(timeout=0.2)
+        allow_update.set()
+        update_thread.join(timeout=2.0)
+        destroy_thread.join(timeout=2.0)
+
+        assert not destroy_advanced_past_update
+        assert not update_thread.is_alive()
+        assert not destroy_thread.is_alive()
+        assert update_errors == []
+        assert destroy_errors == []
+        assert destroy_entered.is_set()
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_weight_update_rejects_after_shutdown_is_requested(self):
+        controller = self._prepare_controller()
+        controller._shutdown_requested.set()
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+
+        with pytest.raises(RuntimeError, match="after shutdown was requested"):
+            controller.update_weights(meta)
+
+        controller.rollout.pause_generation.assert_not_called()
+        controller._weight_update_ctrl.update_weights.assert_not_called()
+
     def test_connect_engine_uses_canonical_disk_save_root(self, tmp_path):
         controller = _make_controller()
         controller._worker_addrs = ["http://train:8000"]
