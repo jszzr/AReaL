@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import select
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import requests
 
+from areal.infra.utils.proc import kill_process_tree
 from areal.v2.weight_update.controller.config import (
     WeightUpdateControllerConfig,
 )
@@ -16,6 +20,29 @@ from areal.v2.weight_update.controller.controller import (
 from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
 GATEWAY_URL = "http://localhost:7080"
+
+
+def _spawn_gateway_with_inherited_stdout() -> subprocess.Popen[bytes]:
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; print('ready', flush=True); time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline() == b"ready\n"
+    return process
+
+
+def _force_reap_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        kill_process_tree(process.pid)
+    process.wait(timeout=5)
+    if process.stdout is not None:
+        process.stdout.close()
 
 
 @pytest.fixture()
@@ -171,6 +198,90 @@ class TestDisconnect:
 
 
 class TestLifecycle:
+    @pytest.mark.parametrize(
+        ("failure_stage", "error_message"),
+        [
+            ("http_client", "http client failed"),
+            ("health_check", "health check failed"),
+        ],
+    )
+    def test_initialize_failure_reaps_started_gateway(
+        self, monkeypatch, failure_stage, error_message
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        real_popen = subprocess.Popen
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def spawn_test_gateway(*_args, **_kwargs):
+            process = real_popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            spawned.append(process)
+            return process
+
+        controller = WeightUpdateController()
+        monkeypatch.setattr(controller_module.subprocess, "Popen", spawn_test_gateway)
+        if failure_stage == "http_client":
+            monkeypatch.setattr(
+                controller_module.httpx,
+                "Client",
+                MagicMock(side_effect=RuntimeError(error_message)),
+            )
+        else:
+            monkeypatch.setattr(
+                controller,
+                "_wait_for_health",
+                MagicMock(side_effect=RuntimeError(error_message)),
+            )
+
+        try:
+            with pytest.raises(RuntimeError, match=error_message):
+                controller.initialize()
+
+            assert len(spawned) == 1
+            assert spawned[0].returncode is not None
+            assert controller._gateway_proc is None
+            assert controller._session is None
+        finally:
+            for process in spawned:
+                _force_reap_process(process)
+
+    def test_destroy_reaps_gateway_and_releases_inherited_output(self):
+        controller = WeightUpdateController()
+        process = _spawn_gateway_with_inherited_stdout()
+        controller._gateway_proc = process
+
+        try:
+            controller.destroy()
+
+            assert process.returncode is not None
+            assert process.stdout is not None
+            readable, _, _ = select.select([process.stdout], [], [], 1.0)
+            assert readable == [process.stdout]
+            assert process.stdout.read() == b""
+        finally:
+            _force_reap_process(process)
+
+    def test_destroy_reaps_gateway_when_http_session_close_fails(self):
+        controller = WeightUpdateController()
+        session = MagicMock(spec=httpx.Client)
+        session.close.side_effect = RuntimeError("session close failed")
+        process = _spawn_gateway_with_inherited_stdout()
+        controller._session = session
+        controller._gateway_proc = process
+
+        try:
+            controller.destroy()
+
+            assert process.returncode is not None
+            assert controller._session is None
+            assert controller._gateway_proc is None
+        finally:
+            _force_reap_process(process)
+
     def test_full_lifecycle(self, ctrl):
         connect_resp = _mock_response(200, {"pair_name": "pair0"})
         update_resp = _mock_response(

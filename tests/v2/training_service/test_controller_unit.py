@@ -362,3 +362,68 @@ class TestGatewayTrainControllerWeightUpdate:
             pytest.raises(ValueError, match="local SGLang"),
         ):
             controller.connect_engine(rollout, meta)
+
+
+class TestGatewayTrainControllerLifecycle:
+    def test_destroy_releases_owned_weight_update_controller_once(self):
+        class OwnedWeightUpdateController:
+            def __init__(self):
+                self.destroy_count = 0
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        controller = _make_controller()
+        weight_update_controller = OwnedWeightUpdateController()
+        controller._weight_update_ctrl = weight_update_controller
+
+        controller.destroy()
+        controller.destroy()
+
+        assert weight_update_controller.destroy_count == 1
+        assert controller._weight_update_ctrl is None
+
+    def test_connect_engine_failure_releases_weight_update_controller(
+        self, monkeypatch
+    ):
+        from areal.v2.weight_update.controller import controller as wu_module
+
+        class FailingWeightUpdateController:
+            def __init__(self, _config):
+                self.initialized = False
+                self.destroyed = False
+
+            def initialize(self):
+                self.initialized = True
+
+            def connect(self, **_kwargs):
+                raise RuntimeError("connect failed")
+
+            def destroy(self):
+                self.destroyed = True
+
+        resource = FailingWeightUpdateController(None)
+        monkeypatch.setattr(
+            wu_module,
+            "WeightUpdateController",
+            lambda _config: resource,
+        )
+
+        rollout = RolloutControllerV2.__new__(RolloutControllerV2)
+        rollout._init_future = None
+        rollout._inf_addrs = ["http://inference-worker"]
+        controller = _make_controller()
+        meta = SimpleNamespace(
+            type="disk",
+            path="",
+            use_lora=False,
+            lora_name="",
+            lora_keep_versions=0,
+        )
+
+        with pytest.raises(RuntimeError, match="connect failed"):
+            controller.connect_engine(rollout, meta)
+
+        assert resource.initialized is True
+        assert resource.destroyed is True
+        assert controller._weight_update_ctrl is None

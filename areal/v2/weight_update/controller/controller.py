@@ -69,9 +69,13 @@ class WeightUpdateController:
         )
 
         self._gateway_url = f"http://{cfg.host}:{port}"
-        self._session = httpx.Client()
-        self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
-        self._wait_for_health()
+        try:
+            self._session = httpx.Client()
+            self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
+            self._wait_for_health()
+        except BaseException:
+            self.destroy()
+            raise
         logger.info("Gateway ready at %s", self._gateway_url)
 
     def _wait_for_health(self) -> None:
@@ -205,15 +209,28 @@ class WeightUpdateController:
             except Exception:
                 logger.warning("Failed to disconnect during destroy", exc_info=True)
 
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-
-        if self._gateway_proc is not None:
+        session = self._session
+        self._session = None
+        if session is not None:
             try:
-                kill_process_tree(self._gateway_proc.pid)
+                session.close()
+            except Exception:
+                logger.warning("Failed to close gateway HTTP session", exc_info=True)
+
+        gateway_proc = self._gateway_proc
+        self._gateway_proc = None
+        if gateway_proc is not None:
+            try:
+                kill_process_tree(gateway_proc.pid)
             except Exception:
                 logger.warning("Failed to kill gateway process", exc_info=True)
-            self._gateway_proc = None
+            try:
+                gateway_proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Gateway process did not exit after process-tree cleanup"
+                )
+                gateway_proc.kill()
+                gateway_proc.wait(timeout=1)
         self._gateway_url = ""
         logger.info("WeightUpdateController destroyed")
