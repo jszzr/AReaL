@@ -21,6 +21,7 @@ from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
+from areal.utils.seeding import validate_base_seed
 
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
@@ -104,6 +105,7 @@ class GatewayTrainController:
         role: str,
         ft_spec: FinetuneSpec | None = None,
         *,
+        base_seed: int | None = None,
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
@@ -117,7 +119,11 @@ class GatewayTrainController:
         self._workers_ready.clear()
         self._shutdown_requested.clear()
         self._init_future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize, role, ft_spec, **kwargs
+            self._guarded_bg_initialize,
+            role,
+            ft_spec,
+            base_seed=base_seed,
+            **kwargs,
         )
 
         ready_timeout = self.config.workers_ready_timeout
@@ -179,6 +185,7 @@ class GatewayTrainController:
         self,
         role: str,
         ft_spec: FinetuneSpec | None = None,
+        base_seed: int | None = None,
         **kwargs: Any,
     ) -> None:
         from dataclasses import asdict
@@ -187,6 +194,13 @@ class GatewayTrainController:
         from areal.api.scheduler_api import Job
 
         cfg = self.config
+        if base_seed is None:
+            exp_config = getattr(self.scheduler, "exp_config", None)
+            candidate_seed = getattr(exp_config, "seed", None)
+            if candidate_seed is not None:
+                base_seed = candidate_seed
+        if base_seed is not None:
+            base_seed = validate_base_seed(base_seed)
 
         world_size = self.train_alloc.parallel.world_size
 
@@ -275,6 +289,22 @@ class GatewayTrainController:
                     "--log-level",
                     cfg.log_level,
                 ]
+                if base_seed is not None:
+                    # Use the logical model role and global rank, matching the
+                    # legacy guard's set_random_seed(seed, f"{role}{rank}").
+                    # FSDP LoRA initialization later broadcasts rank 0's full
+                    # state, while rank-specific RNG streams remain available
+                    # for stochastic training operations.
+                    worker_cmd.extend(
+                        [
+                            "--seed",
+                            str(base_seed),
+                            "--seed-role",
+                            role,
+                            "--seed-rank",
+                            str(rank),
+                        ]
+                    )
 
                 host, port = await self._async_fork_on_guard(
                     guard_addr=guard,

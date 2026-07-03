@@ -10,7 +10,7 @@ from typing import Any
 from areal.api import TrainEngine
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
-from areal.utils import logging
+from areal.utils import logging, seeding
 from areal.utils.dynamic_import import import_from_string
 
 logger = logging.getLogger("TrainWorker")
@@ -93,6 +93,23 @@ def create_engine_module(
                 return jsonify({"error": str(e)}), 400
 
             def create_in_engine_thread():
+                base_seed = getattr(config, "seed", None)
+                if base_seed is not None:
+                    seed_role = getattr(config, "seed_role", None)
+                    seed_rank = getattr(config, "seed_rank", None)
+                    if seed_role is None or seed_rank is None:
+                        raise ValueError(
+                            "seed_role and seed_rank are required when seed is set"
+                        )
+                    seed_key = f"{seed_role}{seed_rank}"
+                    logger.info(
+                        "Seeding engine process before construction "
+                        "(base_seed=%s, key=%s, effective_seed=%s)",
+                        base_seed,
+                        seed_key,
+                        seeding.derive_seed(base_seed, seed_key),
+                    )
+                    seeding.set_random_seed(base_seed, key=seed_key)
                 return engine_class(*init_args, **init_kwargs)
 
             engine = submit_to_engine_thread("create_engine", create_in_engine_thread)

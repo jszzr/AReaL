@@ -22,6 +22,23 @@ def main():
         choices=["debug", "info", "warning", "error"],
         help="Log level",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Experiment base seed used to initialize the training engine",
+    )
+    parser.add_argument(
+        "--seed-role",
+        default=None,
+        help="Logical training role used to derive the worker seed",
+    )
+    parser.add_argument(
+        "--seed-rank",
+        type=int,
+        default=None,
+        help="Global training rank used to derive the worker seed",
+    )
     args, _ = parser.parse_known_args()
 
     from areal.infra.utils.http import validate_admin_api_key
@@ -35,6 +52,9 @@ def main():
         port=args.port,
         admin_api_key=args.admin_api_key,
         log_level=args.log_level,
+        seed=args.seed,
+        seed_role=args.seed_role,
+        seed_rank=args.seed_rank,
     )
 
     from areal.utils.logging import suppress_http_loggers

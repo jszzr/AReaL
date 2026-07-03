@@ -10,6 +10,8 @@ import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.api.io_struct import WeightUpdateMeta
+from areal.trainer import rl_trainer
+from areal.trainer.rl_trainer import PPOTrainer
 from areal.v2.inference_service.controller.controller import RolloutControllerV2
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -116,13 +118,48 @@ class _FailOnceSession:
 
 class TestGatewayTrainControllerInitialization:
     @pytest.mark.asyncio
-    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
+    @pytest.mark.parametrize("invalid_seed", [-1, 2**32, True])
+    async def test_invalid_base_seed_fails_before_guard_creation(self, invalid_seed):
+        scheduler = MagicMock()
+        scheduler.exp_config = None
+        scheduler.create_workers.side_effect = AssertionError(
+            "guard creation must not start for an invalid seed"
+        )
+        controller = _make_controller(scheduler)
+
+        with pytest.raises(ValueError, match="base_seed.*unsigned 32-bit"):
+            await controller._async_initialize(role="actor", base_seed=invalid_seed)
+
+        scheduler.create_workers.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("experiment_seed", [0, 20260703])
+    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(
+        self, experiment_seed
+    ):
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
         worker1 = MagicMock(ip="127.0.0.1", worker_ports=[18001], id="guard-1")
 
         scheduler = MagicMock()
         scheduler.create_workers.return_value = ["guard-0", "guard-1"]
         scheduler.get_workers.return_value = [worker0, worker1]
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.config = SimpleNamespace(
+            seed=experiment_seed,
+            scheduler=SimpleNamespace(type="local"),
+        )
+
+        def make_scheduler(*, exp_config):
+            scheduler.exp_config = exp_config
+            return scheduler
+
+        with patch.object(
+            rl_trainer, "LocalScheduler", side_effect=make_scheduler
+        ) as scheduler_cls:
+            scheduler = trainer._init_scheduler()
+
+        scheduler_cls.assert_called_once_with(exp_config=trainer.config)
 
         controller = _make_controller(scheduler)
         controller._role = "train-role"
@@ -188,6 +225,17 @@ class TestGatewayTrainControllerInitialization:
         mock_set_env.assert_awaited_once()
         assert mock_async_fork.await_count == 5
         mock_sync_fork.assert_not_called()
+
+        for rank, fork_call in enumerate(mock_async_fork.await_args_list[:2]):
+            assert fork_call.kwargs["raw_cmd"][-6:] == [
+                "--seed",
+                str(experiment_seed),
+                "--seed-role",
+                "train-role",
+                "--seed-rank",
+                str(rank),
+            ]
+
         assert mock_create_engine.await_count == 2
         assert mock_call_engine.await_count == 4
         mock_register.assert_awaited_once_with(
@@ -205,6 +253,23 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_seed", [True, "bad", 1.5])
+    async def test_invalid_scheduler_seed_fails_before_guard_creation(
+        self, invalid_seed
+    ):
+        scheduler = MagicMock()
+        scheduler.exp_config = SimpleNamespace(seed=invalid_seed)
+        scheduler.create_workers.side_effect = AssertionError(
+            "guard creation must not start for an invalid seed"
+        )
+        controller = _make_controller(scheduler)
+
+        with pytest.raises(ValueError, match="base_seed.*unsigned 32-bit"):
+            await controller._async_initialize(role="actor")
+
+        scheduler.create_workers.assert_not_called()
 
 
 class TestGatewayTrainControllerWeightUpdate:

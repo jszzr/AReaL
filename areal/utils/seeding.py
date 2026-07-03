@@ -19,10 +19,35 @@ def _seed_from_key(key: str) -> int:
     return int(hashlib.sha256(key.encode()).hexdigest(), 16) & 0xFFFFFFFF
 
 
+def validate_base_seed(base_seed: int) -> int:
+    """Return a valid unsigned 32-bit experiment seed or raise ``ValueError``."""
+    if (
+        isinstance(base_seed, bool)
+        or not isinstance(base_seed, int)
+        or not 0 <= base_seed < 2**32
+    ):
+        raise ValueError(
+            f"base_seed must be an unsigned 32-bit integer, got {base_seed!r}"
+        )
+    return base_seed
+
+
+def derive_seed(base_seed: int, key: str) -> int:
+    """Derive the stable uint32 RNG seed for one logical role/rank key."""
+    return (validate_base_seed(base_seed) + _seed_from_key(key)) & 0xFFFFFFFF
+
+
 def set_random_seed(base_seed: int, key: str) -> None:
+    """Seed all supported RNGs from a stable uint32 ``base_seed`` and key.
+
+    The effective seed is ``(base_seed + sha256(key).low32) mod 2**32``.
+    Keeping this derivation here gives controllers and workers one auditable
+    cross-process contract instead of backend-specific seed arithmetic.
+    """
     global _SEED, _BASE_SEED
+    base_seed = validate_base_seed(base_seed)
     _BASE_SEED = base_seed
-    seed = base_seed + _seed_from_key(key)
+    seed = derive_seed(base_seed, key)
     _SEED = seed
     os.environ["PYTHONHASHSEED"] = str(seed)
     transformers.set_seed(seed)
