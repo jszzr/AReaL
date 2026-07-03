@@ -127,7 +127,7 @@ from areal.utils.lock import DistributedLock
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
-from areal.utils.seeding import get_seed
+from areal.utils.seeding import get_base_seed, get_seed
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -266,11 +266,18 @@ class MegatronEngine(TrainEngine):
         )
 
     def _seed_model_parallel_rng(self) -> None:
-        """Seed Megatron's CUDA RNG tracker from the process worker seed."""
+        """Seed Megatron's CUDA RNG tracker with topology-aware shared input.
+
+        Megatron adds its own TP/EP offsets internally, so every rank in a
+        pipeline stage must start from the same experiment seed.  Feeding the
+        role/rank-derived process seed here would make TP streams disagree
+        across DP replicas.
+        """
         try:
-            self.seed = get_seed()
+            base_seed = get_base_seed()
         except ValueError:
-            self.seed = 42
+            base_seed = 42
+        self.seed = base_seed + 100 * mpu.get_pipeline_model_parallel_rank()
         tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
 
     def _apply_megatron_bridge_lora(self) -> None:

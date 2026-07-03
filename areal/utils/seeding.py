@@ -68,6 +68,14 @@ def get_seed() -> int:
     return _SEED
 
 
+def get_base_seed() -> int:
+    """Return the experiment seed before logical role/rank derivation."""
+    global _BASE_SEED
+    if _BASE_SEED is None:
+        raise ValueError("Random seed is not set. Please call set_random_seed first.")
+    return _BASE_SEED
+
+
 class Shuffler:
     def __init__(self, key="default"):
         self.cnt = 0

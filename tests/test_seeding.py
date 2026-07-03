@@ -22,6 +22,7 @@ def test_set_random_seed_uses_stable_uint32_derivation(monkeypatch, base_seed):
         seeding.set_random_seed(base_seed, key)
 
     assert seeding.get_seed() == expected
+    assert seeding.get_base_seed() == base_seed
     assert seeding.os.environ["PYTHONHASHSEED"] == str(expected)
     transformers_seed.assert_called_once_with(expected)
     python_seed.assert_called_once_with(expected)
@@ -36,28 +37,34 @@ def test_set_random_seed_rejects_values_outside_uint32(invalid_seed):
 
 
 @pytest.mark.parametrize(
-    ("configured_seed", "expected_seed"),
-    [(20260703, 20260703), (None, 42)],
+    ("base_seed", "pipeline_rank", "expected_seed"),
+    [
+        (20260703, 0, 20260703),
+        (20260703, 1, 20260803),
+        (None, 0, 42),
+    ],
 )
-def test_megatron_model_parallel_rng_uses_worker_seed_before_process_group(
-    configured_seed, expected_seed
+def test_megatron_model_parallel_rng_uses_topology_aware_base_seed(
+    base_seed, pipeline_rank, expected_seed
 ):
     pytest.importorskip("mbridge")
     from areal.engine.megatron_engine import MegatronEngine
 
     engine = MegatronEngine.__new__(MegatronEngine)
-    get_seed_patch = (
+    get_base_seed_patch = (
         patch(
-            "areal.engine.megatron_engine.get_seed",
+            "areal.engine.megatron_engine.get_base_seed",
             side_effect=ValueError("seed is unset"),
         )
-        if configured_seed is None
-        else patch(
-            "areal.engine.megatron_engine.get_seed", return_value=configured_seed
-        )
+        if base_seed is None
+        else patch("areal.engine.megatron_engine.get_base_seed", return_value=base_seed)
     )
     with (
-        get_seed_patch,
+        get_base_seed_patch,
+        patch(
+            "areal.engine.megatron_engine.mpu.get_pipeline_model_parallel_rank",
+            return_value=pipeline_rank,
+        ),
         patch(
             "areal.engine.megatron_engine.tensor_parallel."
             "model_parallel_cuda_manual_seed"
