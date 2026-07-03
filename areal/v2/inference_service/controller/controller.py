@@ -208,6 +208,8 @@ class RolloutControllerV2:
         self._callback_host: str | None = None
         self._callback_loop: asyncio.AbstractEventLoop | None = None
         self._callback_loop_ready = threading.Event()
+        self._callback_serving = threading.Event()
+        self._callback_start_error: BaseException | None = None
 
         # Track which service roles were created for cleanup
         self._service_roles: list[str] = []
@@ -235,6 +237,19 @@ class RolloutControllerV2:
 
     # -- Initialize --------------------------------------------------------
 
+    def _rollback_initialization(self, primary_error: BaseException) -> None:
+        """Fence startup and reap every owner without masking its root cause."""
+        if self._initialization_error is None:
+            self._initialization_error = primary_error
+        self._shutdown_requested.set()
+        try:
+            self.destroy()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "Startup rollback cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
     def initialize(
         self,
         role: str,
@@ -255,11 +270,10 @@ class RolloutControllerV2:
                 )
 
             self._worker_role = role
-            self._start_online_callback_server()
-
             self._workers_ready.clear()
             self._initialization_error = None
             try:
+                self._start_online_callback_server()
                 future = get_executor("ctrl_init").submit(
                     self._guarded_bg_initialize,
                     server_args,
@@ -268,29 +282,30 @@ class RolloutControllerV2:
                     **kwargs,
                 )
             except BaseException as exc:
-                self._initialization_error = exc
-                self._shutdown_requested.set()
-                self.destroy()
+                self._rollback_initialization(exc)
                 raise
             # Holding the lifecycle lock prevents a fast background failure
             # from destroying the controller before this owner is published.
             self._init_future = future
 
-        ready_timeout = self.config.workers_ready_timeout
-        if not self._workers_ready.wait(timeout=ready_timeout):
-            timeout_error = TimeoutError(
-                f"Worker creation timed out after {ready_timeout}s"
-            )
-            self._initialization_error = timeout_error
-            self._shutdown_requested.set()
-            raise timeout_error
-        if future.done():
-            future.result()
+        try:
+            ready_timeout = self.config.workers_ready_timeout
+            if not self._workers_ready.wait(timeout=ready_timeout):
+                raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
+            if future.done():
+                future.result()
+            if self._shutdown_requested.is_set():
+                if self._initialization_error is not None:
+                    raise self._initialization_error
+                raise RuntimeError("controller initialization cancelled by shutdown")
 
-        if wait:
-            self._ensure_initialized()
-            return None
-        return future
+            if wait:
+                self._ensure_initialized()
+                return None
+            return future
+        except BaseException as exc:
+            self._rollback_initialization(exc)
+            raise
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
@@ -299,19 +314,11 @@ class RolloutControllerV2:
             self._bg_initialize(*args, **kwargs)
         except BaseException as exc:
             primary_error = exc
-            if self._initialization_error is None:
-                self._initialization_error = exc
             logger.error(
                 "RolloutControllerV2 initialization failed, rolling back",
                 exc_info=True,
             )
-            try:
-                self.destroy()
-            except BaseException as cleanup_error:
-                exc.add_note(
-                    "Rollback cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            self._rollback_initialization(exc)
             raise
         finally:
             self._workers_ready.set()
@@ -1144,29 +1151,82 @@ class RolloutControllerV2:
             lambda self, *args, **kwargs: None
         )
 
-        def serve_forever():
-            self._callback_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._callback_loop)
+        self._callback_loop_ready.clear()
+        self._callback_serving.clear()
+        self._callback_start_error = None
+        original_service_actions = self._callback_server.service_actions
+
+        def mark_serving() -> None:
+            original_service_actions()
+            self._callback_serving.set()
             self._callback_loop_ready.set()
-            logger.info(
-                "Online callback server started on %s",
-                format_hostport(self._callback_host, self._callback_port),
-            )
-            assert self._callback_server is not None
-            self._callback_server.serve_forever()
+
+        # BaseServer invokes service_actions only after serve_forever has entered
+        # its polling loop.  Publishing readiness there makes shutdown safe: a
+        # mere Thread.start() acknowledgement is too early for BaseServer.shutdown.
+        self._callback_server.service_actions = mark_serving
+
+        def serve_forever() -> None:
+            try:
+                self._callback_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._callback_loop)
+                logger.info(
+                    "Online callback server starting on %s",
+                    format_hostport(self._callback_host, self._callback_port),
+                )
+                assert self._callback_server is not None
+                self._callback_server.serve_forever(poll_interval=0.05)
+            except BaseException as exc:
+                self._callback_start_error = exc
+                self._callback_loop_ready.set()
+            finally:
+                # Wake a waiter even if a custom server exits without entering
+                # BaseServer's polling loop and without raising.
+                self._callback_loop_ready.set()
 
         self._callback_server_thread = threading.Thread(
             target=serve_forever, daemon=True
         )
         self._callback_server_thread.start()
-        self._callback_loop_ready.wait()
+        startup_timeout = self.config.setup_timeout
+        if not self._callback_loop_ready.wait(timeout=startup_timeout):
+            raise TimeoutError(
+                "Online callback server did not enter its serving loop within "
+                f"{startup_timeout}s"
+            )
+        if self._callback_start_error is not None:
+            raise self._callback_start_error
+        thread = self._callback_server_thread
+        if (
+            not self._callback_serving.is_set()
+            or thread is None
+            or not thread.is_alive()
+        ):
+            # Read the error once more after observing thread termination so an
+            # exception published immediately after the readiness wake wins.
+            if self._callback_start_error is not None:
+                raise self._callback_start_error
+            raise RuntimeError("Online callback server exited before becoming ready")
 
     def _stop_online_callback_server(self) -> None:
         if self._callback_server is not None:
             logger.info("Stopping online callback server...")
-            self._callback_server.shutdown()
-            if self._callback_server_thread is not None:
-                self._callback_server_thread.join(timeout=5.0)
+            server = self._callback_server
+            thread = self._callback_server_thread
+            serving = (
+                self._callback_serving.is_set()
+                and thread is not None
+                and thread.is_alive()
+            )
+            if serving:
+                server.shutdown()
+            else:
+                # BaseServer.shutdown deadlocks if serve_forever never entered.
+                server.server_close()
+            if thread is not None and thread.ident is not None:
+                thread.join(timeout=5.0)
+            if serving:
+                server.server_close()
             if self._callback_loop is not None:
                 self._callback_loop.close()
             self._callback_server = None
@@ -1176,6 +1236,8 @@ class RolloutControllerV2:
             self._callback_host = None
             self._callback_loop = None
             self._callback_loop_ready.clear()
+            self._callback_serving.clear()
+            self._callback_start_error = None
 
     @property
     def callback_addr(self) -> str:
@@ -1446,6 +1508,10 @@ class RolloutControllerV2:
                 self._predecessor_worker_ids.clear()
 
             cleanup_errors: list[tuple[str, BaseException]] = []
+            fork_cleanup_errors: list[
+                tuple[tuple[str, str, int], str, BaseException]
+            ] = []
+            role_cleanup_errors: list[tuple[str, BaseException]] = []
 
             def record_cleanup_error(stage: str, exc: BaseException) -> None:
                 logger.error("Cleanup failed at %s", stage, exc_info=True)
@@ -1454,8 +1520,14 @@ class RolloutControllerV2:
             self._shutdown_requested.set()
             future = self._init_future
             self._init_future = None
+            cancelled = False
             if future is not None:
-                future.cancel()
+                cancelled = future.cancel()
+            # A future cancelled before it starts cannot execute the guarded
+            # initializer's finally block. Running initializers publish their
+            # own error before waking the waiter.
+            if future is None or cancelled:
+                self._workers_ready.set()
 
             try:
                 self._stop_online_callback_server()
@@ -1476,7 +1548,9 @@ class RolloutControllerV2:
                 try:
                     self._kill_forked_service(guard_addr, role, worker_index)
                 except BaseException as exc:
-                    record_cleanup_error(f"forked service {role}/{worker_index}", exc)
+                    stage = f"forked service {role}/{worker_index}"
+                    logger.error("Cleanup failed at %s", stage, exc_info=True)
+                    fork_cleanup_errors.append((owner, stage, exc))
                 else:
                     self._forked_services.remove(owner)
 
@@ -1496,15 +1570,24 @@ class RolloutControllerV2:
                     self._async_client = None
                     self._async_client_loop = None
 
-            # Deleting each guard also reaps any child whose direct kill failed.
             for role in reversed(list(self._service_roles)):
                 try:
                     self.scheduler.delete_workers(role=role)
                 except BaseException as exc:
-                    record_cleanup_error(f"worker role {role}", exc)
+                    stage = f"worker role {role}"
+                    logger.error("Cleanup failed at %s", stage, exc_info=True)
+                    role_cleanup_errors.append((stage, exc))
                 else:
                     logger.info("Workers deleted for role: %s", role)
                     self._service_roles.remove(role)
+
+            # Scheduler deletion is best effort and does not currently prove
+            # that every guard exited. Keep any direct owner whose kill was not
+            # acknowledged so a later destroy() can retry it explicitly.
+            for _owner, stage, exc in fork_cleanup_errors:
+                record_cleanup_error(stage, exc)
+            for stage, exc in role_cleanup_errors:
+                record_cleanup_error(stage, exc)
 
             self.workers.clear()
             self._server_infos.clear()

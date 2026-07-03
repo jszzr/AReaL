@@ -94,12 +94,26 @@ class GatewayTrainController:
 
         # Pipelined initialization state
         self._init_future: concurrent.futures.Future | None = None
+        self._initialization_error: BaseException | None = None
         self._init_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
 
     # -- Initialize --------------------------------------------------------
+
+    def _rollback_initialization(self, primary_error: BaseException) -> None:
+        """Fence startup and reap every owner without masking its root cause."""
+        if self._initialization_error is None:
+            self._initialization_error = primary_error
+        self._shutdown_requested.set()
+        try:
+            self.destroy()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "Startup rollback cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     def initialize(
         self,
@@ -120,6 +134,7 @@ class GatewayTrainController:
 
             self._role = role
             self._workers_ready.clear()
+            self._initialization_error = None
             try:
                 future = get_executor("ctrl_init").submit(
                     self._guarded_bg_initialize,
@@ -128,23 +143,29 @@ class GatewayTrainController:
                     base_seed=base_seed,
                     **kwargs,
                 )
-            except BaseException:
-                self._shutdown_requested.set()
-                self.destroy()
+            except BaseException as exc:
+                self._rollback_initialization(exc)
                 raise
             self._init_future = future
 
-        ready_timeout = self.config.workers_ready_timeout
-        if not self._workers_ready.wait(timeout=ready_timeout):
-            self._shutdown_requested.set()
-            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
-        if future.done():
-            future.result()
+        try:
+            ready_timeout = self.config.workers_ready_timeout
+            if not self._workers_ready.wait(timeout=ready_timeout):
+                raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
+            if future.done():
+                future.result()
+            if self._shutdown_requested.is_set():
+                if self._initialization_error is not None:
+                    raise self._initialization_error
+                raise RuntimeError("controller initialization cancelled by shutdown")
 
-        if wait:
-            self._ensure_initialized()
-            return None
-        return future
+            if wait:
+                self._ensure_initialized()
+                return None
+            return future
+        except BaseException as exc:
+            self._rollback_initialization(exc)
+            raise
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
@@ -153,18 +174,11 @@ class GatewayTrainController:
             self._bg_initialize(*args, **kwargs)
         except BaseException as exc:
             primary_error = exc
-            self._shutdown_requested.set()
             logger.error(
                 "GatewayTrainController initialization failed, rolling back",
                 exc_info=True,
             )
-            try:
-                self.destroy()
-            except BaseException as cleanup_error:
-                exc.add_note(
-                    "Rollback cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            self._rollback_initialization(exc)
             raise
         finally:
             self._workers_ready.set()
@@ -191,6 +205,8 @@ class GatewayTrainController:
 
     def _ensure_initialized(self) -> None:
         if self._init_future is None:
+            if self._initialization_error is not None:
+                raise self._initialization_error
             return
         with self._init_lock:
             future = self._init_future
@@ -491,12 +507,18 @@ class GatewayTrainController:
                 self._router_addr, self._model_addr, self.api_key
             )
             logger.info("Model registered with api_key=%s", self.api_key)
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "GatewayTrainController initialization failed, rolling back",
                 exc_info=True,
             )
-            self._cleanup_runtime_state()
+            try:
+                self._cleanup_runtime_state()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "Local startup rollback failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
 
     # -- Engine creation ---------------------------------------------------
@@ -679,14 +701,11 @@ class GatewayTrainController:
                 json={"role": role, "worker_index": worker_index},
                 timeout=10,
             )
-            if resp.status_code == 200:
-                logger.info("Killed forked service %s/%d", role, worker_index)
-            else:
-                logger.warning(
-                    "Failed to kill %s/%d: %s", role, worker_index, resp.text
-                )
-        except Exception as exc:
+            resp.raise_for_status()
+            logger.info("Killed forked service %s/%d", role, worker_index)
+        except requests.RequestException as exc:
             logger.error("Error killing %s/%d: %s", role, worker_index, exc)
+            raise
 
     # -- Health checks -----------------------------------------------------
 
@@ -1325,6 +1344,14 @@ class GatewayTrainController:
                 f"{stage} also failed: {type(cleanup_error).__name__}: {cleanup_error}"
             )
 
+        def _record_cleanup_error(stage: str, cleanup_error: BaseException) -> None:
+            nonlocal primary_cleanup_error, primary_cleanup_traceback
+            if primary_cleanup_error is None:
+                primary_cleanup_error = cleanup_error
+                primary_cleanup_traceback = cleanup_error.__traceback__
+            else:
+                _add_secondary_cleanup_note(stage, cleanup_error)
+
         with self._weight_update_lock:
             weight_update_ctrl = self._weight_update_ctrl
             if weight_update_ctrl is not None:
@@ -1377,45 +1404,51 @@ class GatewayTrainController:
             logger.error("Failed to shut down worker engines gracefully", exc_info=True)
             _add_secondary_cleanup_note("Graceful worker shutdown", exc)
 
-        for guard_addr, role, worker_index in reversed(self._forked_services):
+        fork_cleanup_errors: list[tuple[tuple[str, str, int], str, BaseException]] = []
+        for owner in reversed(list(self._forked_services)):
+            guard_addr, role, worker_index = owner
             try:
                 self._kill_forked_service(guard_addr, role, worker_index)
-            except Exception as exc:
+            except BaseException as exc:
                 logger.error(
                     "Error killing %s/%d: %s",
                     role,
                     worker_index,
                     traceback.format_exc(),
                 )
-                if primary_cleanup_error is not None:
-                    _add_secondary_cleanup_note(
-                        f"Forked service {role}/{worker_index} cleanup", exc
+                fork_cleanup_errors.append(
+                    (
+                        owner,
+                        f"Forked service {role}/{worker_index} cleanup",
+                        exc,
                     )
-            except BaseException as exc:
-                if primary_cleanup_error is None:
-                    raise
-                logger.error("Error killing %s/%d", role, worker_index, exc_info=True)
-                _add_secondary_cleanup_note(
-                    f"Forked service {role}/{worker_index} cleanup", exc
                 )
-        self._forked_services.clear()
+            else:
+                self._forked_services.remove(owner)
 
-        for role in reversed(self._service_roles):
+        role_cleanup_errors: list[tuple[str, BaseException]] = []
+        for role in reversed(list(self._service_roles)):
             try:
                 self.scheduler.delete_workers(role=role)
                 logger.info("Workers deleted for role: %s", role)
-            except Exception as exc:
+            except BaseException as exc:
                 logger.error(
                     "Error deleting workers for %s: %s", role, traceback.format_exc()
                 )
-                if primary_cleanup_error is not None:
-                    _add_secondary_cleanup_note(f"Worker role {role} cleanup", exc)
-            except BaseException as exc:
-                if primary_cleanup_error is None:
-                    raise
-                logger.error("Error deleting workers for %s", role, exc_info=True)
-                _add_secondary_cleanup_note(f"Worker role {role} cleanup", exc)
-        self._service_roles.clear()
+                role_cleanup_errors.append((f"Worker role {role} cleanup", exc))
+            else:
+                self._service_roles.remove(role)
+
+        # Scheduler deletion is best effort and does not currently prove that
+        # every guard exited. Retain direct owners whose kill was not
+        # acknowledged so a later destroy() can retry them explicitly.
+        for _owner, stage, exc in fork_cleanup_errors:
+            _record_cleanup_error(stage, exc)
+        for stage, exc in role_cleanup_errors:
+            _record_cleanup_error(stage, exc)
+
+        if not self._service_roles:
+            self._guard_addrs.clear()
         self._worker_addrs.clear()
         self._router_addr = ""
         self._gateway_addr = ""
@@ -1466,7 +1499,10 @@ class GatewayTrainController:
             self._shutdown_requested.set()
             future = self._init_future
             self._init_future = None
+            cancelled = False
             if future is not None:
-                future.cancel()
+                cancelled = future.cancel()
+            if future is None or cancelled:
+                self._workers_ready.set()
 
             self._cleanup_runtime_state()

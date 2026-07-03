@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -273,6 +274,88 @@ def test_destroy_retains_fork_owner_when_guard_rejects_kill() -> None:
     assert controller._destroyed is False
 
 
+def test_guard_deletion_does_not_mask_unconfirmed_direct_kill() -> None:
+    controller = _controller()
+    owner = ("http://guard", "inf-server", 0)
+    controller._forked_services.append(owner)
+    controller._service_roles.append("rollout-inf")
+
+    kill = MagicMock(side_effect=[OSError("direct kill failed"), None])
+    with (
+        patch.object(controller, "_kill_forked_service", kill),
+        pytest.raises(OSError, match="direct kill failed"),
+    ):
+        controller.destroy()
+
+    controller.scheduler.delete_workers.assert_called_once_with(role="rollout-inf")
+    assert controller._forked_services == [owner]
+    assert controller._service_roles == []
+    assert controller._destroyed is False
+
+    with patch.object(controller, "_kill_forked_service", kill):
+        controller.destroy()
+
+    assert kill.call_count == 2
+    assert controller.scheduler.delete_workers.call_count == 1
+    assert controller._forked_services == []
+    assert controller._destroyed is True
+
+
+def test_failed_direct_kill_and_guard_deletion_retain_owners_for_retry() -> None:
+    controller = _controller()
+    owner = ("http://guard", "inf-server", 0)
+    controller._forked_services.append(owner)
+    controller._service_roles.append("rollout-inf")
+    kill = MagicMock(side_effect=[OSError("direct kill failed"), None])
+    controller.scheduler.delete_workers.side_effect = [
+        OSError("guard delete failed"),
+        None,
+    ]
+
+    with (
+        patch.object(controller, "_kill_forked_service", kill),
+        pytest.raises(OSError, match="direct kill failed"),
+    ):
+        controller.destroy()
+
+    assert controller._forked_services == [owner]
+    assert controller._service_roles == ["rollout-inf"]
+    assert controller._destroyed is False
+
+    with patch.object(controller, "_kill_forked_service", kill):
+        controller.destroy()
+
+    assert kill.call_count == 2
+    assert controller.scheduler.delete_workers.call_count == 2
+    assert controller._forked_services == []
+    assert controller._service_roles == []
+    assert controller._destroyed is True
+
+
+def test_guard_fallback_does_not_mask_direct_kill_keyboard_interrupt() -> None:
+    controller = _controller()
+    owner = ("http://guard", "inf-server", 0)
+    primary = KeyboardInterrupt("direct kill interrupted")
+    controller._forked_services.append(owner)
+    controller._service_roles.append("rollout-inf")
+
+    kill = MagicMock(side_effect=[primary, None])
+    with (
+        patch.object(controller, "_kill_forked_service", kill),
+        pytest.raises(KeyboardInterrupt) as exc_info,
+    ):
+        controller.destroy()
+
+    assert exc_info.value is primary
+    assert controller._forked_services == [owner]
+    assert controller._service_roles == []
+
+    with patch.object(controller, "_kill_forked_service", kill):
+        controller.destroy()
+
+    assert controller._forked_services == []
+
+
 def test_terminal_cleanup_reopens_closed_sync_client_for_late_owner() -> None:
     controller = _controller()
     owner = ("http://guard", "late-inf-server", 0)
@@ -351,6 +434,7 @@ def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner() -> None:
     owner = ("http://guard", "late-inf-server", 0)
     killed_owners: list[tuple[str, str, int]] = []
     deleted_roles: list[str] = []
+    terminal_cleanup_done = threading.Event()
 
     def publish_after_timeout(*_args, **_kwargs) -> None:
         initialization_started.set()
@@ -358,12 +442,26 @@ def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner() -> None:
         controller._forked_services.append(owner)
         controller._service_roles.append("rollout-inf")
 
-    controller.scheduler.delete_workers.side_effect = (
-        lambda *, role: deleted_roles.append(role)
-    )
+    def delete_role(*, role: str) -> None:
+        deleted_roles.append(role)
+
+    guarded_initialize = controller._guarded_bg_initialize
+
+    def observe_terminal_cleanup(*args, **kwargs) -> None:
+        try:
+            guarded_initialize(*args, **kwargs)
+        finally:
+            terminal_cleanup_done.set()
+
+    controller.scheduler.delete_workers.side_effect = delete_role
 
     with (
         patch.object(controller, "_bg_initialize", publish_after_timeout),
+        patch.object(
+            controller,
+            "_guarded_bg_initialize",
+            side_effect=observe_terminal_cleanup,
+        ),
         patch.object(controller, "_start_online_callback_server"),
         patch.object(controller, "_stop_online_callback_server"),
         patch.object(
@@ -376,16 +474,234 @@ def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner() -> None:
             controller.initialize("rollout")
         assert initialization_started.is_set()
         assert controller._shutdown_requested.is_set()
-        future = controller._init_future
-        assert future is not None
         release_late_publish.set()
-        future.result(timeout=1.0)
+        assert terminal_cleanup_done.wait(timeout=1.0)
 
     assert killed_owners == [owner]
     assert deleted_roles == ["rollout-inf"]
     assert controller._forked_services == []
     assert controller._service_roles == []
     assert controller._destroyed is True
+
+
+def test_workers_ready_deadline_win_cleans_owner_before_caller_resumes() -> None:
+    controller = _controller()
+    owner = ("http://guard", "completed-inf-server", 0)
+    killed_owners: list[tuple[str, str, int]] = []
+    deleted_roles: list[str] = []
+
+    def publish_before_deadline_caller_resumes(*_args, **_kwargs) -> None:
+        controller._forked_services.append(owner)
+        controller._service_roles.append("completed-rollout-inf")
+
+    def return_timed_out_after_background_finished(*, timeout: float) -> bool:
+        assert timeout == controller.config.workers_ready_timeout
+        future = controller._init_future
+        assert future is not None
+        future.result(timeout=1.0)
+        assert controller._workers_ready.is_set()
+        return False
+
+    controller.scheduler.delete_workers.side_effect = (
+        lambda *, role: deleted_roles.append(role)
+    )
+
+    with (
+        patch.object(
+            controller,
+            "_bg_initialize",
+            side_effect=publish_before_deadline_caller_resumes,
+        ),
+        patch.object(controller, "_start_online_callback_server"),
+        patch.object(controller, "_stop_online_callback_server"),
+        patch.object(
+            controller._workers_ready,
+            "wait",
+            side_effect=return_timed_out_after_background_finished,
+        ),
+        patch.object(
+            controller,
+            "_kill_forked_service",
+            side_effect=lambda *args: killed_owners.append(args),
+        ),
+    ):
+        with pytest.raises(TimeoutError, match="Worker creation timed out"):
+            controller.initialize("rollout")
+
+    assert killed_owners == [owner]
+    assert deleted_roles == ["completed-rollout-inf"]
+    assert controller._forked_services == []
+    assert controller._service_roles == []
+    assert controller._destroyed is True
+
+
+def test_workers_ready_wait_interrupt_requests_terminal_cleanup() -> None:
+    controller = _controller()
+    initialization_started = threading.Event()
+    release_late_publish = threading.Event()
+    owner = ("http://guard", "interrupted-inf-server", 0)
+    captured_futures: list[concurrent.futures.Future] = []
+    killed_owners: list[tuple[str, str, int]] = []
+    deleted_roles: list[str] = []
+
+    def publish_after_interrupt(*_args, **_kwargs) -> None:
+        initialization_started.set()
+        assert release_late_publish.wait(timeout=1.0)
+        controller._forked_services.append(owner)
+        controller._service_roles.append("interrupted-rollout-inf")
+
+    def interrupt_wait(*, timeout: float) -> bool:
+        assert timeout == controller.config.workers_ready_timeout
+        assert initialization_started.wait(timeout=1.0)
+        future = controller._init_future
+        assert future is not None
+        captured_futures.append(future)
+        raise KeyboardInterrupt("startup wait interrupted")
+
+    controller.scheduler.delete_workers.side_effect = (
+        lambda *, role: deleted_roles.append(role)
+    )
+
+    with (
+        patch.object(controller, "_bg_initialize", side_effect=publish_after_interrupt),
+        patch.object(controller, "_start_online_callback_server"),
+        patch.object(controller, "_stop_online_callback_server"),
+        patch.object(controller._workers_ready, "wait", side_effect=interrupt_wait),
+        patch.object(
+            controller,
+            "_kill_forked_service",
+            side_effect=lambda *args: killed_owners.append(args),
+        ),
+    ):
+        with pytest.raises(KeyboardInterrupt, match="startup wait interrupted"):
+            controller.initialize("rollout")
+        assert controller._shutdown_requested.is_set()
+        release_late_publish.set()
+        captured_futures[0].result(timeout=1.0)
+
+    assert killed_owners == [owner]
+    assert deleted_roles == ["interrupted-rollout-inf"]
+    assert controller._forked_services == []
+    assert controller._service_roles == []
+    assert controller._destroyed is True
+
+
+def test_callback_start_failure_is_rolled_back() -> None:
+    controller = _controller()
+    primary = OSError("callback thread start failed after bind")
+
+    def fail_after_publishing_callback_owner() -> None:
+        controller._callback_server = MagicMock()
+        controller._callback_server_thread = MagicMock()
+        raise primary
+
+    with (
+        patch.object(
+            controller,
+            "_start_online_callback_server",
+            side_effect=fail_after_publishing_callback_owner,
+        ),
+        patch.object(controller, "_stop_online_callback_server") as stop_callback,
+        pytest.raises(OSError) as exc_info,
+    ):
+        controller.initialize("rollout")
+
+    assert exc_info.value is primary
+    assert controller._shutdown_requested.is_set()
+    stop_callback.assert_called_once_with()
+
+
+def test_callback_thread_pre_ready_failure_keeps_primary_and_closes_owner() -> None:
+    controller = _controller()
+    primary = OSError("callback event loop creation failed")
+    server = MagicMock()
+
+    with (
+        patch("werkzeug.serving.make_server", return_value=server),
+        patch(
+            "areal.v2.inference_service.controller.controller.asyncio.new_event_loop",
+            side_effect=primary,
+        ),
+        pytest.raises(OSError) as exc_info,
+    ):
+        controller.initialize("rollout")
+
+    assert exc_info.value is primary
+    server.shutdown.assert_not_called()
+    server.server_close.assert_called_once_with()
+    assert controller._callback_server is None
+    assert controller._callback_server_thread is None
+    assert controller._shutdown_requested.is_set()
+
+
+def test_callback_thread_never_ready_times_out_and_closes_without_shutdown() -> None:
+    controller = _controller()
+    controller.config.setup_timeout = 0.01
+    release_server = threading.Event()
+    server = MagicMock()
+    server.serve_forever.side_effect = lambda **_kwargs: release_server.wait(
+        timeout=1.0
+    )
+    server.server_close.side_effect = release_server.set
+
+    with (
+        patch("werkzeug.serving.make_server", return_value=server),
+        pytest.raises(TimeoutError, match="did not enter its serving loop"),
+    ):
+        controller.initialize("rollout")
+
+    server.shutdown.assert_not_called()
+    server.server_close.assert_called_once_with()
+    assert controller._callback_server is None
+    assert controller._callback_server_thread is None
+    assert controller._shutdown_requested.is_set()
+
+
+def test_executor_submit_failure_keeps_primary_when_rollback_fails() -> None:
+    controller = _controller()
+    primary = RuntimeError("executor submit failed")
+    cleanup_error = OSError("callback cleanup failed")
+    executor = MagicMock()
+    executor.submit.side_effect = primary
+
+    with (
+        patch("areal.infra.utils.concurrent.get_executor", return_value=executor),
+        patch.object(controller, "_start_online_callback_server"),
+        patch.object(controller, "destroy", side_effect=cleanup_error),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        controller.initialize("rollout")
+
+    assert exc_info.value is primary
+    assert any(
+        "callback cleanup failed" in note for note in getattr(primary, "__notes__", [])
+    )
+
+
+def test_fast_background_failure_is_not_masked_by_shutdown_wakeup() -> None:
+    controller = _controller()
+    primary = RuntimeError("background startup failed")
+    future = MagicMock()
+    future.done.return_value = False
+    executor = MagicMock()
+
+    def publish_failure_before_returning_future(*_args, **_kwargs):
+        controller._initialization_error = primary
+        controller._shutdown_requested.set()
+        controller._workers_ready.set()
+        return future
+
+    executor.submit.side_effect = publish_failure_before_returning_future
+
+    with (
+        patch("areal.infra.utils.concurrent.get_executor", return_value=executor),
+        patch.object(controller, "_start_online_callback_server"),
+        patch.object(controller, "_stop_online_callback_server"),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        controller.initialize("rollout")
+
+    assert exc_info.value is primary
 
 
 def test_initialize_and_destroy_are_linearized_across_callback_start() -> None:
@@ -446,11 +762,16 @@ def test_initialize_and_destroy_are_linearized_across_callback_start() -> None:
 
     assert not initialize_thread.is_alive()
     assert not destroy_thread.is_alive()
-    assert initialize_errors == []
+    assert len(initialize_errors) <= 1
+    if initialize_errors:
+        assert isinstance(
+            initialize_errors[0],
+            (RuntimeError, concurrent.futures.CancelledError),
+        )
     assert destroy_errors == []
     assert controller._shutdown_requested.is_set()
     assert controller._service_roles == []
-    assert deleted_roles == ["late-role"]
+    assert deleted_roles in ([], ["late-role"])
     assert controller._destroyed is True
 
 

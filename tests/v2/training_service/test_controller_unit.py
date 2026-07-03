@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import threading
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import requests
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.api.io_struct import WeightUpdateMeta
@@ -126,6 +128,7 @@ class TestGatewayTrainControllerInitialization:
         owner = ("http://guard", "late-train-worker", 0)
         killed_owners: list[tuple[str, str, int]] = []
         deleted_roles: list[str] = []
+        terminal_cleanup_done = threading.Event()
 
         def publish_after_timeout(*_args, **_kwargs) -> None:
             initialization_started.set()
@@ -133,12 +136,26 @@ class TestGatewayTrainControllerInitialization:
             controller._forked_services.append(owner)
             controller._service_roles.append("actor-guard")
 
-        scheduler.delete_workers.side_effect = lambda *, role: deleted_roles.append(
-            role
-        )
+        def delete_role(*, role: str) -> None:
+            deleted_roles.append(role)
+
+        guarded_initialize = controller._guarded_bg_initialize
+
+        def observe_terminal_cleanup(*args, **kwargs) -> None:
+            try:
+                guarded_initialize(*args, **kwargs)
+            finally:
+                terminal_cleanup_done.set()
+
+        scheduler.delete_workers.side_effect = delete_role
 
         with (
             patch.object(controller, "_bg_initialize", publish_after_timeout),
+            patch.object(
+                controller,
+                "_guarded_bg_initialize",
+                side_effect=observe_terminal_cleanup,
+            ),
             patch.object(
                 controller,
                 "_kill_forked_service",
@@ -150,15 +167,183 @@ class TestGatewayTrainControllerInitialization:
 
             assert initialization_started.is_set()
             assert controller._shutdown_requested.is_set()
-            future = controller._init_future
-            assert future is not None
             release_late_publish.set()
-            future.result(timeout=1.0)
+            assert terminal_cleanup_done.wait(timeout=1.0)
 
         assert killed_owners == [owner]
         assert deleted_roles == ["actor-guard"]
         assert controller._forked_services == []
         assert controller._service_roles == []
+
+    def test_workers_ready_deadline_win_cleans_owner_before_caller_resumes(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        owner = ("http://guard", "completed-train-worker", 0)
+        killed_owners: list[tuple[str, str, int]] = []
+        deleted_roles: list[str] = []
+
+        def publish_before_deadline_caller_resumes(*_args, **_kwargs) -> None:
+            controller._forked_services.append(owner)
+            controller._service_roles.append("completed-actor-guard")
+
+        def return_timed_out_after_background_finished(*, timeout: float) -> bool:
+            assert timeout == controller.config.workers_ready_timeout
+            future = controller._init_future
+            assert future is not None
+            future.result(timeout=1.0)
+            assert controller._workers_ready.is_set()
+            return False
+
+        scheduler.delete_workers.side_effect = lambda *, role: deleted_roles.append(
+            role
+        )
+
+        with (
+            patch.object(
+                controller,
+                "_bg_initialize",
+                side_effect=publish_before_deadline_caller_resumes,
+            ),
+            patch.object(
+                controller._workers_ready,
+                "wait",
+                side_effect=return_timed_out_after_background_finished,
+            ),
+            patch.object(
+                controller,
+                "_kill_forked_service",
+                side_effect=lambda *args: killed_owners.append(args),
+            ),
+        ):
+            with pytest.raises(TimeoutError, match="Worker creation timed out"):
+                controller.initialize("actor")
+
+        assert killed_owners == [owner]
+        assert deleted_roles == ["completed-actor-guard"]
+        assert controller._forked_services == []
+        assert controller._service_roles == []
+
+    def test_workers_ready_wait_interrupt_requests_terminal_cleanup(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        initialization_started = threading.Event()
+        release_late_publish = threading.Event()
+        owner = ("http://guard", "interrupted-train-worker", 0)
+        captured_futures: list[concurrent.futures.Future] = []
+        killed_owners: list[tuple[str, str, int]] = []
+        deleted_roles: list[str] = []
+
+        def publish_after_interrupt(*_args, **_kwargs) -> None:
+            initialization_started.set()
+            assert release_late_publish.wait(timeout=1.0)
+            controller._forked_services.append(owner)
+            controller._service_roles.append("interrupted-actor-guard")
+
+        def interrupt_wait(*, timeout: float) -> bool:
+            assert timeout == controller.config.workers_ready_timeout
+            assert initialization_started.wait(timeout=1.0)
+            future = controller._init_future
+            assert future is not None
+            captured_futures.append(future)
+            raise KeyboardInterrupt("startup wait interrupted")
+
+        scheduler.delete_workers.side_effect = lambda *, role: deleted_roles.append(
+            role
+        )
+
+        with (
+            patch.object(
+                controller, "_bg_initialize", side_effect=publish_after_interrupt
+            ),
+            patch.object(controller._workers_ready, "wait", side_effect=interrupt_wait),
+            patch.object(
+                controller,
+                "_kill_forked_service",
+                side_effect=lambda *args: killed_owners.append(args),
+            ),
+        ):
+            with pytest.raises(KeyboardInterrupt, match="startup wait interrupted"):
+                controller.initialize("actor")
+            assert controller._shutdown_requested.is_set()
+            release_late_publish.set()
+            captured_futures[0].result(timeout=1.0)
+
+        assert killed_owners == [owner]
+        assert deleted_roles == ["interrupted-actor-guard"]
+        assert controller._forked_services == []
+        assert controller._service_roles == []
+
+    def test_executor_submit_failure_keeps_primary_when_rollback_fails(self):
+        controller = _make_controller()
+        primary = RuntimeError("executor submit failed")
+        cleanup_error = OSError("training cleanup failed")
+        executor = MagicMock()
+        executor.submit.side_effect = primary
+
+        with (
+            patch(f"{MODULE}.get_executor", return_value=executor),
+            patch.object(controller, "destroy", side_effect=cleanup_error),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            controller.initialize("actor")
+
+        assert exc_info.value is primary
+        assert any(
+            "training cleanup failed" in note
+            for note in getattr(primary, "__notes__", [])
+        )
+
+    def test_fast_background_failure_is_not_masked_by_shutdown_wakeup(self):
+        controller = _make_controller()
+        primary = RuntimeError("background startup failed")
+        future = MagicMock()
+        future.done.return_value = False
+        executor = MagicMock()
+
+        def publish_failure_before_returning_future(*_args, **_kwargs):
+            controller._initialization_error = primary
+            controller._shutdown_requested.set()
+            controller._workers_ready.set()
+            return future
+
+        executor.submit.side_effect = publish_failure_before_returning_future
+
+        with (
+            patch(f"{MODULE}.get_executor", return_value=executor),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            controller.initialize("actor")
+
+        assert exc_info.value is primary
+
+    def test_ensure_initialized_surfaces_terminal_background_failure(self):
+        controller = _make_controller()
+        primary = RuntimeError("background startup failed after readiness")
+        controller._init_future = None
+        controller._initialization_error = primary
+
+        with pytest.raises(RuntimeError) as exc_info:
+            controller._ensure_initialized()
+
+        assert exc_info.value is primary
+
+    @pytest.mark.asyncio
+    async def test_async_startup_keeps_primary_when_local_rollback_fails(self):
+        scheduler = MagicMock()
+        scheduler.exp_config = None
+        primary = RuntimeError("guard discovery failed")
+        scheduler.get_workers.side_effect = primary
+        scheduler.delete_workers.side_effect = OSError("guard cleanup failed")
+        controller = _make_controller(scheduler)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await controller._async_initialize("actor")
+
+        assert exc_info.value is primary
+        assert controller._service_roles == ["actor-guard"]
+        assert any(
+            "guard cleanup failed" in note for note in getattr(primary, "__notes__", [])
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("invalid_seed", [-1, 2**32, True])
@@ -589,6 +774,88 @@ class TestGatewayTrainControllerWeightUpdate:
 
 
 class TestGatewayTrainControllerLifecycle:
+    def test_guard_deletion_does_not_mask_unconfirmed_direct_kill(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        owner = ("http://guard", "train-worker", 0)
+        controller._forked_services.append(owner)
+        controller._service_roles.append("actor-guard")
+
+        rejected = MagicMock()
+        rejected.raise_for_status.side_effect = requests.HTTPError("direct kill failed")
+
+        accepted = MagicMock()
+        with (
+            patch("requests.post", return_value=rejected),
+            pytest.raises(requests.HTTPError, match="direct kill failed"),
+        ):
+            controller.destroy()
+
+        scheduler.delete_workers.assert_called_once_with(role="actor-guard")
+        assert controller._forked_services == [owner]
+        assert controller._service_roles == []
+
+        with patch("requests.post", return_value=accepted):
+            controller.destroy()
+
+        assert scheduler.delete_workers.call_count == 1
+        assert controller._forked_services == []
+
+    def test_failed_direct_kill_and_guard_deletion_retain_owners_for_retry(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        owner = ("http://guard", "train-worker", 0)
+        controller._forked_services.append(owner)
+        controller._service_roles.append("actor-guard")
+        rejected = MagicMock()
+        rejected.raise_for_status.side_effect = requests.HTTPError("direct kill failed")
+        accepted = MagicMock()
+        scheduler.delete_workers.side_effect = [
+            OSError("guard delete failed"),
+            None,
+        ]
+
+        with (
+            patch("requests.post", return_value=rejected),
+            pytest.raises(requests.HTTPError, match="direct kill failed"),
+        ):
+            controller.destroy()
+
+        assert controller._forked_services == [owner]
+        assert controller._service_roles == ["actor-guard"]
+
+        with patch("requests.post", return_value=accepted) as post:
+            controller.destroy()
+
+        assert post.call_count == 1
+        assert scheduler.delete_workers.call_count == 2
+        assert controller._forked_services == []
+        assert controller._service_roles == []
+
+    def test_guard_fallback_does_not_mask_direct_kill_keyboard_interrupt(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        owner = ("http://guard", "train-worker", 0)
+        primary = KeyboardInterrupt("direct kill interrupted")
+        controller._forked_services.append(owner)
+        controller._service_roles.append("actor-guard")
+
+        kill = MagicMock(side_effect=[primary, None])
+        with (
+            patch.object(controller, "_kill_forked_service", kill),
+            pytest.raises(KeyboardInterrupt) as exc_info,
+        ):
+            controller.destroy()
+
+        assert exc_info.value is primary
+        assert controller._forked_services == [owner]
+        assert controller._service_roles == []
+
+        with patch.object(controller, "_kill_forked_service", kill):
+            controller.destroy()
+
+        assert controller._forked_services == []
+
     def test_destroy_releases_owned_weight_update_controller_once(self):
         class OwnedWeightUpdateController:
             def __init__(self):
@@ -707,7 +974,7 @@ class TestGatewayTrainControllerLifecycle:
         weight_update_controller = WeightUpdateController()
         weight_update_controller._session = session
         scheduler = MagicMock()
-        scheduler.delete_workers.side_effect = secondary_error
+        scheduler.delete_workers.side_effect = [secondary_error, None]
         controller = _make_controller(scheduler)
         controller._weight_update_ctrl = weight_update_controller
         controller._service_roles = ["actor"]
@@ -722,13 +989,14 @@ class TestGatewayTrainControllerLifecycle:
                 for note in getattr(primary_error, "__notes__", [])
             )
             scheduler.delete_workers.assert_called_once_with(role="actor")
-            assert controller._service_roles == []
+            assert controller._service_roles == ["actor"]
             assert controller._weight_update_ctrl is weight_update_controller
 
             controller.destroy()
 
             assert session.close_count == 2
             assert controller._weight_update_ctrl is None
+            assert controller._service_roles == []
         finally:
             if controller._weight_update_ctrl is not None:
                 controller.destroy()
