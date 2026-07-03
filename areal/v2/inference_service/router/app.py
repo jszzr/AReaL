@@ -30,6 +30,7 @@ from areal.v2.inference_service.router.state import (
     ModelRegistry,
     SessionRegistry,
     WorkerRegistry,
+    canonical_worker_addr,
 )
 from areal.v2.inference_service.router.strategies import get_strategy
 
@@ -316,6 +317,7 @@ def create_app(config: RouterConfig) -> FastAPI:
         """Return the active or last-retired epoch for one worker address."""
 
         _require_admin_key(request, config.admin_api_key)
+        worker_addr = canonical_worker_addr(worker_addr)
         status, worker_id = await worker_registry.get_epoch(worker_addr)
         return WorkerEpochResponse(
             worker_addr=worker_addr,
@@ -430,13 +432,13 @@ def create_app(config: RouterConfig) -> FastAPI:
                     status_code=422,
                     detail="new_session cannot be combined with api_key or session_id",
                 )
-            all_workers = await worker_registry.get_all_workers()
-            candidates = _filter_by_model(all_workers, model_addrs)
+            healthy_workers = await worker_registry.get_healthy_workers()
+            candidates = _filter_by_model(healthy_workers, model_addrs)
             if not candidates:
-                raise HTTPException(status_code=503, detail="No registered workers")
+                raise HTTPException(status_code=503, detail="No healthy workers")
             worker = strategy.pick(candidates)
             if worker is None:
-                raise HTTPException(status_code=503, detail="No registered workers")
+                raise HTTPException(status_code=503, detail="No healthy workers")
             return RouteResponse(
                 worker_addr=worker.worker_addr,
                 worker_id=worker.worker_id,
@@ -462,13 +464,13 @@ def create_app(config: RouterConfig) -> FastAPI:
 
         # Step C: model-only routing (no api_key/session_id)
         if body.api_key is None and model_addrs is not None:
-            all_workers = await worker_registry.get_all_workers()
-            candidates = _filter_by_model(all_workers, model_addrs)
+            healthy_workers = await worker_registry.get_healthy_workers()
+            candidates = _filter_by_model(healthy_workers, model_addrs)
             if not candidates:
-                raise HTTPException(status_code=503, detail="No registered workers")
+                raise HTTPException(status_code=503, detail="No healthy workers")
             worker = strategy.pick(candidates)
             if worker is None:
-                raise HTTPException(status_code=503, detail="No registered workers")
+                raise HTTPException(status_code=503, detail="No healthy workers")
             info = (
                 await model_registry.get(body.model)
                 if body.model
@@ -524,13 +526,13 @@ def create_app(config: RouterConfig) -> FastAPI:
                         worker_addr=pinned.worker_addr,
                         worker_id=pinned.worker_id,
                     )
-                all_workers = await worker_registry.get_all_workers()
-                candidates = _filter_by_model(all_workers, model_addrs)
+                healthy_workers = await worker_registry.get_healthy_workers()
+                candidates = _filter_by_model(healthy_workers, model_addrs)
                 if not candidates:
-                    raise HTTPException(status_code=503, detail="No registered workers")
+                    raise HTTPException(status_code=503, detail="No healthy workers")
                 worker = strategy.pick(candidates)
                 if worker is None:
-                    raise HTTPException(status_code=503, detail="No registered workers")
+                    raise HTTPException(status_code=503, detail="No healthy workers")
                 await session_registry.register_session(
                     body.api_key,
                     "__hitl__",
@@ -661,7 +663,7 @@ def create_app(config: RouterConfig) -> FastAPI:
     @app.post("/register_model", response_model=RegisterModelResponse)
     async def register_model(body: RegisterModelRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
-        addrs = body.data_proxy_addrs
+        addrs = [canonical_worker_addr(addr) for addr in body.data_proxy_addrs]
         if not addrs:
             healthy = await worker_registry.get_healthy_workers()
             if not healthy:

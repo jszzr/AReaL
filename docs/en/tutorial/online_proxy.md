@@ -204,10 +204,16 @@ The relevant programmatic settings are `GatewayConfig.max_request_replay_records
 - Router registration is bound to a worker registration epoch, preventing a delayed
   response from reviving sessions after a process restarts at the same address.
 - Data Proxy health replies include that immutable worker ID. Router health probes
-  accept a `200` only when the returned ID matches the registered epoch.
+  accept a `200` only when the returned ID matches the registered epoch. A new worker
+  remains unroutable until that check succeeds; unpinned and new-session routes select
+  only healthy workers.
 - The inference CLI reads the admin-only `/worker_epoch` snapshot once after a new proxy
   becomes healthy and uses it as the registration CAS predecessor. A `409` fails the
   launch instead of rereading and overwriting a concurrent successor.
+- CLI model state records `REGISTERING`, `ACTIVE`, or `CLEANUP_PENDING`. If a Router or
+  Gateway success response is lost and exact cleanup cannot be proven, the CLI retains
+  both the local processes and their worker IDs so `areal inf deregister` can safely
+  retry cleanup.
 - An unclaimed lease expires after the controller-owned timeout. Once callback export
   begins, the lease enters a delivered phase whose deadline covers the bounded Gateway
   forward; a successful destructive export completes it. Cleanup independently retries

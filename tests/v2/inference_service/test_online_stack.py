@@ -172,6 +172,12 @@ async def online_stack(monkeypatch):
             headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         )
         assert reg_resp.status_code == 200
+        assert (
+            await router_app.state.worker_registry.update_health(
+                DATA_PROXY_ADDR, DATA_PROXY_WORKER_ID, True
+            )
+            is True
+        )
 
         async def _query_router(
             router_addr: str,

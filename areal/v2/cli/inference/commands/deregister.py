@@ -8,7 +8,7 @@ from areal.v2.cli.client import ServiceHTTPError, ServiceUnreachable
 from areal.v2.cli.inference.client import RouterClient
 from areal.v2.cli.inference.common import logger
 from areal.v2.cli.inference.lifecycle import inf_lifecycle
-from areal.v2.cli.inference.state import store
+from areal.v2.cli.inference.state import MODEL_ACTIVE, MODEL_CLEANUP_PENDING, store
 from areal.v2.cli.process import kill_pids
 
 
@@ -35,14 +35,21 @@ def do_deregister(
             )
         entry = state.models[model_name]
         router = RouterClient(state.router_url, state.admin_api_key)
+        previous_lifecycle_state = entry.lifecycle_state
+
+        # Persist destructive intent before the first remote mutation. A retry
+        # can now finish exact cleanup even if this CLI dies after a response is
+        # lost.
+        entry.lifecycle_state = MODEL_CLEANUP_PENDING
+        entry.gateway_model_cleanup_pending = True
+        for replica in entry.replicas:
+            replica.router_cleanup_pending = True
+        state.model_state.save()
 
         # Router unregister → kill data-proxies → kill workers (same data-flow
         # order as terminate_runtime_state).
         legacy_replicas = [r for r in entry.replicas if r.router_worker_id is None]
         if legacy_replicas:
-            for replica in legacy_replicas:
-                replica.router_cleanup_pending = True
-            state.model_state.save()
             legacy_addrs = ", ".join(r.data_proxy.addr for r in legacy_replicas)
             raise click.ClickException(
                 "legacy model state has no router_worker_id for data-proxy "
@@ -67,6 +74,7 @@ def do_deregister(
 
             if response.get("removed") is True:
                 r.router_cleanup_pending = False
+                r.router_registration_ambiguous = False
                 continue
 
             # A previous exact unregister may have committed even if its
@@ -85,6 +93,20 @@ def do_deregister(
                 epoch.get("status") == "retired"
                 and epoch.get("worker_id") == r.router_worker_id
             ):
+                r.router_cleanup_pending = False
+                r.router_registration_ambiguous = False
+                continue
+            if (
+                not r.router_registration_ambiguous
+                and previous_lifecycle_state != MODEL_ACTIVE
+                and (
+                    epoch.get("status") == "unseen"
+                    or epoch.get("worker_id") != r.router_worker_id
+                )
+            ):
+                # A durable REGISTERING/CLEANUP_PENDING entry may describe an
+                # intent that never reached Router. An authenticated epoch
+                # snapshot proving that exact ID absent is sufficient cleanup.
                 r.router_cleanup_pending = False
                 continue
 
@@ -112,13 +134,14 @@ def do_deregister(
             model_cleanup_error = exc
 
         if model_cleanup_error is not None:
-            for r in entry.replicas:
-                r.router_cleanup_pending = True
             state.model_state.save()
             raise click.ClickException(
                 "router model cleanup is pending; local processes and model state "
                 f"were retained for a safe retry: {model_cleanup_error}"
             )
+
+        entry.gateway_model_cleanup_pending = False
+        state.model_state.save()
 
         proxy_pids = [r.data_proxy.pid for r in entry.replicas if r.data_proxy.pid > 0]
         worker_pids = [r.worker.pid for r in entry.replicas if r.worker.pid > 0]

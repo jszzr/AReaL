@@ -20,6 +20,9 @@ from areal.v2.cli.state import (
 from areal.v2.cli.utils import file_lock
 
 INF_NAMESPACE = "inf"
+MODEL_REGISTERING = "REGISTERING"
+MODEL_ACTIVE = "ACTIVE"
+MODEL_CLEANUP_PENDING = "CLEANUP_PENDING"
 
 
 class InferenceStateStore(NamespacedStateStore):
@@ -117,6 +120,9 @@ __all__ = [
     "DEFAULT_SERVICE",
     "INF_NAMESPACE",
     "InferenceStateStore",
+    "MODEL_ACTIVE",
+    "MODEL_CLEANUP_PENDING",
+    "MODEL_REGISTERING",
     "ModelEntry",
     "ModelReplica",
     "ModelState",
@@ -144,12 +150,15 @@ class ModelReplica:
     worker: TaskHandle
     router_worker_id: str | None = None
     router_cleanup_pending: bool = False
+    router_registration_ambiguous: bool = False
 
 
 @dataclass
 class ModelEntry:
     backend: str = ""
     replicas: list[ModelReplica] = field(default_factory=list)
+    lifecycle_state: str = MODEL_ACTIVE
+    gateway_model_cleanup_pending: bool = False
 
     def all_workers(self) -> list[TaskHandle]:
         return [r.worker for r in self.replicas]
@@ -168,10 +177,20 @@ class ModelEntry:
                 worker=_handle_from_dict(r["worker"]),
                 router_worker_id=r.get("router_worker_id"),
                 router_cleanup_pending=bool(r.get("router_cleanup_pending", False)),
+                router_registration_ambiguous=bool(
+                    r.get("router_registration_ambiguous", False)
+                ),
             )
             for r in raw.get("replicas", [])
         ]
-        return cls(backend=raw.get("backend", ""), replicas=replicas)
+        return cls(
+            backend=raw.get("backend", ""),
+            replicas=replicas,
+            lifecycle_state=raw.get("lifecycle_state", MODEL_ACTIVE),
+            gateway_model_cleanup_pending=bool(
+                raw.get("gateway_model_cleanup_pending", False)
+            ),
+        )
 
 
 @dataclass

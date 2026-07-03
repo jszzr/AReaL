@@ -73,7 +73,21 @@ class TestWorkerRegistry:
         assert len(workers) == 1
         assert workers[0].worker_addr == WORKER_1
         assert workers[0].worker_id == WORKER_ID_1
-        assert workers[0].is_healthy is True
+        assert workers[0].is_healthy is False
+
+    @pytest.mark.asyncio
+    async def test_trailing_slash_alias_is_one_worker_epoch(self):
+        reg = WorkerRegistry()
+        assert await reg.register(WORKER_1, WORKER_ID_1, None) == "created"
+
+        with pytest.raises(ValueError, match="epoch mismatch"):
+            await reg.register(f"{WORKER_1}/", WORKER_ID_2, None)
+
+        assert await reg.get_epoch(f"{WORKER_1}/") == ("active", WORKER_ID_1)
+        workers = await reg.get_all_workers()
+        assert [(worker.worker_addr, worker.worker_id) for worker in workers] == [
+            (WORKER_1, WORKER_ID_1)
+        ]
 
     @pytest.mark.asyncio
     async def test_register_duplicate_noop(self):
@@ -111,6 +125,7 @@ class TestWorkerRegistry:
         await reg.register(WORKER_1, WORKER_ID_1, None)
         await reg.register(WORKER_2, WORKER_ID_2, None)
         await reg.update_health(WORKER_1, WORKER_ID_1, False)
+        await reg.update_health(WORKER_2, WORKER_ID_2, True)
         healthy = await reg.get_healthy_workers()
         assert len(healthy) == 1
         assert healthy[0].worker_addr == WORKER_2
@@ -153,7 +168,7 @@ class TestWorkerRegistry:
         current = await reg.get_by_addr(WORKER_1)
         assert current is not None
         assert current.worker_id == "worker-1-epoch-2"
-        assert current.is_healthy is True
+        assert current.is_healthy is False
 
     @pytest.mark.asyncio
     async def test_get_by_id(self):
@@ -328,6 +343,13 @@ async def register_workers(client, *worker_addrs: str) -> None:
             headers=admin_headers(),
         )
         assert response.status_code == 200
+        worker_id = worker_id_for(worker_addr)
+        assert (
+            await client._transport.app.state.worker_registry.update_health(
+                worker_addr, worker_id, True
+            )
+            is True
+        )
 
 
 class TestRouterEndpoints:
@@ -379,11 +401,7 @@ class TestRouterEndpoints:
 
     @pytest.mark.asyncio
     async def test_hitl_route_binds_first_use(self, client):
-        await client.post(
-            "/register",
-            json=register_payload(WORKER_1),
-            headers=admin_headers(),
-        )
+        await register_workers(client, WORKER_1)
 
         resp = await client.post(
             "/route",
@@ -504,6 +522,46 @@ class TestRouterEndpoints:
         assert (
             await client.get("/worker_epoch", params={"worker_addr": WORKER_1})
         ).status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_worker_epoch_canonicalizes_trailing_slash_alias(self, client):
+        assert (
+            await client.post(
+                "/register", json=register_payload(WORKER_1), headers=admin_headers()
+            )
+        ).status_code == 200
+
+        epoch = await client.get(
+            "/worker_epoch",
+            params={"worker_addr": f"{WORKER_1}/"},
+            headers=admin_headers(),
+        )
+
+        assert epoch.json() == {
+            "worker_addr": WORKER_1,
+            "status": "active",
+            "worker_id": WORKER_ID_1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_new_session_rejects_worker_until_matching_health_probe(self, client):
+        response = await client.post(
+            "/register", json=register_payload(WORKER_1), headers=admin_headers()
+        )
+        assert response.status_code == 200
+
+        unavailable = await client.post(
+            "/route", json={"new_session": True}, headers=admin_headers()
+        )
+        assert unavailable.status_code == 503
+
+        registry = client._transport.app.state.worker_registry
+        assert await registry.update_health(WORKER_1, WORKER_ID_1, True) is True
+        available = await client.post(
+            "/route", json={"new_session": True}, headers=admin_headers()
+        )
+        assert available.status_code == 200
+        assert available.json()["worker_id"] == WORKER_ID_1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("worker_id", ["", "x" * 129])
@@ -971,16 +1029,7 @@ class TestRouterEndpoints:
 
     @pytest.mark.asyncio
     async def test_route_admin_key_sticky_hitl(self, client):
-        await client.post(
-            "/register",
-            json=register_payload(WORKER_1),
-            headers=admin_headers(),
-        )
-        await client.post(
-            "/register",
-            json=register_payload(WORKER_2),
-            headers=admin_headers(),
-        )
+        await register_workers(client, WORKER_1, WORKER_2)
 
         resp1 = await client.post(
             "/route",
@@ -1002,12 +1051,7 @@ class TestRouterEndpoints:
 
     @pytest.mark.asyncio
     async def test_route_new_sessions_are_unpinned_and_round_robin(self, client):
-        for worker_addr in (WORKER_1, WORKER_2):
-            await client.post(
-                "/register",
-                json=register_payload(worker_addr),
-                headers=admin_headers(),
-            )
+        await register_workers(client, WORKER_1, WORKER_2)
 
         responses = [
             await client.post(
@@ -1080,7 +1124,7 @@ class TestRouterEndpoints:
             headers=admin_headers(),
         )
         assert resp.status_code == 503
-        assert "No registered workers" in resp.json()["detail"]
+        assert "No healthy workers" in resp.json()["detail"]
 
     # ----- /route — pinned worker unhealthy -----
 
@@ -2041,7 +2085,7 @@ class TestRouterEndpoints:
         assert len(data["workers"]) == 2
         addrs = {w["addr"] for w in data["workers"]}
         assert addrs == {WORKER_1, WORKER_2}
-        assert all(w["healthy"] is True for w in data["workers"])
+        assert all(w["healthy"] is False for w in data["workers"])
         assert all("worker_id" in w for w in data["workers"])
         assert all(isinstance(w["worker_id"], str) for w in data["workers"])
 

@@ -71,6 +71,7 @@ def wait_http_health(
     label: str,
     poll_interval: float = 0.5,
     request_timeout: float = 2.0,
+    expected_worker_id: str | None = None,
 ) -> None:
     """Poll ``GET <url>/health`` until it returns < 5xx.
 
@@ -88,9 +89,28 @@ def wait_http_health(
             with urllib.request.urlopen(
                 f"{url.rstrip('/')}/health", timeout=request_timeout
             ) as resp:
+                if expected_worker_id is not None:
+                    payload = json.loads(resp.read().decode())
+                    if (
+                        resp.status == 200
+                        and isinstance(payload, dict)
+                        and payload.get("status") == "ok"
+                        and payload.get("worker_id") == expected_worker_id
+                    ):
+                        return
+                    raise ValueError(
+                        f"health identity mismatch: expected {expected_worker_id!r}, "
+                        f"got {payload!r}"
+                    )
                 if resp.status < 500:
                     return
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+        except (
+            urllib.error.URLError,
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
             last_err = exc
             time.sleep(poll_interval)
     raise click.ClickException(f"{label} did not become healthy: {last_err}")

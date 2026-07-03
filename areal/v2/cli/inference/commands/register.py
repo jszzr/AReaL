@@ -48,6 +48,13 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
                 f"model {model_name!r} already registered in service {state.service!r}"
             )
 
+        def persist_entry(entry):
+            if entry is None:
+                state.model_state.models.pop(model_name, None)
+            else:
+                state.model_state.models[model_name] = entry
+            state.model_state.save()
+
         entry = register_model(
             model_name=model_name,
             opts=opts,
@@ -57,6 +64,7 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
             admin_api_key=state.admin_api_key,
             scheduler_backend=state.backend,
             occupied_gpus=state.model_state.occupied_gpus(),
+            persist_entry=persist_entry,
         )
         state.model_state.models[model_name] = entry
         state.model_state.save()

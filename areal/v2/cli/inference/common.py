@@ -11,6 +11,7 @@ and TaskHandle column formatters.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -30,6 +31,9 @@ from areal.v2.cli.inference.scheduler import (
     build_scheduler,
 )
 from areal.v2.cli.inference.state import (
+    MODEL_ACTIVE,
+    MODEL_CLEANUP_PENDING,
+    MODEL_REGISTERING,
     ModelEntry,
     ModelReplica,
     RuntimeState,
@@ -171,6 +175,54 @@ def _read_worker_predecessor(router: RouterClient, addr: str) -> str | None:
     )
 
 
+def _confirm_worker_cleanup(
+    router: RouterClient,
+    addr: str,
+    worker_id: str,
+    *,
+    require_exact_tombstone: bool = False,
+) -> bool:
+    """Return true only when the exact generated incarnation is no longer active."""
+
+    try:
+        response = router.unregister_worker(addr, worker_id)
+        if response.get("removed") is True:
+            return True
+    except Exception as exc:
+        logger.warning(
+            "router rollback unregister %s (id=%s) failed: %s",
+            addr,
+            worker_id,
+            exc,
+        )
+
+    try:
+        epoch = router.get_worker_epoch(addr)
+    except Exception as exc:
+        logger.warning(
+            "router rollback epoch verification %s (id=%s) failed: %s",
+            addr,
+            worker_id,
+            exc,
+        )
+        return False
+    if epoch.get("worker_addr") != addr:
+        return False
+    status = epoch.get("status")
+    epoch_worker_id = epoch.get("worker_id")
+    if require_exact_tombstone:
+        return status == "retired" and epoch_worker_id == worker_id
+    if status == "active":
+        return (
+            isinstance(epoch_worker_id, str)
+            and bool(epoch_worker_id)
+            and epoch_worker_id != worker_id
+        )
+    if status == "retired":
+        return isinstance(epoch_worker_id, str) and bool(epoch_worker_id)
+    return status == "unseen" and epoch_worker_id is None
+
+
 def register_internal(
     *,
     model: str,
@@ -186,6 +238,7 @@ def register_internal(
     router: RouterClient,
     log_dir: Path,
     scheduler: Scheduler,
+    persist_entry: Callable[[ModelEntry | None], None] | None = None,
 ) -> list[ModelReplica]:
     engine, tp, dp, pp = parse_backend_spec(backend)
     if pp > 1:
@@ -198,6 +251,12 @@ def register_internal(
     generated_router_workers: list[tuple[str, str]] = []
     registration_intents: list[tuple[str, str, str | None]] = []
     proxy_addrs_seen: set[str] = set()
+    entry: ModelEntry | None = None
+    gateway_attempted = False
+
+    def _persist(value: ModelEntry | None) -> None:
+        if persist_entry is not None:
+            persist_entry(value)
 
     try:
         for rank in range(dp):
@@ -273,6 +332,7 @@ def register_internal(
                 timeout=30.0,
                 label=f"data-proxy {rank}",
                 poll_interval=1.0,
+                expected_worker_id=router_worker_id,
             )
             predecessor_worker_id = _read_worker_predecessor(router, proxy_addr)
             registration_intents.append(
@@ -287,18 +347,43 @@ def register_internal(
                 )
             )
 
+        entry = ModelEntry(
+            backend=backend,
+            replicas=replicas,
+            lifecycle_state=MODEL_REGISTERING,
+        )
+        for replica in replicas:
+            replica.router_cleanup_pending = True
+        _persist(entry)
+
         proxy_addrs = [addr for addr, _, _ in registration_intents]
         for addr, worker_id, predecessor_worker_id in registration_intents:
+            replica = next(
+                replica
+                for replica in replicas
+                if replica.data_proxy.addr.rstrip("/") == addr
+                and replica.router_worker_id == worker_id
+            )
+            replica.router_registration_ambiguous = True
+            _persist(entry)
             try:
                 response = router.register_worker(
                     addr,
                     worker_id,
                     predecessor_worker_id,
                 )
-            except (ServiceUnreachable, ServiceHTTPError) as exc:
+            except ServiceUnreachable as exc:
                 raise click.ClickException(
                     f"router register_worker {addr} failed: {exc}"
                 ) from exc
+            except ServiceHTTPError as exc:
+                replica.router_registration_ambiguous = False
+                _persist(entry)
+                raise click.ClickException(
+                    f"router register_worker {addr} failed: {exc}"
+                ) from exc
+            replica.router_registration_ambiguous = False
+            _persist(entry)
             echoed_worker_id = response.get("worker_id")
             if echoed_worker_id != worker_id:
                 raise click.ClickException(
@@ -306,6 +391,9 @@ def register_internal(
                     f"{echoed_worker_id!r}; expected {worker_id!r}"
                 )
 
+        entry.gateway_model_cleanup_pending = True
+        _persist(entry)
+        gateway_attempted = True
         try:
             gateway.register_model(
                 {
@@ -318,24 +406,80 @@ def register_internal(
         except (ServiceUnreachable, ServiceHTTPError) as exc:
             raise click.ClickException(f"gateway register_model failed: {exc}") from exc
 
+        for replica in replicas:
+            replica.router_cleanup_pending = False
+        entry.gateway_model_cleanup_pending = False
+        entry.lifecycle_state = MODEL_ACTIVE
+        _persist(entry)
+
     except BaseException:
+        cleanup_by_identity: dict[tuple[str, str], bool] = {}
         for addr, worker_id in reversed(generated_router_workers):
-            try:
-                router.unregister_worker(addr, worker_id)
-            except Exception as exc:
-                logger.warning(
-                    "router rollback unregister %s (id=%s) failed: %s",
-                    addr,
-                    worker_id,
-                    exc,
+            matching_replica = next(
+                (
+                    replica
+                    for replica in replicas
+                    if replica.data_proxy.addr.rstrip("/") == addr
+                    and replica.router_worker_id == worker_id
+                ),
+                None,
+            )
+            cleanup_by_identity[(addr, worker_id)] = _confirm_worker_cleanup(
+                router,
+                addr,
+                worker_id,
+                require_exact_tombstone=(
+                    matching_replica is not None
+                    and matching_replica.router_registration_ambiguous
+                ),
+            )
+
+        if entry is not None:
+            for replica in replicas:
+                assert replica.router_worker_id is not None
+                identity = (
+                    replica.data_proxy.addr.rstrip("/"),
+                    replica.router_worker_id,
                 )
-        if spawned_handles:
+                replica.router_cleanup_pending = not cleanup_by_identity.get(
+                    identity, False
+                )
+                if not replica.router_cleanup_pending:
+                    replica.router_registration_ambiguous = False
+
+            model_cleanup_confirmed = not gateway_attempted
+            if gateway_attempted:
+                try:
+                    router.remove_model(model)
+                    model_cleanup_confirmed = True
+                except ServiceHTTPError as exc:
+                    model_cleanup_confirmed = exc.status == 404
+                except Exception as exc:
+                    logger.warning(
+                        "router rollback remove_model %s failed: %s", model, exc
+                    )
+            entry.gateway_model_cleanup_pending = not model_cleanup_confirmed
+
+        cleanup_pending = entry is not None and (
+            entry.gateway_model_cleanup_pending
+            or any(replica.router_cleanup_pending for replica in replicas)
+        )
+        if cleanup_pending:
+            entry.lifecycle_state = MODEL_CLEANUP_PENDING
+            _persist(entry)
+            logger.error(
+                "internal register failed with remote cleanup pending; "
+                "retaining %d spawned worker(s)",
+                len(spawned_handles),
+            )
+        elif spawned_handles:
             logger.error(
                 "internal register failed; killing %d spawned worker(s)",
                 len(spawned_handles),
             )
             pids = [h.pid for h in spawned_handles if h.pid > 0]
             kill_pids(pids, grace_s=10.0)
+            _persist(None)
         raise
 
     return replicas
@@ -358,6 +502,7 @@ def register_model(
     admin_api_key: str,
     scheduler_backend: str,
     occupied_gpus: set[int],
+    persist_entry: Callable[[ModelEntry | None], None] | None = None,
 ) -> ModelEntry:
     """Validate registration opts and spawn the model's worker + data-proxy
     fleet. The returned ModelEntry is meant to be slotted into model_state
@@ -380,6 +525,7 @@ def register_model(
         router=router,
         log_dir=log_dir,
         scheduler=scheduler,
+        persist_entry=persist_entry,
     )
     return ModelEntry(backend=opts["backend"], replicas=replicas)
 

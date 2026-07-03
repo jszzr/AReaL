@@ -247,6 +247,12 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             },
             headers=admin_headers(),
         )
+        assert (
+            await router_app.state.worker_registry.update_health(
+                WORKER_ADDR, WORKER_ID, True
+            )
+            is True
+        )
 
         async def _register_model_in_router(
             router_addr: str,

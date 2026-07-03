@@ -176,9 +176,12 @@ Proxy。只有参数变化或真正的新导出才使用新的 ID。
 - 新会话独立分配；创建后，会话密钥固定路由到所属 worker。
 - session ID 包含全局唯一的 group 身份，Router 会拒绝 ID 或密钥所有权冲突。
 - Router 注册绑定 worker 的注册 epoch，避免进程在同一地址重启后被延迟响应复活旧会话。
-- Data Proxy 的健康响应会返回不可变 worker ID；Router 只会把 ID 与已注册 epoch 相同的 `200` 视为健康。
+- Data Proxy 的健康响应会返回不可变 worker ID；Router 只会把 ID 与已注册 epoch 相同的 `200` 视为健康。新 worker
+  在通过该检查前不会参与路由；未固定和新会话路由只选择健康 worker。
 - 新 proxy 健康后，推理 CLI 只读取一次管理员端点 `/worker_epoch`，并将其作为注册 CAS 的 predecessor。 如果返回
   `409`，本次启动直接失败，不会重读后覆盖并发 successor。
+- CLI 模型状态会记录 `REGISTERING`、`ACTIVE` 或 `CLEANUP_PENDING`。如果 Router 或 Gateway 的成功响应丢失，且无法
+  证明精确清理已经完成，CLI 会保留本地进程及其 worker ID，使 `areal inf deregister` 能够安全重试清理。
 - 尚未领取的 lease 在 controller 持有的超时后过期。callback 导出开始后，lease 进入 delivered 阶段，其新期限 覆盖有界的
   Gateway 转发；破坏性导出成功后进入 completed。worker 取消和 Router 撤销会独立重试。
 - 同一进程内不会静默淘汰 start/export request ID；响应 payload 会压缩为返回 `410` 的 fence，容量耗尽则对 新 ID 背压。

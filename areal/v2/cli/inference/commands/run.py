@@ -166,6 +166,14 @@ def do_run(opts: dict) -> int:
 
         if opts["model"]:
             try:
+
+                def persist_entry(entry):
+                    if entry is None:
+                        model_state.models.pop(opts["model"], None)
+                    else:
+                        model_state.models[opts["model"]] = entry
+                    model_state.save()
+
                 entry = register_model(
                     model_name=opts["model"],
                     opts=opts,
@@ -175,6 +183,7 @@ def do_run(opts: dict) -> int:
                     admin_api_key=opts["admin_api_key"],
                     scheduler_backend=backend,
                     occupied_gpus=model_state.occupied_gpus(),
+                    persist_entry=persist_entry,
                 )
                 model_state.models[opts["model"]] = entry
                 model_state.save()

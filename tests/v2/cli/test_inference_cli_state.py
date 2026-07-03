@@ -113,6 +113,59 @@ def test_model_state_round_trips_pending_router_cleanup(tmp_path, monkeypatch):
     assert loaded.models["m"].replicas[0].router_cleanup_pending is True
 
 
+def test_model_state_round_trips_ambiguous_router_registration(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    replica = _replica(router_worker_id="proxy-incarnation-1")
+    replica.router_registration_ambiguous = True
+    ModelState(
+        service="svc",
+        models={"m": ModelEntry(backend="sglang:d1", replicas=[replica])},
+    ).save()
+
+    loaded = ModelState.load("svc")
+
+    assert loaded.models["m"].replicas[0].router_registration_ambiguous is True
+
+
+def test_model_state_round_trips_registration_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    replica = _replica(router_worker_id="proxy-incarnation-1")
+    replica.router_cleanup_pending = True
+    ModelState(
+        service="svc",
+        models={
+            "m": ModelEntry(
+                backend="sglang:d1",
+                replicas=[replica],
+                lifecycle_state="CLEANUP_PENDING",
+                gateway_model_cleanup_pending=True,
+            )
+        },
+    ).save()
+
+    loaded = ModelState.load("svc").models["m"]
+
+    assert loaded.lifecycle_state == "CLEANUP_PENDING"
+    assert loaded.gateway_model_cleanup_pending is True
+
+
+def test_model_state_loads_legacy_entry_as_active(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    store.models_state_path("svc").write_text(
+        json.dumps(
+            {
+                "service": "svc",
+                "models": {"m": {"backend": "sglang:d1", "replicas": []}},
+            }
+        )
+    )
+
+    loaded = ModelState.load("svc").models["m"]
+
+    assert loaded.lifecycle_state == "ACTIVE"
+    assert loaded.gateway_model_cleanup_pending is False
+
+
 def test_model_state_loads_legacy_replica_without_router_worker_id(
     tmp_path, monkeypatch
 ):

@@ -99,7 +99,7 @@ class TestRouterExternalEndpoints:
             json={
                 "model": "ext-1",
                 "url": "http://ext-api",
-                "data_proxy_addrs": [WORKER_ADDR],
+                "data_proxy_addrs": [f"{WORKER_ADDR}/"],
             },
             headers=admin_headers(),
         )
@@ -137,6 +137,12 @@ class TestRouterExternalEndpoints:
             },
             headers=admin_headers(),
         )
+        assert (
+            await router_client._transport.app.state.worker_registry.update_health(
+                WORKER_ADDR, WORKER_ID, True
+            )
+            is True
+        )
         await router_client.post(
             "/register_model",
             json={
@@ -146,7 +152,6 @@ class TestRouterExternalEndpoints:
             },
             headers=admin_headers(),
         )
-
         resp = await router_client.post(
             "/route",
             json={"model": "ext-1"},
@@ -688,6 +693,12 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
                 "expected_worker_id": None,
             },
             headers=admin_headers(),
+        )
+        assert (
+            await router_app.state.worker_registry.update_health(
+                WORKER_ADDR, WORKER_ID, True
+            )
+            is True
         )
 
         gateway_config = GatewayConfig(

@@ -12,13 +12,22 @@ import time
 from dataclasses import dataclass, field
 
 
+def canonical_worker_addr(worker_addr: str) -> str:
+    """Return the single registry key used for one HTTP worker endpoint."""
+
+    canonical = worker_addr.rstrip("/")
+    if not canonical:
+        raise ValueError("Worker address must not be empty")
+    return canonical
+
+
 @dataclass
 class WorkerInfo:
     """A registered data proxy worker."""
 
     worker_id: str
     worker_addr: str
-    is_healthy: bool = True
+    is_healthy: bool = False
     active_requests: int = 0
     registered_at: float = field(default_factory=time.time)
     registered_from_worker_id: str | None = field(default=None, repr=False)
@@ -52,6 +61,7 @@ class WorkerRegistry:
         transitions raise ``ValueError`` without changing registry state.
         """
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             current = self._workers.get(worker_addr)
             if current is not None:
@@ -110,6 +120,7 @@ class WorkerRegistry:
     async def unregister(self, worker_addr: str, worker_id: str) -> bool:
         """Remove only the exact active incarnation, preserving its tombstone."""
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             current = self._workers.get(worker_addr)
             if current is None or current.worker_id != worker_id:
@@ -127,12 +138,14 @@ class WorkerRegistry:
             return self._workers.get(addr)
 
     async def get_by_addr(self, worker_addr: str) -> WorkerInfo | None:
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             return self._workers.get(worker_addr)
 
     async def get_epoch(self, worker_addr: str) -> tuple[str, str | None]:
         """Return ``(status, worker_id)`` for one canonical address."""
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             current = self._workers.get(worker_addr)
             if current is not None:
@@ -147,6 +160,7 @@ class WorkerRegistry:
     ) -> bool:
         """Set health only if the probe belongs to the active incarnation."""
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             w = self._workers.get(worker_addr)
             if w is None or w.worker_id != expected_worker_id:
@@ -170,6 +184,7 @@ class WorkerRegistry:
             return list(self._workers.keys())
 
     async def contains(self, worker_addr: str) -> bool:
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             return worker_addr in self._workers
 
@@ -219,6 +234,7 @@ class SessionRegistry:
     ) -> None:
         """Atomically register a batch, rejecting key or ID ownership changes."""
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             batch_ids: dict[str, str] = {}
             batch_keys: dict[str, str] = {}
@@ -313,6 +329,7 @@ class SessionRegistry:
 
         Returns the number of session keys removed.
         """
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             keys_to_remove = [
                 k
@@ -440,6 +457,7 @@ class ModelRegistry:
         api_key: str | None,
         data_proxy_addrs: list[str],
     ) -> None:
+        data_proxy_addrs = [canonical_worker_addr(addr) for addr in data_proxy_addrs]
         async with self._lock:
             self._models[name] = ModelInfo(
                 name=name,
@@ -490,6 +508,7 @@ class GroupRegistry:
         session_api_keys: list[str] | None = None,
     ) -> bool:
         """Store a group mapping with idempotent retry semantics."""
+        worker_addr = canonical_worker_addr(worker_addr)
         resolved_api_keys = list(session_api_keys or [])
         async with self._lock:
             retired = self._retired_groups.get(group_id)
@@ -588,6 +607,7 @@ class GroupRegistry:
     async def revoke_by_worker(self, worker_addr: str, worker_id: str) -> int:
         """Remove groups owned by an exact incarnation and return their count."""
 
+        worker_addr = canonical_worker_addr(worker_addr)
         async with self._lock:
             group_ids = [
                 group_id
