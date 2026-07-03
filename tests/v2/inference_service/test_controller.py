@@ -2265,7 +2265,7 @@ class TestMultiNodeConfig:
     @pytest.mark.asyncio
     async def test_async_initialize_multinode_worker_count(self):
         """With multi-node and pre-existing server_infos, should create dp_size workers."""
-        from areal.api.cli_args import SchedulingSpec
+        from areal.api.cli_args import SchedulingSpec, SGLangConfig
         from areal.api.io_struct import LocalInfServerInfo
 
         worker0 = MagicMock()
@@ -2292,15 +2292,29 @@ class TestMultiNodeConfig:
         controller._callback_host = "127.0.0.1"
         controller._callback_port = 19000
 
-        with patch.object(controller, "_async_fork_on_guard") as mock_fork:
+        with (
+            patch.object(controller, "_async_fork_on_guard") as mock_fork,
+            patch(
+                "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
+                return_value=True,
+            ),
+        ):
             mock_fork.side_effect = [
                 ("127.0.0.1", 18081),  # router
                 ("127.0.0.1", 18082),  # data proxy (only 1, on head)
                 ("127.0.0.1", 18080),  # gateway
             ]
+            server_args = SGLangConfig.build_args(
+                SGLangConfig(
+                    model_path="test-model",
+                    enable_batch_invariant_ops_mm_deepgemm=False,
+                ),
+                tp_size=8,
+                base_gpu_id=0,
+            )
 
             await controller._async_initialize(
-                server_args=None,
+                server_args=server_args,
                 server_infos=[
                     LocalInfServerInfo(
                         host="10.0.0.1", port=30000, process=MagicMock()
@@ -2319,11 +2333,14 @@ class TestMultiNodeConfig:
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
         ]
         assert len(data_proxy_calls) == 1
+        assert all(
+            c.kwargs.get("role") != "inf-server" for c in mock_fork.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_async_initialize_multinode_fork_path(self):
         """Exercise the full multi-node fork path (server_infos=None)."""
-        from areal.api.cli_args import SchedulingSpec
+        from areal.api.cli_args import SchedulingSpec, SGLangConfig
 
         worker0 = MagicMock()
         worker0.ip = "10.0.0.1"
@@ -2390,11 +2407,18 @@ class TestMultiNodeConfig:
                 ("10.0.0.1", 18082),  # data proxy
                 ("10.0.0.1", 18080),  # gateway
             ]
+            server_args = SGLangConfig.build_args(
+                SGLangConfig(
+                    model_path="test-model",
+                    enable_batch_invariant_ops_mm_deepgemm=False,
+                ),
+                tp_size=8,
+                base_gpu_id=0,
+            )
 
             await controller._async_initialize(
-                server_args=None,
+                server_args=server_args,
                 server_infos=None,
-                server_env={"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"},
             )
 
         # dp_size=1, nnodes_per_instance=2: total_workers = 2
@@ -2417,7 +2441,12 @@ class TestMultiNodeConfig:
         for fc in fork_calls:
             cmd_str = " ".join(fc["raw_cmd"])
             assert "--dist-init-addr" in cmd_str or "--dist_init_addr" in cmd_str
-            assert fc["env"] == {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
+            assert "env" not in fc
+            assert fc["raw_cmd"][:3] == [
+                "env",
+                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0",
+                "python3",
+            ]
 
         # Only 1 data proxy (dp_size=1, on head worker only)
         data_proxy_calls = [

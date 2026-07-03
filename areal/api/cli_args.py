@@ -1967,6 +1967,7 @@ class vLLMConfig:
 _SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = (
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
 )
+_AREAL_SERVER_ENV = "_areal_server_env"
 
 
 @dataclass
@@ -2091,7 +2092,15 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
-        return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
+        launch_args = dict(args)
+        server_env: dict[str, str] = launch_args.pop(_AREAL_SERVER_ENV, {})
+        cmd = get_py_cmd("areal.v2.inference_service.sglang.launch_server", launch_args)
+        if not server_env:
+            return cmd
+        env_assignments = [
+            f"{key}={value}" for key, value in sorted(server_env.items())
+        ]
+        return ["env", *env_assignments, *cmd]
 
     @staticmethod
     def build_args(
@@ -2140,6 +2149,9 @@ class SGLangConfig:
             args["host"] = host
         if port is not None:
             args["port"] = port
+        server_env = SGLangConfig.build_server_env(sglang_config)
+        if server_env:
+            args[_AREAL_SERVER_ENV] = server_env
         if not pkg_version.is_version_greater_or_equal("sglang", "0.5.10.post1"):
             raise RuntimeError("Needs sglang>=0.5.10.post1 to run the code.")
         return args

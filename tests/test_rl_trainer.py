@@ -101,14 +101,17 @@ def test_v2_megatron_lora_error_recommends_supported_backend_pair():
         trainer._validate_cfg()
 
 
-def _make_v2_rollout_init_trainer(
-    *, backend: str, enable_mm_deepgemm: bool | None = None
+def _make_rollout_init_trainer(
+    *,
+    backend: str,
+    rollout_version: str = "v2",
+    enable_mm_deepgemm: bool | None = None,
 ) -> PPOTrainer:
     trainer = PPOTrainer.__new__(PPOTrainer)
     trainer.config = SimpleNamespace(
         rollout=InferenceEngineConfig(
             backend=backend,
-            _version="v2",
+            _version=rollout_version,
             admin_api_key="test-key",
         ),
         actor=SimpleNamespace(use_lora=False),
@@ -118,19 +121,40 @@ def _make_v2_rollout_init_trainer(
             enable_batch_invariant_ops_mm_deepgemm=enable_mm_deepgemm,
         ),
         vllm=vLLMConfig(model="test-model"),
+        teacher=SimpleNamespace(path=""),
     )
     trainer.rollout_alloc = ModelAllocation.from_str(backend)
     trainer.scheduler = MagicMock(n_gpus_per_node=8)
     return trainer
 
 
+def _assert_sglang_server_command(server_args, expected_value):
+    cmd = SGLangConfig.build_cmd_from_args(server_args)
+    if expected_value is None:
+        assert cmd[:3] == [
+            "python3",
+            "-m",
+            "areal.v2.inference_service.sglang.launch_server",
+        ]
+    else:
+        assert cmd[:3] == [
+            "env",
+            f"{SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM}={expected_value}",
+            "python3",
+        ]
+
+
+@pytest.mark.parametrize("rollout_version", ["v1", "v2"])
 @pytest.mark.parametrize(
     ("setting", "expected_value"),
     [(None, None), (False, "0"), (True, "1")],
 )
-def test_v2_sglang_rollout_passes_explicit_server_env(setting, expected_value):
-    trainer = _make_v2_rollout_init_trainer(
+def test_sglang_rollout_command_covers_v1_and_v2(
+    rollout_version, setting, expected_value
+):
+    trainer = _make_rollout_init_trainer(
         backend="sglang:d1",
+        rollout_version=rollout_version,
         enable_mm_deepgemm=setting,
     )
     controller = MagicMock()
@@ -142,6 +166,11 @@ def test_v2_sglang_rollout_passes_explicit_server_env(setting, expected_value):
             "RolloutControllerV2",
             return_value=controller,
         ),
+        patch.object(
+            rl_trainer.RemoteSGLangEngine,
+            "as_controller",
+            return_value=controller,
+        ),
         patch(
             "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
             return_value=True,
@@ -151,16 +180,57 @@ def test_v2_sglang_rollout_passes_explicit_server_env(setting, expected_value):
 
     assert result is controller
     initialize_kwargs = controller.initialize.call_args.kwargs
-    if expected_value is None:
-        assert "server_env" not in initialize_kwargs
-    else:
-        assert initialize_kwargs["server_env"] == {
-            SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM: expected_value
-        }
+    assert "server_env" not in initialize_kwargs
+    _assert_sglang_server_command(
+        initialize_kwargs["server_args"],
+        expected_value,
+    )
+
+
+@pytest.mark.parametrize("rollout_version", ["v1", "v2"])
+@pytest.mark.parametrize(("setting", "expected_value"), [(False, "0"), (True, "1")])
+def test_sglang_teacher_command_covers_v1_and_v2(
+    rollout_version, setting, expected_value
+):
+    trainer = _make_rollout_init_trainer(
+        backend="sglang:d1",
+        rollout_version=rollout_version,
+        enable_mm_deepgemm=setting,
+    )
+    trainer.teacher_alloc = ModelAllocation.from_str("sglang:d1")
+    trainer.actor_alloc = ModelAllocation.from_str("fsdp:d1")
+    controller = MagicMock()
+    teacher_config = InferenceEngineConfig(
+        backend="sglang:d1",
+        _version=rollout_version,
+        admin_api_key="test-key",
+    )
+
+    with (
+        patch.object(rl_trainer, "is_single_controller", return_value=True),
+        patch.object(
+            rl_trainer.RemoteSGLangEngine,
+            "as_controller",
+            return_value=controller,
+        ),
+        patch(
+            "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
+            return_value=True,
+        ),
+    ):
+        result = trainer._init_teacher_rollout(teacher_config)
+
+    assert result is controller
+    initialize_kwargs = controller.initialize.call_args.kwargs
+    assert "server_env" not in initialize_kwargs
+    _assert_sglang_server_command(
+        initialize_kwargs["server_args"],
+        expected_value,
+    )
 
 
 def test_v2_vllm_rollout_does_not_pass_sglang_server_env():
-    trainer = _make_v2_rollout_init_trainer(
+    trainer = _make_rollout_init_trainer(
         backend="vllm:d1",
         enable_mm_deepgemm=False,
     )
