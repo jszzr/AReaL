@@ -363,8 +363,13 @@ class RolloutControllerV2:
 
     def _ensure_initialized(self) -> None:
         if self._init_future is None:
-            if self._initialization_error is not None:
-                raise self._initialization_error
+            # Some direct/legacy callers construct a lightweight controller
+            # with ``__new__`` and provide pre-existing inference addresses.
+            # Treat the absence of the pipelined-initialization field as the
+            # historical "no pending initialization" state.
+            initialization_error = getattr(self, "_initialization_error", None)
+            if initialization_error is not None:
+                raise initialization_error
             return
         with self._init_lock:
             future = self._init_future
