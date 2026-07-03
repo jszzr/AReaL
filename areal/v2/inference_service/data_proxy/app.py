@@ -548,7 +548,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # Session management (admin key / session key required)
     # =========================================================================
 
-    @app.post("/rl/start_session", status_code=201)
+    @app.post(
+        "/rl/start_session",
+        status_code=201,
+        response_model_exclude_none=True,
+    )
     async def start_session(
         body: StartSessionRequest, request: Request
     ) -> StartSessionResponse:

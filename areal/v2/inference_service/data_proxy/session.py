@@ -67,10 +67,22 @@ class SessionCredentials(BaseModel):
 
 
 class StartSessionResponse(BaseModel):
-    """Response from start_session — always a list of session credentials."""
+    """Response from start_session — always a list of session credentials.
+
+    The inference Gateway adds ``expected_version`` after consuming a callback
+    lease. It is the policy version that must have produced the loss-bearing
+    trajectory. Pull and direct Data Proxy responses omit it.
+    """
 
     group_id: str
     sessions: list[SessionCredentials]
+    expected_version: int | None = Field(
+        default=None,
+        description=(
+            "Policy version bound to the consumed callback lease; omitted for "
+            "pull or direct Data Proxy responses."
+        ),
+    )
 
 
 class CancelSessionsRequest(BaseModel):

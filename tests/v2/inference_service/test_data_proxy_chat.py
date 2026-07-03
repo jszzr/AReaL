@@ -19,9 +19,11 @@ from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import (
     ExportTrajectoriesRequest,
     ReadyNotification,
+    SessionCredentials,
     SessionData,
     SessionStore,
     StartSessionRequest,
+    StartSessionResponse,
     TrajectoryDeliveryMode,
 )
 from areal.v2.inference_service.worker_identity import WORKER_ID_HEADER
@@ -570,6 +572,22 @@ class TestSessionStore:
 # =============================================================================
 
 
+def test_start_session_response_represents_optional_expected_version():
+    credentials = [
+        SessionCredentials(session_id="session-1", session_api_key="session-key")
+    ]
+
+    callback_response = StartSessionResponse(
+        group_id="group-1",
+        sessions=credentials,
+        expected_version=7,
+    )
+    pull_response = StartSessionResponse(group_id="group-2", sessions=credentials)
+
+    assert callback_response.model_dump(exclude_none=True)["expected_version"] == 7
+    assert "expected_version" not in pull_response.model_dump(exclude_none=True)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "payload"),
@@ -910,6 +928,9 @@ async def test_callback_session_persists_lease_metadata(client):
     )
 
     assert response.status_code == 201
+    assert "expected_version" not in response.json()
+    assert "lease_id" not in response.json()
+    assert "admission_id" not in response.json()
     session_id = response.json()["sessions"][0]["session_id"]
     session = client._transport.app.state.session_store.get_session(session_id)
     assert session.lease_id == "lease-1"

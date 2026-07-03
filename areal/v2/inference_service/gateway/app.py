@@ -1183,7 +1183,11 @@ def create_app(config: GatewayConfig) -> FastAPI:
                                 status_code,
                             )
                         else:
-                            return await _finish_json(resp_data, 201)
+                            response_data = {
+                                **resp_data,
+                                "expected_version": lease.expected_version,
+                            }
+                            return await _finish_json(response_data, 201)
                         return response
 
                     assert start_worker_binding is not None

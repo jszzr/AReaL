@@ -1224,6 +1224,13 @@ class TestGatewayOnlineAdmission:
 
         assert granted.status_code == 201
         assert response.status_code == 201
+        assert response.json() == {
+            "group_id": "grp-1",
+            "sessions": [{"session_id": "task-1-0", "session_api_key": "key-1"}],
+            "expected_version": 5,
+        }
+        assert "lease_id" not in response.json()
+        assert "admission_id" not in response.json()
         forwarded = json.loads(mock_forward.call_args.args[1])
         assert forwarded["lease_id"] == "lease-1"
         assert forwarded["admission_id"] == "lease-1"
@@ -1252,10 +1259,13 @@ class TestGatewayOnlineAdmission:
         }
 
         async with client:
-            for lease_id in ("lease-1", "lease-2"):
+            for lease_id, expected_version in (("lease-1", 5), ("lease-2", 9)):
                 await client.post(
                     "/internal/online_leases",
-                    json={"lease_id": lease_id, "expected_version": 0},
+                    json={
+                        "lease_id": lease_id,
+                        "expected_version": expected_version,
+                    },
                     headers=_headers(),
                 )
             first = await client.post(
@@ -1266,7 +1276,16 @@ class TestGatewayOnlineAdmission:
             )
 
         assert first.status_code == replay.status_code == 201
-        assert first.json() == replay.json() == response_body
+        assert (
+            first.json()
+            == replay.json()
+            == {
+                **response_body,
+                "expected_version": 5,
+            }
+        )
+        assert "lease_id" not in replay.json()
+        assert "admission_id" not in replay.json()
         mock_query.assert_awaited_once()
         mock_forward.assert_awaited_once()
         mock_register.assert_awaited_once()
@@ -1397,6 +1416,7 @@ class TestGatewayOnlineAdmission:
             )
 
         assert response.status_code == 201
+        assert "expected_version" not in response.json()
         forwarded = json.loads(mock_forward.call_args.args[1])
         assert "lease_id" not in forwarded
         assert forwarded["admission_id"] == "pull-bypass-admission"

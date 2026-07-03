@@ -89,6 +89,7 @@ A successful response is:
 ```json
 {
   "group_id": "grp-2a61...",
+  "expected_version": 37,
   "sessions": [
     {
       "session_id": "gsm8k-17-grp-2a61...-0",
@@ -98,8 +99,14 @@ A successful response is:
 }
 ```
 
-Both IDs and keys are opaque. Do not parse their textual form or infer worker placement
-from it.
+`expected_version` is the policy version bound to the consumed trainer lease. It lets a
+producer attribute the episode at creation time; it is not a claim that this version
+will remain the latest one. An identical request replay returns the same value. The
+Gateway exposes only this version metadata, not its internal `lease_id` or callback
+address. Pull and direct Data Proxy responses omit the field.
+
+All returned IDs and keys are opaque. Do not parse their textual form or infer worker
+placement from it.
 
 ### 2. Run the agent
 

@@ -79,6 +79,7 @@ curl -X POST http://<gateway>/rl/start_session \
 ```json
 {
   "group_id": "grp-2a61...",
+  "expected_version": 37,
   "sessions": [
     {
       "session_id": "gsm8k-17-grp-2a61...-0",
@@ -88,7 +89,11 @@ curl -X POST http://<gateway>/rl/start_session \
 }
 ```
 
-ID 和密钥都是不透明值，不要解析其文本格式，也不要据此推断 worker 位置。
+`expected_version` 是本次消费的 trainer lease 所绑定的策略版本，可用于在会话创建时归因
+episode；它并不表示该版本之后仍是最新版本。相同请求的重放会返回完全相同的值。Gateway 只暴露这项版本元数据，不会返回内部 `lease_id` 或
+callback 地址；pull 和直接访问 Data Proxy 的响应会省略该字段。
+
+所有返回的 ID 和密钥都是不透明值，不要解析其文本格式，也不要据此推断 worker 位置。
 
 ### 2. 运行智能体
 

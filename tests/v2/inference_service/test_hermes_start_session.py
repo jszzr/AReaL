@@ -11,6 +11,7 @@ class _Response:
         self.status_code = status_code
         self._payload = {
             "group_id": "group-1",
+            "expected_version": 7,
             "sessions": [
                 {
                     "session_id": "session-1",
