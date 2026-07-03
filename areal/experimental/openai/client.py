@@ -555,6 +555,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -578,6 +579,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -600,6 +602,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         max_total_tokens: int | None | NotGiven = NOT_GIVEN,
         metadata: Metadata | None | NotGiven = NOT_GIVEN,
         n: int | None | NotGiven = NOT_GIVEN,
+        seed: int | None | NotGiven = NOT_GIVEN,
         stop: str | None | list[str] | None | NotGiven = NOT_GIVEN,
         store: bool | None | NotGiven = NOT_GIVEN,
         temperature: float | None | NotGiven = NOT_GIVEN,
@@ -624,6 +627,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if not is_omitted(n) and n != 1:
             raise NotImplementedError("n != 1 is not supported yet")
         n = 1
+        seed_value = (
+            None if is_omitted(seed) else GenerationHyperparameters.validate_seed(seed)
+        )
 
         messages_list_raw = list(messages)
         if not messages_list_raw:
@@ -782,6 +788,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             stop=stop_tokens,
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
+            seed=seed_value,
             lora_name=self.lora_name,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])

@@ -530,6 +530,7 @@ Controls text generation behavior for rollout.
 | `frequency_penalty`   | float                  | `0.0`            | Penalizes tokens based on their frequency in generation so far. Must be between -2 and 2 where negative numbers encourage repetition. |
 | `lora_name`           | string                 | `"default_lora"` | Lora name to be used for this generation.                                                                                             |
 | `use_beam_search`     | boolean                | `False`          | Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored.         |
+| `seed`                | integer \| None        | `None`           | Optional non-negative signed 64-bit sampling seed. SGLang requires enable_deterministic_inference.                                    |
 
 (section-inference-engine)=
 
@@ -574,7 +575,8 @@ Configuration for inference servers, including offpolicyness control.
 
 ## SGLang Configuration
 
-Configuration for SGLang runtime. Refer to:
+Configuration for SGLang runtime; per-request seeds require
+enable_deterministic_inference, which may reduce throughput. Refer to:
 
 https://github.com/sgl-project/sglang for detailed documentation.
 
@@ -633,6 +635,7 @@ https://github.com/sgl-project/sglang for detailed documentation.
 | `enable_metrics`                  | boolean                 | `True`       | -           |
 | `decode_log_interval`             | integer                 | `1`          | -           |
 | `enable_multithread_load`         | boolean                 | `False`      | -           |
+| `enable_deterministic_inference`  | boolean                 | `False`      | Seed opt-in |
 | `enable_return_routed_experts`    | boolean                 | `False`      | -           |
 
 (section-v-llm)=

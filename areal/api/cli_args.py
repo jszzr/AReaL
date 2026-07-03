@@ -232,7 +232,30 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional non-negative signed 64-bit sampling seed. SGLang "
+                "requires enable_deterministic_inference."
+            )
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
+
+    def __post_init__(self) -> None:
+        self.seed = self.validate_seed(self.seed)
+
+    @staticmethod
+    def validate_seed(seed: Any) -> int | None:
+        """Validate a per-request sampling seed for backend int64 tensors."""
+        if seed is None:
+            return None
+        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
+            raise ValueError(
+                f"seed must be a non-negative signed 64-bit integer, got {seed!r}"
+            )
+        return seed
 
     def new(self, **kwargs):
         args = asdict(self)
@@ -294,14 +317,18 @@ class GenerationHyperparameters:
             mapping["max_new_tokens"] = "max_completion_tokens"
         elif api_format == "responses":
             mapping["max_new_tokens"] = "max_output_tokens"
+            final_exclude_args.add("seed")
         elif api_format == "openai-agents":
             # NOTE: max_tokens in openai-agents means `max_new_tokens` in sglang/vllm. This is not a bug
             mapping["max_new_tokens"] = "max_tokens"
+            final_exclude_args.add("seed")
         else:
             raise ValueError(f"Unsupported API format: {api_format}")
 
         res = {}
         for k, v in asdict(self).items():
+            if k == "seed" and v is None:
+                continue
             if k in final_exclude_args:
                 should_warn = False
 
@@ -1939,7 +1966,7 @@ class vLLMConfig:
 
 @dataclass
 class SGLangConfig:
-    """Configuration for SGLang runtime. Refer to:
+    """Configuration for SGLang runtime; per-request seeds require enable_deterministic_inference, which may reduce throughput. Refer to:
     https://github.com/sgl-project/sglang for detailed documentation.
     """
 
@@ -2005,6 +2032,10 @@ class SGLangConfig:
     # NOTE: These arguments will be parsed into a dict json-string
     # and passed as `model_loader_extra_config` to SGLang.
     enable_multithread_load: bool = False
+    enable_deterministic_inference: bool = field(
+        default=False,
+        metadata={"help": "Seed opt-in"},
+    )
 
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False

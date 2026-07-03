@@ -59,6 +59,9 @@ class SGLangBridgeBackend:
         }
         if gconfig.stop:
             sampling_params["stop"] = gconfig.stop
+        # SGLang consumes this only when --enable-deterministic-inference is set.
+        if gconfig.seed is not None:
+            sampling_params["sampling_seed"] = gconfig.seed
 
         payload: dict[str, Any] = {
             "input_ids": list(req.input_ids),
