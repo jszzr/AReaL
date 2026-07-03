@@ -442,12 +442,21 @@ class TestGatewayTrainControllerLifecycle:
         assert controller._weight_update_ctrl is None
 
     def test_destroy_defers_weight_update_keyboard_interrupt_until_cleanup_finishes(
-        self,
+        self, monkeypatch
     ):
+        from areal.v2.weight_update.controller import controller as wu_module
+
         primary_error = KeyboardInterrupt("session close interrupted")
+        process_error = OSError("gateway wait failed")
         session = _FailOnceSession(primary_error)
+        gateway_process = MagicMock()
+        gateway_process.pid = 12345
+        gateway_process.wait.side_effect = [process_error, 0]
         weight_update_controller = WeightUpdateController()
         weight_update_controller._session = session
+        weight_update_controller._gateway_proc = gateway_process
+        weight_update_controller._gateway_url = "http://weight-gateway"
+        monkeypatch.setattr(wu_module, "kill_process_tree", lambda _pid: None)
         scheduler = MagicMock()
         controller = _make_controller(scheduler)
         graceful_shutdown = MagicMock()
@@ -472,12 +481,18 @@ class TestGatewayTrainControllerLifecycle:
                 traceback_nodes.append(traceback_cursor)
                 traceback_cursor = traceback_cursor.tb_next
             assert session.raised_traceback in traceback_nodes
+            assert any(
+                "OSError: gateway wait failed" in note
+                for note in getattr(primary_error, "__notes__", [])
+            )
 
             graceful_shutdown.assert_called_once_with()
             kill_forked_service.assert_called_once_with("http://guard", "router", 0)
             scheduler.delete_workers.assert_called_once_with(role="actor")
             assert controller._weight_update_ctrl is weight_update_controller
             assert weight_update_controller._session is session
+            assert weight_update_controller._gateway_proc is gateway_process
+            assert weight_update_controller.gateway_url == "http://weight-gateway"
             assert controller._worker_addrs == []
             assert controller._forked_services == []
             assert controller._service_roles == []
@@ -487,6 +502,8 @@ class TestGatewayTrainControllerLifecycle:
 
             assert session.close_count == 2
             assert weight_update_controller._session is None
+            assert weight_update_controller._gateway_proc is None
+            assert weight_update_controller.gateway_url == ""
             assert controller._weight_update_ctrl is None
         finally:
             if controller._weight_update_ctrl is not None:

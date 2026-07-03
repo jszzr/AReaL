@@ -89,6 +89,22 @@ class _NeverReturningGatewayProcess:
         self.kill_count += 1
 
 
+class _FailOnceSession:
+    def __init__(self, error: BaseException):
+        self.error = error
+        self.close_count = 0
+        self.raised_traceback = None
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.close_count == 1:
+            try:
+                raise self.error
+            except BaseException as exc:
+                self.raised_traceback = exc.__traceback__
+                raise
+
+
 @pytest.fixture()
 def ctrl() -> WeightUpdateController:
     c = WeightUpdateController(
@@ -481,6 +497,68 @@ class TestLifecycle:
             assert session.close.call_count == 2
         finally:
             _force_reap_process(process)
+
+    @pytest.mark.parametrize(
+        "failure_stage",
+        ["initial-wait-oserror", "final-wait-timeout"],
+    )
+    def test_destroy_keeps_session_base_exception_primary_when_process_cleanup_fails(
+        self, monkeypatch, failure_stage
+    ):
+        from areal.v2.weight_update.controller import controller as controller_module
+
+        primary_error = KeyboardInterrupt("session close interrupted")
+        session = _FailOnceSession(primary_error)
+        if failure_stage == "initial-wait-oserror":
+            process_error: BaseException = OSError("gateway wait failed")
+            wait_effects = [process_error, 0]
+            first_destroy_waits = [1]
+        else:
+            process_error = subprocess.TimeoutExpired(cmd="gateway", timeout=1)
+            wait_effects = [
+                subprocess.TimeoutExpired(cmd="gateway", timeout=1),
+                process_error,
+                0,
+            ]
+            first_destroy_waits = [1, 1]
+        process = _ScriptedGatewayProcess(wait_effects)
+        controller = WeightUpdateController()
+        controller._session = session
+        controller._gateway_proc = process
+        controller._gateway_url = GATEWAY_URL
+        monkeypatch.setattr(controller_module, "kill_process_tree", lambda _pid: None)
+
+        try:
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                controller.destroy()
+
+            assert exc_info.value is primary_error
+            traceback_cursor = exc_info.tb
+            traceback_nodes = []
+            while traceback_cursor is not None:
+                traceback_nodes.append(traceback_cursor)
+                traceback_cursor = traceback_cursor.tb_next
+            assert session.raised_traceback in traceback_nodes
+            assert any(
+                type(process_error).__name__ in note
+                for note in getattr(primary_error, "__notes__", [])
+            )
+            assert session.close_count == 1
+            assert process.wait_timeouts == first_destroy_waits
+            assert controller._session is session
+            assert controller._gateway_proc is process
+            assert controller.gateway_url == GATEWAY_URL
+
+            controller.destroy()
+
+            assert session.close_count == 2
+            assert process.wait_timeouts == [*first_destroy_waits, 1]
+            assert controller._session is None
+            assert controller._gateway_proc is None
+            assert controller.gateway_url == ""
+        finally:
+            if controller._session is not None or controller._gateway_proc is not None:
+                controller.destroy()
 
     def test_destroy_uses_second_bounded_wait_when_tree_cleanup_fails(
         self, monkeypatch

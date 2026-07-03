@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from types import TracebackType
 from typing import Any
 
 import httpx
@@ -220,6 +221,21 @@ class WeightUpdateController:
                 logger.warning("Failed to disconnect during destroy", exc_info=True)
 
         session_error: BaseException | None = None
+        session_traceback: TracebackType | None = None
+
+        def _record_process_cleanup_error(
+            stage: str, cleanup_error: BaseException
+        ) -> None:
+            assert session_error is not None
+            logger.warning(
+                "%s failed after gateway HTTP session cleanup was interrupted",
+                stage,
+                exc_info=True,
+            )
+            session_error.add_note(
+                f"{stage} also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
         session = self._session
         if session is not None:
             try:
@@ -227,16 +243,27 @@ class WeightUpdateController:
             except BaseException as exc:
                 logger.warning("Failed to close gateway HTTP session", exc_info=True)
                 session_error = exc
+                session_traceback = exc.__traceback__
             else:
                 if self._session is session:
                     self._session = None
 
         gateway_proc = self._gateway_proc
         if gateway_proc is not None:
+            process_reaped = False
             try:
                 kill_process_tree(gateway_proc.pid)
-            except Exception:
+            except Exception as exc:
                 logger.warning("Failed to kill gateway process", exc_info=True)
+                if session_error is not None:
+                    session_error.add_note(
+                        "Gateway process-tree cleanup also failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            except BaseException as exc:
+                if session_error is None:
+                    raise
+                _record_process_cleanup_error("Gateway process-tree cleanup", exc)
             try:
                 gateway_proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
@@ -248,10 +275,29 @@ class WeightUpdateController:
                 except ProcessLookupError:
                     # The process may exit between wait() timing out and kill().
                     pass
-                gateway_proc.wait(timeout=1)
-            if self._gateway_proc is gateway_proc:
+                except BaseException as exc:
+                    if session_error is None:
+                        raise
+                    _record_process_cleanup_error("Gateway process kill", exc)
+                try:
+                    gateway_proc.wait(timeout=1)
+                except BaseException as exc:
+                    if session_error is None:
+                        raise
+                    _record_process_cleanup_error("Final gateway process wait", exc)
+                else:
+                    process_reaped = True
+            except BaseException as exc:
+                if session_error is None:
+                    raise
+                _record_process_cleanup_error("Gateway process wait", exc)
+            else:
+                process_reaped = True
+            if process_reaped and self._gateway_proc is gateway_proc:
                 self._gateway_proc = None
-        self._gateway_url = ""
+        if self._gateway_proc is None:
+            self._gateway_url = ""
         if session_error is not None:
-            raise session_error
+            assert session_traceback is not None
+            raise session_error.with_traceback(session_traceback)
         logger.info("WeightUpdateController destroyed")
