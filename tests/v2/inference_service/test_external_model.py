@@ -254,7 +254,7 @@ class TestGatewayExternalEndpoints:
         mock_forward,
         gateway_client,
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
         mock_forward.return_value = httpx.Response(200, json={"id": "ext-chat-1"})
 
         resp = await gateway_client.post(
@@ -275,7 +275,7 @@ class TestGatewayExternalEndpoints:
         mock_forward_sse,
         gateway_client,
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
 
         async def _stream() -> AsyncGenerator[bytes, None]:
             yield b"data: hello\n\n"
@@ -304,7 +304,7 @@ class TestGatewayExternalEndpoints:
         mock_forward,
         gateway_client,
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
         mock_forward.return_value = httpx.Response(200, json={"id": "internal-chat"})
 
         resp = await gateway_client.post(
@@ -328,7 +328,7 @@ class TestGatewayExternalEndpoints:
         mock_forward,
         gateway_client,
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
         mock_forward.return_value = httpx.Response(200, json={"id": "internal-chat"})
 
         resp = await gateway_client.post(

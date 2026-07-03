@@ -124,7 +124,9 @@ class TestAdminEndpoints:
         self, mock_query_router, mock_forward, client
     ):
         """Admin key → /chat/completions (non-streaming) → response forwarded."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
 
         # Simulate data proxy response
         mock_resp = httpx.Response(
@@ -139,11 +141,19 @@ class TestAdminEndpoints:
                 "model": "sglang",
                 "messages": [{"role": "user", "content": "hello"}],
             },
-            headers=admin_headers(),
+            headers={
+                **admin_headers(),
+                WORKER_ID_HEADER: "caller-supplied-stale-epoch",
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == "chatcmpl-1"
+        assert mock_query_router.call_args.kwargs["return_destination"] is True
+        assert mock_forward.call_args.args[0] == f"{WORKER_ADDR}/chat/completions"
+        assert (
+            mock_forward.call_args.args[2][WORKER_ID_HEADER] == "worker-epoch-current"
+        )
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.forward_sse_stream")
@@ -152,7 +162,9 @@ class TestAdminEndpoints:
         self, mock_query_router, mock_forward_sse, client
     ):
         """Admin key → /chat/completions (streaming) → SSE forwarded."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
 
         async def _stream():
             yield b'data: {"choices": [{"delta": {"content": "Hi"}}]}\n\n'
@@ -167,10 +179,19 @@ class TestAdminEndpoints:
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
             },
-            headers=admin_headers(),
+            headers={
+                **admin_headers(),
+                WORKER_ID_HEADER: "caller-supplied-stale-epoch",
+            },
         )
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
+        assert mock_query_router.call_args.kwargs["return_destination"] is True
+        assert mock_forward_sse.call_args.args[0] == (f"{WORKER_ADDR}/chat/completions")
+        assert (
+            mock_forward_sse.call_args.args[2][WORKER_ID_HEADER]
+            == "worker-epoch-current"
+        )
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
@@ -512,7 +533,9 @@ class TestSessionEndpoints:
         self, mock_query_router, mock_forward, client
     ):
         """Session key → /chat/completions → forwarded to pinned worker."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
         mock_forward.return_value = httpx.Response(
             200,
             json={"id": "chatcmpl-2", "choices": [{"message": {"content": "OK"}}]},
@@ -536,7 +559,9 @@ class TestSessionEndpoints:
         self, mock_query_router, mock_forward, client
     ):
         """Session key → /rl/set_reward (finish=True) → forwarded to pinned worker."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
         mock_forward.return_value = httpx.Response(
             200,
             json={"message": "success", "interaction_count": 5, "finished": True},
@@ -555,16 +580,26 @@ class TestSessionEndpoints:
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
     async def test_session_set_reward(self, mock_query_router, mock_forward, client):
         """Session key → /rl/set_reward → forwarded to pinned worker."""
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
         mock_forward.return_value = httpx.Response(200, json={"message": "success"})
 
         resp = await client.post(
             "/rl/set_reward",
             json={"reward": 1.0},
-            headers=session_headers(),
+            headers={
+                **session_headers(),
+                WORKER_ID_HEADER: "caller-supplied-stale-epoch",
+            },
         )
         assert resp.status_code == 200
         mock_forward.assert_called_once()
+        assert mock_query_router.call_args.kwargs["return_destination"] is True
+        assert mock_forward.call_args.args[0] == f"{WORKER_ADDR}/rl/set_reward"
+        assert (
+            mock_forward.call_args.args[2][WORKER_ID_HEADER] == "worker-epoch-current"
+        )
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
@@ -572,7 +607,9 @@ class TestSessionEndpoints:
     async def test_set_reward_returns_ready_transition_without_router_notification(
         self, mock_query_router, mock_forward, client
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
         mock_forward.return_value = httpx.Response(
             200,
             json={
@@ -598,7 +635,9 @@ class TestSessionEndpoints:
     async def test_set_reward_duplicate_ready_transition_is_forwarded_as_is(
         self, mock_query_router, mock_forward, client
     ):
-        mock_query_router.return_value = WORKER_ADDR
+        mock_query_router.return_value = RouterDestination(
+            WORKER_ADDR, "worker-epoch-current"
+        )
         mock_forward.return_value = httpx.Response(
             200,
             json={

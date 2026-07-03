@@ -34,6 +34,7 @@ class OnlineLease:
 class OnlineLeaseBinding:
     admission_id: str
     worker_addr: str
+    worker_id: str
     group_id: str
     session_ids: tuple[str, ...]
 
@@ -134,7 +135,10 @@ class RequestWorkerOwnershipRegistry:
             record = self._records.get(request_id)
             if record is None or record.binding != binding:
                 raise ValueError(f"Request {request_id} has no matching worker owner")
-            if cleanup_binding.worker_addr != binding.worker_addr:
+            if (
+                cleanup_binding.worker_addr != binding.worker_addr
+                or cleanup_binding.worker_id != binding.worker_id
+            ):
                 raise ValueError(
                     f"Request {request_id} cleanup worker does not match its owner"
                 )

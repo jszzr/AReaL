@@ -230,6 +230,9 @@ async def online_stack(monkeypatch):
             router_addr: str,
             admin_api_key: str,
             group_id: str,
+            worker_addr: str,
+            worker_id: str,
+            session_ids: tuple[str, ...] | list[str],
             timeout: float = 2.0,
             *,
             client: httpx.AsyncClient | None = None,
@@ -237,7 +240,12 @@ async def online_stack(monkeypatch):
             del router_addr, timeout, client
             resp = await router_client.post(
                 "/remove_session",
-                json={"group_id": group_id},
+                json={
+                    "group_id": group_id,
+                    "worker_addr": worker_addr,
+                    "worker_id": worker_id,
+                    "session_ids": list(session_ids),
+                },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
             )
             assert resp.status_code == 200

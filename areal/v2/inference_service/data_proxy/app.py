@@ -162,6 +162,8 @@ def _require_worker_identity(request: Request, config: DataProxyConfig) -> None:
 def _resolve_session_from_token(
     token: str | None,
     store: SessionStore,
+    *,
+    create_hitl: bool = True,
 ) -> SessionData | None:
     """Resolve a session from the bearer token.
 
@@ -173,7 +175,7 @@ def _resolve_session_from_token(
     session = store.get_session_by_api_key(token)
     if session is not None:
         return session
-    if hmac.compare_digest(token, store.admin_api_key):
+    if create_hitl and hmac.compare_digest(token, store.admin_api_key):
         return store.get_or_create_hitl_session()
     return None
 
@@ -518,9 +520,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def start_session(
         body: StartSessionRequest, request: Request
     ) -> StartSessionResponse:
-        _require_worker_identity(request, config)
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
+        _require_worker_identity(request, config)
 
         group_size = max(body.group_size, 1)
         if body.delivery_mode is TrajectoryDeliveryMode.CALLBACK:
@@ -614,6 +616,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def cancel_sessions(body: CancelSessionsRequest, request: Request):
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
+        _require_worker_identity(request, config)
         async with admission_lock:
             _tombstone_admission_locked(body.admission_id)
             session_ids = set(body.session_ids)
@@ -633,11 +636,15 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def set_reward(body: SetRewardRequest, request: Request):
         store: SessionStore = app.state.session_store
         token = _extract_bearer_token(request)
-        session = _resolve_session_from_token(token, store)
-        if session is None:
+        session = _resolve_session_from_token(token, store, create_hitl=False)
+        is_admin = hmac.compare_digest(token, store.admin_api_key)
+        if session is None and not is_admin:
             raise HTTPException(
                 status_code=401, detail="Invalid or expired session API key."
             )
+        _require_worker_identity(request, config)
+        if session is None:
+            session = store.get_or_create_hitl_session()
 
         try:
             reward_result = session.set_reward(
@@ -676,7 +683,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
 
         token = _try_extract_bearer_token(request)
-        session = _resolve_session_from_token(token, store)
+        session = _resolve_session_from_token(token, store, create_hitl=False)
+        _require_worker_identity(request, config)
+        if (
+            session is None
+            and token is not None
+            and hmac.compare_digest(token, store.admin_api_key)
+        ):
+            session = store.get_or_create_hitl_session()
         if session is not None:
             session.update_last_access()
 
@@ -860,9 +874,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
-        _require_worker_identity(request, config)
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
+        _require_worker_identity(request, config)
 
         if not body.session_ids:
             raise HTTPException(

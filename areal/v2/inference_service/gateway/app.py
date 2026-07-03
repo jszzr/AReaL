@@ -114,7 +114,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
     online_lease_registry = OnlineLeaseRegistry()
     start_request_registry = RequestReplayRegistry()
     export_request_registry = RequestReplayRegistry()
-    pending_export_group_cleanups: set[str] = set()
+    pending_export_group_cleanups: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     reserved_export_group_cleanups: set[str] = set()
     export_group_cleanup_lock = asyncio.Lock()
     start_request_workers = RequestWorkerOwnershipRegistry(
@@ -163,6 +163,31 @@ def create_app(config: GatewayConfig) -> FastAPI:
             if _fallback_client is None:
                 _fallback_client = create_httpx_client(timeout=config.router_timeout)
             return _fallback_client
+
+    async def _await_critical_task(task: asyncio.Task, operation: str):
+        """Finish a state transition even if its request is cancelled repeatedly."""
+
+        request_cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                request_cancelled = True
+                continue
+            except BaseException:
+                break
+
+        if request_cancelled:
+            try:
+                task.result()
+            except BaseException as exc:
+                logger.error(
+                    "%s failed while its request was cancelled: %s",
+                    operation,
+                    exc,
+                )
+            raise asyncio.CancelledError
+        return task.result()
 
     def _targeted_control_headers(request: Request, worker_id: str) -> dict[str, str]:
         """Forward auth/content headers while pinning the resolved incarnation."""
@@ -286,11 +311,17 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 {
                     "Authorization": f"Bearer {config.admin_api_key}",
                     "Content-Type": "application/json",
+                    WORKER_ID_HEADER: binding.worker_id,
                 },
                 min(config.forward_timeout, 10.0),
                 client=_client(),
             )
-            if response.status_code < 200 or response.status_code >= 300:
+            if response.status_code == 409:
+                # The old incarnation is already gone.  Its in-memory session
+                # state cannot be cleaned any further, but the Router's exact
+                # ownership record still must be compared and removed below.
+                worker_cleaned = True
+            elif response.status_code < 200 or response.status_code >= 300:
                 logger.warning(
                     "Failed to cancel sessions for group %s on %s: HTTP %d %s",
                     binding.group_id,
@@ -313,6 +344,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 config.router_addr,
                 config.admin_api_key,
                 binding.group_id,
+                binding.worker_addr,
+                binding.worker_id,
+                binding.session_ids,
                 timeout=config.router_timeout,
                 client=_client(),
             )
@@ -359,25 +393,44 @@ def create_app(config: GatewayConfig) -> FastAPI:
             )
 
     async def _ensure_export_group_cleanup(group_id: str) -> bool:
-        await _handoff_export_group_cleanup(group_id)
+        async with export_group_cleanup_lock:
+            binding = pending_export_group_cleanups.get(group_id)
+        if binding is None:
+            return True
+        worker_addr, worker_id, session_ids = binding
         revoked = await revoke_session_in_router(
             config.router_addr,
             config.admin_api_key,
             group_id,
+            worker_addr,
+            worker_id,
+            session_ids,
             timeout=config.router_timeout,
             client=_client(),
         )
         if revoked:
             async with export_group_cleanup_lock:
-                pending_export_group_cleanups.discard(group_id)
+                if pending_export_group_cleanups.get(group_id) == binding:
+                    pending_export_group_cleanups.pop(group_id, None)
         return revoked
 
-    async def _handoff_export_group_cleanup(group_id: str) -> None:
+    async def _handoff_export_group_cleanup(
+        group_id: str,
+        worker_addr: str,
+        worker_id: str,
+        session_ids: tuple[str, ...],
+    ) -> None:
         """Make Router cleanup reaper-owned before any later await can cancel."""
 
         async with export_group_cleanup_lock:
+            binding = (worker_addr, worker_id, session_ids)
+            existing = pending_export_group_cleanups.get(group_id)
+            if existing is not None and existing != binding:
+                raise RuntimeError(
+                    f"Export group {group_id} has conflicting cleanup ownership"
+                )
             reserved_export_group_cleanups.discard(group_id)
-            pending_export_group_cleanups.add(group_id)
+            pending_export_group_cleanups[group_id] = binding
 
     async def _reserve_export_group_cleanup(group_id: str) -> tuple[bool, bool]:
         """Reserve bounded ownership for cleanup after a destructive export."""
@@ -539,17 +592,24 @@ def create_app(config: GatewayConfig) -> FastAPI:
             pass
 
         try:
-            worker_addr = await query_router(
+            route_result = await query_router(
                 config.router_addr,
                 token,
                 "/chat/completions",
                 config.router_timeout,
                 admin_api_key=config.admin_api_key,
                 model=model_name,
+                return_destination=True,
                 client=_client(),
             )
+            if not isinstance(route_result, RouterDestination):
+                raise RouterUnreachableError(
+                    "Router chat route did not return a worker incarnation"
+                )
         except (RouterUnreachableError, RouterKeyRejectedError) as exc:
             return _router_error_response(exc)
+        worker_addr = route_result.worker_addr
+        headers[WORKER_ID_HEADER] = route_result.worker_id
 
         if is_streaming:
             return StreamingResponse(
@@ -828,11 +888,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 return await _finish(result)
 
             finalize_task = asyncio.create_task(_critical_finalize())
-            try:
-                response = await asyncio.shield(finalize_task)
-            except asyncio.CancelledError:
-                await finalize_task
-                raise
+            response = await _await_critical_task(
+                finalize_task, "Callback failure settlement"
+            )
             if notification_cancelled:
                 raise asyncio.CancelledError
             return response
@@ -969,6 +1027,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 fallback_binding = OnlineLeaseBinding(
                     admission_id=lease.lease_id,
                     worker_addr=worker_addr,
+                    worker_id=worker_id,
                     group_id="",
                     session_ids=(),
                 )
@@ -996,6 +1055,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         group_id: str | None = None
         sessions: list[dict[str, str]] = []
+        start_success_settled = False
         if resp.status_code == 201:
             try:
                 resp_data = resp.json()
@@ -1007,6 +1067,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     binding = OnlineLeaseBinding(
                         admission_id=lease.lease_id,
                         worker_addr=worker_addr,
+                        worker_id=worker_id,
                         group_id=group_id,
                         session_ids=tuple(str(item["session_id"]) for item in sessions),
                     )
@@ -1026,36 +1087,51 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     client=_client(),
                 )
 
-                if lease is None:
-                    assert start_worker_binding is not None
-                    await _forget_start_worker(
-                        resolved_request_id, start_worker_binding
-                    )
-                else:
-                    active, deferred_binding = await online_lease_registry.finish_start(
-                        lease.lease_id
-                    )
-                    cleanup_ok = True
-                    if deferred_binding is not None:
-                        cleanup_ok = await _cleanup_and_ack_online_binding(
-                            lease.lease_id, deferred_binding
+                async def _finalize_registered_start() -> Response:
+                    nonlocal start_success_settled
+                    if lease is None:
+                        assert start_worker_binding is not None
+                        response = await _finish_json(resp_data, 201)
+                        await _forget_start_worker(
+                            resolved_request_id, start_worker_binding
                         )
-                    if not active:
-                        status_code = 409 if cleanup_ok else 502
-                        return await _finish_json(
-                            {
-                                "error": (
-                                    "Online lease ended while start_session was "
-                                    "still registering"
-                                )
-                            },
-                            status_code,
-                        )
-                return await _finish_json(resp_data, 201)
+                    else:
+                        (
+                            active,
+                            deferred_binding,
+                        ) = await online_lease_registry.finish_start(lease.lease_id)
+                        cleanup_ok = True
+                        if deferred_binding is not None:
+                            cleanup_ok = await _cleanup_and_ack_online_binding(
+                                lease.lease_id, deferred_binding
+                            )
+                        if not active:
+                            status_code = 409 if cleanup_ok else 502
+                            response = await _finish_json(
+                                {
+                                    "error": (
+                                        "Online lease ended while start_session was "
+                                        "still registering"
+                                    )
+                                },
+                                status_code,
+                            )
+                        else:
+                            response = await _finish_json(resp_data, 201)
+                    start_success_settled = True
+                    return response
+
+                return await _await_critical_task(
+                    asyncio.create_task(_finalize_registered_start()),
+                    "Registered start settlement",
+                )
             except asyncio.CancelledError:
+                if start_success_settled:
+                    raise
                 cancelled_binding = OnlineLeaseBinding(
                     admission_id=downstream_admission_id,
                     worker_addr=worker_addr,
+                    worker_id=worker_id,
                     group_id=group_id or "",
                     session_ids=tuple(str(item["session_id"]) for item in sessions),
                 )
@@ -1095,16 +1171,15 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     )
 
                 compensation_task = asyncio.create_task(_compensate_cancelled_start())
-                try:
-                    await asyncio.shield(compensation_task)
-                except asyncio.CancelledError:
-                    await compensation_task
-                    raise
+                await _await_critical_task(
+                    compensation_task, "Cancelled start compensation"
+                )
                 raise
             except RouterSessionRegistrationError as exc:
                 conflict_binding = OnlineLeaseBinding(
                     admission_id=downstream_admission_id,
                     worker_addr=worker_addr,
+                    worker_id=worker_id,
                     group_id=group_id or "",
                     session_ids=tuple(str(item["session_id"]) for item in sessions),
                 )
@@ -1136,17 +1211,16 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     return await _finish(result)
 
                 settle_task = asyncio.create_task(_settle_pull_conflict())
-                try:
-                    return await asyncio.shield(settle_task)
-                except asyncio.CancelledError:
-                    await settle_task
-                    raise
+                return await _await_critical_task(
+                    settle_task, "Pull registration conflict settlement"
+                )
             except Exception as exc:
                 failed_binding: OnlineLeaseBinding | None = None
                 if lease is not None:
                     failed_binding = OnlineLeaseBinding(
                         admission_id=lease.lease_id,
                         worker_addr=worker_addr,
+                        worker_id=worker_id,
                         group_id=group_id or "",
                         session_ids=tuple(str(item["session_id"]) for item in sessions),
                     )
@@ -1186,6 +1260,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
             fallback_binding = OnlineLeaseBinding(
                 admission_id=lease.lease_id,
                 worker_addr=worker_addr,
+                worker_id=worker_id,
                 group_id="",
                 session_ids=(),
             )
@@ -1198,8 +1273,16 @@ def create_app(config: GatewayConfig) -> FastAPI:
         if result.status_code >= 500:
             return await _release(result)
         assert start_worker_binding is not None
-        await _forget_start_worker(resolved_request_id, start_worker_binding)
-        return await _finish(result)
+
+        async def _finalize_terminal_pull_start() -> Response:
+            response = await _finish(result)
+            await _forget_start_worker(resolved_request_id, start_worker_binding)
+            return response
+
+        return await _await_critical_task(
+            asyncio.create_task(_finalize_terminal_pull_start()),
+            "Terminal pull start settlement",
+        )
 
     # =========================================================================
     # POST /rl/set_reward — session key or admin key (HITL)
@@ -1219,17 +1302,24 @@ def create_app(config: GatewayConfig) -> FastAPI:
             pass
 
         try:
-            worker_addr = await query_router(
+            route_result = await query_router(
                 config.router_addr,
                 token,
                 "/rl/set_reward",
                 config.router_timeout,
                 admin_api_key=config.admin_api_key,
                 model=model,
+                return_destination=True,
                 client=_client(),
             )
+            if not isinstance(route_result, RouterDestination):
+                raise RouterUnreachableError(
+                    "Router reward route did not return a worker incarnation"
+                )
         except (RouterUnreachableError, RouterKeyRejectedError) as exc:
             return _router_error_response(exc)
+        worker_addr = route_result.worker_addr
+        headers[WORKER_ID_HEADER] = route_result.worker_id
 
         resp = await forward_request(
             f"{worker_addr}/rl/set_reward",
@@ -1440,7 +1530,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
             """Settle replay and cleanup-slot ownership as one critical section."""
 
             if cleanup_required:
-                await _handoff_export_group_cleanup(group_id)
+                assert group_id is not None
+                await _handoff_export_group_cleanup(
+                    group_id,
+                    worker_addr,
+                    worker_id,
+                    tuple(session_ids),
+                )
             elif cleanup_slot_reserved:
                 await _release_export_group_cleanup_reservation(group_id)
 
@@ -1469,11 +1565,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     cleanup_required=cleanup_required,
                 )
             )
-            try:
-                await asyncio.shield(finalize_task)
-            except asyncio.CancelledError:
-                await finalize_task
-                raise
+            await _await_critical_task(finalize_task, "Export ownership settlement")
 
         try:
             recalled = await _recalled_export_worker(request_id, fingerprint)

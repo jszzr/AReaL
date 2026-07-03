@@ -243,6 +243,9 @@ async def revoke_session_in_router(
     router_addr: str,
     admin_api_key: str,
     group_id: str,
+    worker_addr: str,
+    worker_id: str,
+    session_ids: tuple[str, ...] | list[str],
     timeout: float = 2.0,
     *,
     client: httpx.AsyncClient | None = None,
@@ -252,7 +255,12 @@ async def revoke_session_in_router(
         async with _use_client(client, timeout) as c:
             resp = await c.post(
                 f"{router_addr}/remove_session",
-                json={"group_id": group_id},
+                json={
+                    "group_id": group_id,
+                    "worker_addr": worker_addr,
+                    "worker_id": worker_id,
+                    "session_ids": list(session_ids),
+                },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
                 timeout=timeout,
             )

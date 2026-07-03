@@ -478,6 +478,180 @@ async def test_session_mutations_accept_matching_worker_identity(client, config)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worker_header", [None, "epoch-e1"])
+async def test_chat_rejects_missing_or_stale_worker_before_session_side_effect(
+    client, config, mock_areal_client, worker_header
+):
+    started = await client.post(
+        "/rl/start_session",
+        json={"task_id": "chat-fenced", "delivery_mode": "pull"},
+        headers=admin_headers(),
+    )
+    api_key = started.json()["sessions"][0]["session_api_key"]
+    config.worker_id = "epoch-e2"
+    headers = session_headers(api_key)
+    if worker_header is not None:
+        headers[WORKER_ID_HEADER] = worker_header
+
+    response = await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": [{"role": "user", "content": "must not run"}],
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Data Proxy incarnation mismatch"
+    mock_areal_client.chat.completions.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_header", [None, "epoch-e1"])
+async def test_set_reward_rejects_missing_or_stale_worker_before_mutation(
+    client, config, worker_header
+):
+    started = await client.post(
+        "/rl/start_session",
+        json={"task_id": "reward-fenced", "delivery_mode": "pull"},
+        headers=admin_headers(),
+    )
+    credentials = started.json()["sessions"][0]
+    session = client._transport.app.state.session_store.get_session(
+        credentials["session_id"]
+    )
+    _add_fake_interaction(session)
+    config.worker_id = "epoch-e2"
+    headers = session_headers(credentials["session_api_key"])
+    if worker_header is not None:
+        headers[WORKER_ID_HEADER] = worker_header
+
+    response = await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Data Proxy incarnation mismatch"
+    assert not session.has_ready_trajectories
+    assert len(session.active_completions) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_sessions_rejects_stale_worker_without_closing_admission(
+    client, config
+):
+    request = {
+        "task_id": "cancel-fenced",
+        "delivery_mode": "pull",
+        "admission_id": "cancel-fenced-admission",
+    }
+    started = await client.post(
+        "/rl/start_session", json=request, headers=admin_headers()
+    )
+    session_id = started.json()["sessions"][0]["session_id"]
+    config.worker_id = "epoch-e2"
+
+    response = await client.post(
+        "/rl/cancel_sessions",
+        json={
+            "admission_id": "cancel-fenced-admission",
+            "session_ids": [session_id],
+        },
+        headers={**admin_headers(), WORKER_ID_HEADER: "epoch-e1"},
+    )
+
+    assert response.status_code == 409
+    assert client._transport.app.state.session_store.get_session(session_id) is not None
+    assert "cancel-fenced-admission" in client._transport.app.state.admission_records
+
+
+@pytest.mark.asyncio
+async def test_chat_parsing_precedes_worker_identity_fence(client, config):
+    config.worker_id = "epoch-e2"
+
+    response = await client.post(
+        "/chat/completions",
+        content=b"not-json",
+        headers={"Authorization": "Bearer unknown"},
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_set_reward_authentication_precedes_worker_identity_fence(client, config):
+    config.worker_id = "epoch-e2"
+
+    response = await client.post("/rl/set_reward", json={"reward": 1.0})
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/rl/set_reward", {"reward": 1.0}),
+        (
+            "/chat/completions",
+            {
+                "model": "sglang",
+                "messages": [{"role": "user", "content": "must not create HITL"}],
+            },
+        ),
+    ],
+)
+async def test_stale_admin_request_is_fenced_before_hitl_session_creation(
+    client, config, path, payload
+):
+    config.worker_id = "epoch-e2"
+
+    response = await client.post(
+        path,
+        json=payload,
+        headers={**admin_headers(), WORKER_ID_HEADER: "epoch-e1"},
+    )
+
+    assert response.status_code == 409
+    assert client._transport.app.state.session_store.session_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/rl/start_session", {"task_id": "auth-first", "delivery_mode": "pull"}),
+        (
+            "/export_trajectories",
+            {"request_id": "auth-first-export", "session_ids": ["missing"]},
+        ),
+        (
+            "/rl/cancel_sessions",
+            {"admission_id": "auth-first-cancel", "session_ids": ["missing"]},
+        ),
+    ],
+)
+async def test_admin_authentication_precedes_worker_fence(
+    client, config, path, payload
+):
+    config.worker_id = "epoch-e2"
+
+    response = await client.post(
+        path,
+        json=payload,
+        headers={
+            "Authorization": "Bearer wrong-admin-key",
+            WORKER_ID_HEADER: "epoch-e1",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_start_session_with_admin_key(client):
     resp = await client.post(
         "/rl/start_session",

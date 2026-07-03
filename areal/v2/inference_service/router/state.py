@@ -354,6 +354,30 @@ class SessionRegistry:
                 self._key_to_id.pop(session_key, None)
             return True
 
+    async def revoke_session_exact(
+        self, session_id: str, worker_addr: str, worker_id: str
+    ) -> bool:
+        """Remove a session only while it still belongs to the expected epoch."""
+
+        async with self._lock:
+            if (
+                self._id_to_worker.get(session_id) != worker_addr
+                or self._id_to_worker_id.get(session_id) != worker_id
+            ):
+                return False
+            del self._id_to_worker[session_id]
+            self._id_to_worker_id.pop(session_id, None)
+            session_key = self._id_to_key.pop(session_id, None)
+            if session_key is not None and (
+                self._key_to_worker.get(session_key) == worker_addr
+                and self._key_to_worker_id.get(session_key) == worker_id
+                and self._key_to_id.get(session_key) == session_id
+            ):
+                self._key_to_worker.pop(session_key, None)
+                self._key_to_worker_id.pop(session_key, None)
+                self._key_to_id.pop(session_key, None)
+            return True
+
     async def session_key_for_id(self, session_id: str) -> str | None:
         async with self._lock:
             return self._id_to_key.get(session_id)
@@ -384,6 +408,22 @@ class GroupInfo:
     session_ids: list[str] = field(default_factory=list)
     session_api_keys: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+
+    def matches_cleanup(
+        self,
+        worker_addr: str,
+        worker_id: str,
+        session_ids: list[str],
+    ) -> bool:
+        return (
+            self.worker_addr == worker_addr
+            and self.worker_id == worker_id
+            and sorted(self.session_ids) == sorted(session_ids)
+        )
+
+
+class GroupRetirementCapacityError(RuntimeError):
+    """The Router cannot safely retain another anti-resurrection tombstone."""
 
 
 class ModelRegistry:
@@ -430,8 +470,15 @@ class ModelRegistry:
 class GroupRegistry:
     """Maps group IDs to worker addresses and member session IDs."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_retired_groups: int = 4096) -> None:
+        if max_retired_groups < 1:
+            raise ValueError("max_retired_groups must be >= 1")
         self._groups: dict[str, GroupInfo] = {}
+        # A removal can arrive before a delayed registration.  Keep the exact
+        # cleanup owner so that late registration cannot resurrect its routes.
+        # Tombstones are purged when that worker incarnation is retired.
+        self._retired_groups: dict[str, GroupInfo] = {}
+        self._max_retired_groups = max_retired_groups
         self._lock = asyncio.Lock()
 
     async def register_group(
@@ -445,6 +492,13 @@ class GroupRegistry:
         """Store a group mapping with idempotent retry semantics."""
         resolved_api_keys = list(session_api_keys or [])
         async with self._lock:
+            retired = self._retired_groups.get(group_id)
+            if retired is not None:
+                if retired.matches_cleanup(worker_addr, worker_id, session_ids):
+                    raise ValueError(f"Group {group_id} has already been retired")
+                raise ValueError(
+                    f"Group {group_id} was retired with different ownership"
+                )
             existing = self._groups.get(group_id)
             if existing is not None:
                 if (
@@ -472,12 +526,64 @@ class GroupRegistry:
             return self._groups.get(group_id)
 
     async def revoke(self, group_id: str) -> list[str]:
-        """Remove a group. Returns the session_ids that were in the group."""
+        """Discard an active group for an internal registration rollback."""
         async with self._lock:
             info = self._groups.pop(group_id, None)
             if info is None:
                 return []
             return info.session_ids
+
+    async def compare_and_revoke(
+        self,
+        group_id: str,
+        worker_addr: str,
+        worker_id: str,
+        session_ids: list[str],
+        *,
+        retire_missing: bool = True,
+    ) -> tuple[bool, list[str]]:
+        """Retire only an exact group, or tombstone a cleanup that arrived first.
+
+        A mismatched cleanup is a successful no-op: its exact target is absent,
+        and deleting the active group would corrupt a successor's ownership.
+        """
+
+        async with self._lock:
+            existing = self._groups.get(group_id)
+            if existing is not None and not existing.matches_cleanup(
+                worker_addr, worker_id, session_ids
+            ):
+                return False, []
+
+            retired = self._retired_groups.get(group_id)
+            if retired is not None:
+                return False, []
+
+            if existing is None and not retire_missing:
+                return False, []
+
+            if len(self._retired_groups) >= self._max_retired_groups:
+                raise GroupRetirementCapacityError(
+                    "Group cleanup tombstone capacity is exhausted; retry after "
+                    "the owning worker incarnation is retired"
+                )
+
+            if existing is None:
+                retirement = GroupInfo(
+                    group_id=group_id,
+                    worker_addr=worker_addr,
+                    worker_id=worker_id,
+                    session_ids=list(session_ids),
+                )
+                removed = False
+                owned_session_ids: list[str] = []
+            else:
+                retirement = existing
+                removed = True
+                owned_session_ids = list(existing.session_ids)
+                self._groups.pop(group_id, None)
+            self._retired_groups[group_id] = retirement
+            return removed, owned_session_ids
 
     async def revoke_by_worker(self, worker_addr: str, worker_id: str) -> int:
         """Remove groups owned by an exact incarnation and return their count."""
@@ -490,4 +596,11 @@ class GroupRegistry:
             ]
             for group_id in group_ids:
                 self._groups.pop(group_id, None)
+            retired_group_ids = [
+                group_id
+                for group_id, info in self._retired_groups.items()
+                if info.worker_addr == worker_addr and info.worker_id == worker_id
+            ]
+            for group_id in retired_group_ids:
+                self._retired_groups.pop(group_id, None)
             return len(group_ids)

@@ -667,6 +667,9 @@ class TestRouterEndpoints:
         )
         await asyncio.wait_for(cascade_entered.wait(), timeout=1.0)
         replacement.cancel()
+        await asyncio.sleep(0)
+        replacement.cancel()
+        await asyncio.sleep(0)
         allow_cascade.set()
         with pytest.raises(asyncio.CancelledError):
             await replacement
@@ -1510,13 +1513,327 @@ class TestRouterEndpoints:
         # refreshed key that now authenticates the new session.
         removed = await client.post(
             "/remove_session",
-            json={"group_id": "grp-old"},
+            json={
+                "group_id": "grp-old",
+                "worker_addr": WORKER_1,
+                "worker_id": WORKER_ID_1,
+                "session_ids": ["old-id"],
+            },
             headers=admin_headers(),
         )
         assert removed.status_code == 200
         assert await registry.lookup_by_id("old-id") is None
         assert await registry.lookup_by_id("new-id") == WORKER_1
         assert await registry.lookup_by_key("stable-key") == WORKER_1
+
+    @pytest.mark.asyncio
+    async def test_cleanup_before_registration_tombstones_exact_group(self, client):
+        await register_workers(client, WORKER_1)
+        cleanup = {
+            "group_id": "late-group",
+            "worker_addr": WORKER_1,
+            "worker_id": WORKER_ID_1,
+            "session_ids": ["late-id"],
+        }
+
+        removed = await client.post(
+            "/remove_session", json=cleanup, headers=admin_headers()
+        )
+        late_registration = await client.post(
+            "/register_session",
+            json={
+                "sessions": [{"session_api_key": "late-key", "session_id": "late-id"}],
+                "worker_addr": WORKER_1,
+                "worker_id": WORKER_ID_1,
+                "group_id": "late-group",
+            },
+            headers=admin_headers(),
+        )
+
+        assert removed.status_code == 200
+        assert late_registration.status_code == 409
+        assert await client._transport.app.state.session_registry.count() == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "cleanup_override",
+        [
+            {"worker_id": "wrong-epoch"},
+            {"worker_addr": WORKER_2},
+            {"session_ids": ["unrelated-id"]},
+        ],
+    )
+    async def test_remove_session_rejects_non_exact_owner(
+        self, client, cleanup_override
+    ):
+        await register_workers(client, WORKER_1)
+        registration = {
+            "sessions": [{"session_api_key": "kept-key", "session_id": "kept-id"}],
+            "worker_addr": WORKER_1,
+            "worker_id": WORKER_ID_1,
+            "group_id": "kept-group",
+        }
+        assert (
+            await client.post(
+                "/register_session", json=registration, headers=admin_headers()
+            )
+        ).status_code == 200
+        cleanup = {
+            "group_id": "kept-group",
+            "worker_addr": WORKER_1,
+            "worker_id": WORKER_ID_1,
+            "session_ids": ["kept-id"],
+            **cleanup_override,
+        }
+
+        response = await client.post(
+            "/remove_session", json=cleanup, headers=admin_headers()
+        )
+
+        assert response.status_code == 200
+        assert response.json()["removed"] is False
+        assert (
+            await client._transport.app.state.session_registry.lookup_by_key("kept-key")
+            == WORKER_1
+        )
+
+    @pytest.mark.asyncio
+    async def test_remove_session_matches_exact_members_independent_of_order(
+        self, client
+    ):
+        await register_workers(client, WORKER_1)
+        assert (
+            await client.post(
+                "/register_session",
+                json={
+                    "sessions": [
+                        {"session_api_key": "key-a", "session_id": "id-a"},
+                        {"session_api_key": "key-b", "session_id": "id-b"},
+                    ],
+                    "worker_addr": WORKER_1,
+                    "worker_id": WORKER_ID_1,
+                    "group_id": "ordered-group",
+                },
+                headers=admin_headers(),
+            )
+        ).status_code == 200
+
+        response = await client.post(
+            "/remove_session",
+            json={
+                "group_id": "ordered-group",
+                "worker_addr": WORKER_1,
+                "worker_id": WORKER_ID_1,
+                "session_ids": ["id-b", "id-a"],
+            },
+            headers=admin_headers(),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["removed"] is True
+        registry = client._transport.app.state.session_registry
+        assert await registry.lookup_by_id("id-a") is None
+        assert await registry.lookup_by_id("id-b") is None
+
+    @pytest.mark.asyncio
+    async def test_delayed_old_cleanup_cannot_delete_successor_group(self, client):
+        await register_workers(client, WORKER_1)
+        old_registration = {
+            "sessions": [{"session_api_key": "old-key", "session_id": "old-id"}],
+            "worker_addr": WORKER_1,
+            "worker_id": WORKER_ID_1,
+            "group_id": "reused-group-id",
+        }
+        assert (
+            await client.post(
+                "/register_session", json=old_registration, headers=admin_headers()
+            )
+        ).status_code == 200
+        assert (
+            await client.post(
+                "/register",
+                json=register_payload(
+                    WORKER_1,
+                    worker_id="worker-1-epoch-2",
+                    expected_worker_id=WORKER_ID_1,
+                ),
+                headers=admin_headers(),
+            )
+        ).status_code == 200
+        successor = {
+            "sessions": [
+                {"session_api_key": "successor-key", "session_id": "successor-id"}
+            ],
+            "worker_addr": WORKER_1,
+            "worker_id": "worker-1-epoch-2",
+            "group_id": "reused-group-id",
+        }
+        assert (
+            await client.post(
+                "/register_session", json=successor, headers=admin_headers()
+            )
+        ).status_code == 200
+
+        delayed = await client.post(
+            "/remove_session",
+            json={
+                "group_id": "reused-group-id",
+                "worker_addr": WORKER_1,
+                "worker_id": WORKER_ID_1,
+                "session_ids": ["old-id"],
+            },
+            headers=admin_headers(),
+        )
+
+        assert delayed.status_code == 200
+        assert delayed.json()["removed"] is False
+        assert (
+            await client._transport.app.state.session_registry.lookup_by_key(
+                "successor-key"
+            )
+            == WORKER_1
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_for_inactive_epoch_does_not_tombstone_successor_name(
+        self, client
+    ):
+        await register_workers(client, WORKER_1)
+        assert (
+            await client.post(
+                "/register",
+                json=register_payload(
+                    WORKER_1,
+                    worker_id="worker-1-epoch-2",
+                    expected_worker_id=WORKER_ID_1,
+                ),
+                headers=admin_headers(),
+            )
+        ).status_code == 200
+
+        stale_cleanup = await client.post(
+            "/remove_session",
+            json={
+                "group_id": "future-successor-group",
+                "worker_addr": WORKER_1,
+                "worker_id": WORKER_ID_1,
+                "session_ids": ["old-session-id"],
+            },
+            headers=admin_headers(),
+        )
+        successor_registration = await client.post(
+            "/register_session",
+            json={
+                "sessions": [
+                    {
+                        "session_api_key": "future-successor-key",
+                        "session_id": "future-successor-id",
+                    }
+                ],
+                "worker_addr": WORKER_1,
+                "worker_id": "worker-1-epoch-2",
+                "group_id": "future-successor-group",
+            },
+            headers=admin_headers(),
+        )
+
+        assert stale_cleanup.status_code == 200
+        assert stale_cleanup.json()["removed"] is False
+        assert successor_registration.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_cannot_interrupt_session_registration(
+        self, client, monkeypatch
+    ):
+        await register_workers(client, WORKER_1)
+        registry = client._transport.app.state.session_registry
+        original_register = registry.register_sessions
+        entered = asyncio.Event()
+        allow = asyncio.Event()
+
+        async def blocking_register(*args, **kwargs):
+            entered.set()
+            await allow.wait()
+            return await original_register(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "register_sessions", blocking_register)
+        registration = asyncio.create_task(
+            client.post(
+                "/register_session",
+                json={
+                    "sessions": [
+                        {"session_api_key": "cancel-key", "session_id": "cancel-id"}
+                    ],
+                    "worker_addr": WORKER_1,
+                    "worker_id": WORKER_ID_1,
+                    "group_id": "cancel-group",
+                },
+                headers=admin_headers(),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        registration.cancel()
+        await asyncio.sleep(0)
+        registration.cancel()
+        await asyncio.sleep(0)
+        allow.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+        assert await registry.lookup_by_key("cancel-key") == WORKER_1
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_cannot_interrupt_exact_group_removal(
+        self, client, monkeypatch
+    ):
+        await register_workers(client, WORKER_1)
+        assert (
+            await client.post(
+                "/register_session",
+                json={
+                    "sessions": [
+                        {"session_api_key": "remove-key", "session_id": "remove-id"}
+                    ],
+                    "worker_addr": WORKER_1,
+                    "worker_id": WORKER_ID_1,
+                    "group_id": "remove-group",
+                },
+                headers=admin_headers(),
+            )
+        ).status_code == 200
+        registry = client._transport.app.state.session_registry
+        original_revoke = registry.revoke_session_exact
+        entered = asyncio.Event()
+        allow = asyncio.Event()
+
+        async def blocking_revoke(*args, **kwargs):
+            entered.set()
+            await allow.wait()
+            return await original_revoke(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "revoke_session_exact", blocking_revoke)
+        removal = asyncio.create_task(
+            client.post(
+                "/remove_session",
+                json={
+                    "group_id": "remove-group",
+                    "worker_addr": WORKER_1,
+                    "worker_id": WORKER_ID_1,
+                    "session_ids": ["remove-id"],
+                },
+                headers=admin_headers(),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        removal.cancel()
+        await asyncio.sleep(0)
+        removal.cancel()
+        await asyncio.sleep(0)
+        allow.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await removal
+        assert await registry.lookup_by_key("remove-key") is None
 
     @pytest.mark.asyncio
     async def test_register_session_rejects_key_refresh_across_workers(self, client):

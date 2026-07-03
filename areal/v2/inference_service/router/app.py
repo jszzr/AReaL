@@ -26,6 +26,7 @@ from areal.utils import logging
 from areal.v2.inference_service.router.config import RouterConfig
 from areal.v2.inference_service.router.state import (
     GroupRegistry,
+    GroupRetirementCapacityError,
     ModelRegistry,
     SessionRegistry,
     WorkerRegistry,
@@ -99,6 +100,9 @@ class RegisterSessionRequest(BaseModel):
 
 class RemoveSessionRequest(BaseModel):
     group_id: str
+    worker_addr: str
+    worker_id: str
+    session_ids: list[str]
 
 
 class RegisterModelRequest(BaseModel):
@@ -265,19 +269,28 @@ def create_app(config: RouterConfig) -> FastAPI:
     app.state.ownership_lock = ownership_lock
 
     async def _await_ownership_transition(task: asyncio.Task):
-        """Let an in-memory ownership transition settle before propagating cancel."""
+        """Settle an ownership transition before propagating repeated cancels."""
 
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
+        request_cancelled = False
+        while not task.done():
             try:
-                await task
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                request_cancelled = True
+                continue
+            except BaseException:
+                break
+
+        if request_cancelled:
+            try:
+                task.result()
             except BaseException as exc:
                 logger.error(
                     "Ownership transition failed while its request was cancelled: %s",
                     exc,
                 )
-            raise
+            raise asyncio.CancelledError
+        return task.result()
 
     # =========================================================================
     # Health
@@ -541,44 +554,48 @@ def create_app(config: RouterConfig) -> FastAPI:
         _require_admin_key(request, config.admin_api_key)
 
         session_ids = [e.session_id for e in body.sessions]
-        async with ownership_lock:
-            worker = await worker_registry.get_by_addr(body.worker_addr)
-            if worker is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Worker {body.worker_addr} is not registered",
-                )
-            if body.worker_id != worker.worker_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Worker epoch mismatch for {body.worker_addr}: "
-                        f"expected {worker.worker_id}, got {body.worker_id}"
-                    ),
-                )
-            group_created = False
-            try:
-                # Register the immutable group key first. A conflicting HTTP
-                # replay is rejected before any session mapping can be mutated.
-                group_created = await group_registry.register_group(
-                    body.group_id,
-                    body.worker_addr,
-                    session_ids,
-                    body.worker_id,
-                    [entry.session_api_key for entry in body.sessions],
-                )
-                await session_registry.register_sessions(
-                    [
-                        (entry.session_api_key, entry.session_id)
-                        for entry in body.sessions
-                    ],
-                    body.worker_addr,
-                    worker_id=body.worker_id,
-                )
-            except ValueError as exc:
-                if group_created:
-                    await group_registry.revoke(body.group_id)
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        async def _transition() -> None:
+            async with ownership_lock:
+                worker = await worker_registry.get_by_addr(body.worker_addr)
+                if worker is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Worker {body.worker_addr} is not registered",
+                    )
+                if body.worker_id != worker.worker_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Worker epoch mismatch for {body.worker_addr}: "
+                            f"expected {worker.worker_id}, got {body.worker_id}"
+                        ),
+                    )
+                group_created = False
+                try:
+                    # Register the immutable group key first. A conflicting HTTP
+                    # replay is rejected before any session mapping can be mutated.
+                    group_created = await group_registry.register_group(
+                        body.group_id,
+                        body.worker_addr,
+                        session_ids,
+                        body.worker_id,
+                        [entry.session_api_key for entry in body.sessions],
+                    )
+                    await session_registry.register_sessions(
+                        [
+                            (entry.session_api_key, entry.session_id)
+                            for entry in body.sessions
+                        ],
+                        body.worker_addr,
+                        worker_id=body.worker_id,
+                    )
+                except ValueError as exc:
+                    if group_created:
+                        await group_registry.revoke(body.group_id)
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        await _await_ownership_transition(asyncio.create_task(_transition()))
 
         return StatusResponse(status="ok")
 
@@ -590,13 +607,35 @@ def create_app(config: RouterConfig) -> FastAPI:
     async def remove_session(body: RemoveSessionRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
 
-        async with ownership_lock:
-            session_ids = await group_registry.revoke(body.group_id)
-            for sid in session_ids:
-                await session_registry.revoke_session(sid)
+        async def _transition() -> bool:
+            async with ownership_lock:
+                active_worker = await worker_registry.get_by_addr(body.worker_addr)
+                retire_missing = (
+                    active_worker is not None
+                    and active_worker.worker_id == body.worker_id
+                )
+                removed, owned_session_ids = await group_registry.compare_and_revoke(
+                    body.group_id,
+                    body.worker_addr,
+                    body.worker_id,
+                    body.session_ids,
+                    retire_missing=retire_missing,
+                )
+                for sid in owned_session_ids:
+                    await session_registry.revoke_session_exact(
+                        sid, body.worker_addr, body.worker_id
+                    )
+                return removed
+
+        try:
+            removed = await _await_ownership_transition(
+                asyncio.create_task(_transition())
+            )
+        except GroupRetirementCapacityError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         return RemoveSessionResponse(
             status="ok",
-            removed=len(session_ids) > 0,
+            removed=removed,
         )
 
     # =========================================================================

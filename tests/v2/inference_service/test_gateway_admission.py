@@ -145,6 +145,7 @@ class TestOnlineLeaseRegistry:
         binding = OnlineLeaseBinding(
             admission_id="lease-cleanup",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="grp-cleanup",
             session_ids=("session-1",),
         )
@@ -184,6 +185,7 @@ class TestOnlineLeaseRegistry:
         binding = OnlineLeaseBinding(
             admission_id=lease.lease_id,
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="late-group",
             session_ids=("late-session",),
         )
@@ -202,6 +204,7 @@ class TestOnlineLeaseRegistry:
         binding = OnlineLeaseBinding(
             admission_id=lease.lease_id,
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-pending-cleanup",
             session_ids=("session-pending-cleanup",),
         )
@@ -227,6 +230,7 @@ class TestOnlineLeaseRegistry:
             binding = OnlineLeaseBinding(
                 admission_id=lease.lease_id,
                 worker_addr=WORKER_ADDR,
+                worker_id=WORKER_ID,
                 group_id="group-owned",
                 session_ids=("session-owned",),
             )
@@ -332,6 +336,7 @@ class TestRequestWorkerOwnershipRegistry:
         cleanup_binding = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-1",
             session_ids=("session-1",),
         )
@@ -366,18 +371,28 @@ class TestRequestWorkerOwnershipRegistry:
         cleanup_binding = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-1",
             session_ids=("session-1",),
         )
         wrong_worker_cleanup = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr="http://worker-2:18082",
+            worker_id=WORKER_ID,
+            group_id="group-1",
+            session_ids=("session-1",),
+        )
+        wrong_epoch_cleanup = OnlineLeaseBinding(
+            admission_id="request-1",
+            worker_addr=WORKER_ADDR,
+            worker_id="stale-worker-epoch",
             group_id="group-1",
             session_ids=("session-1",),
         )
         conflicting_cleanup = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-2",
             session_ids=("session-2",),
         )
@@ -390,6 +405,10 @@ class TestRequestWorkerOwnershipRegistry:
         with pytest.raises(ValueError, match="cleanup worker does not match"):
             await registry.retain_cleanup(
                 "request-1", worker_binding, wrong_worker_cleanup
+            )
+        with pytest.raises(ValueError, match="cleanup worker does not match"):
+            await registry.retain_cleanup(
+                "request-1", worker_binding, wrong_epoch_cleanup
             )
         await registry.retain_cleanup("request-1", worker_binding, cleanup_binding)
         with pytest.raises(ValueError, match="conflicting cleanup"):
@@ -408,12 +427,14 @@ class TestRequestWorkerOwnershipRegistry:
         cleanup_binding = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-1",
             session_ids=("session-1",),
         )
         different_cleanup = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="different-group",
             session_ids=("different-session",),
         )
@@ -480,6 +501,7 @@ class TestRequestWorkerOwnershipRegistry:
         cleanup_binding = OnlineLeaseBinding(
             admission_id="request-1",
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="group-1",
             session_ids=("session-1",),
         )
@@ -1127,8 +1149,55 @@ class TestGatewayOnlineAdmission:
             "admission_id": "lease-1",
             "session_ids": ["task-1-0"],
         }
+        assert mock_forward.await_args_list[1].args[2][WORKER_ID_HEADER] == WORKER_ID
+        assert mock_revoke.call_args.args[2:] == (
+            "grp-1",
+            WORKER_ADDR,
+            WORKER_ID,
+            ("task-1-0",),
+        )
         mock_revoke.assert_awaited_once()
         mock_notify.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_stale_worker_cleanup_still_completes_exact_router_cleanup(
+        self, mock_forward, mock_revoke
+    ):
+        mock_forward.return_value = httpx.Response(
+            409, json={"detail": "Data Proxy incarnation mismatch"}
+        )
+        mock_revoke.return_value = True
+        app, client = _app_client()
+        registry = app.state.online_lease_registry
+        lease = OnlineLease("lease-stale-worker", expected_version=0)
+        binding = OnlineLeaseBinding(
+            admission_id=lease.lease_id,
+            worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
+            group_id="stale-worker-group",
+            session_ids=("stale-worker-session",),
+        )
+        await registry.grant(lease)
+        await registry.try_acquire()
+        await registry.bind(lease.lease_id, binding)
+        await registry.finish_start(lease.lease_id)
+
+        async with client:
+            response = await client.delete(
+                f"/internal/online_leases/{lease.lease_id}", headers=_headers()
+            )
+
+        assert response.status_code == 200
+        assert mock_forward.call_args.args[2][WORKER_ID_HEADER] == WORKER_ID
+        assert mock_revoke.call_args.args[2:] == (
+            "stale-worker-group",
+            WORKER_ADDR,
+            WORKER_ID,
+            ("stale-worker-session",),
+        )
+        assert await registry.pending_cleanup_bindings() == []
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.notify_online_lease_failure", new_callable=AsyncMock)
@@ -1420,6 +1489,68 @@ class TestGatewayOnlineAdmission:
         assert mock_register.await_count == 1
 
     @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_repeated_cancel_during_pull_success_settlement_preserves_replay(
+        self, mock_query, mock_forward, mock_register, mock_revoke
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        mock_forward.return_value = httpx.Response(
+            201,
+            json={
+                "group_id": "group-settled-pull",
+                "sessions": [
+                    {
+                        "session_id": "session-settled-pull",
+                        "session_api_key": "key-settled-pull",
+                    }
+                ],
+            },
+        )
+        app, client = _app_client()
+        replay_registry = app.state.start_request_registry
+        original_finish = replay_registry.finish
+        finish_started = asyncio.Event()
+        allow_finish = asyncio.Event()
+
+        async def _blocking_finish(*args, **kwargs):
+            finish_started.set()
+            await allow_finish.wait()
+            return await original_finish(*args, **kwargs)
+
+        body = {
+            "task_id": "task-settled-pull",
+            "delivery_mode": "pull",
+            "request_id": "request-settled-pull",
+        }
+        async with client:
+            with patch.object(replay_registry, "finish", side_effect=_blocking_finish):
+                start_task = asyncio.create_task(
+                    client.post("/rl/start_session", json=body, headers=_headers())
+                )
+                await finish_started.wait()
+                start_task.cancel()
+                await asyncio.sleep(0)
+                start_task.cancel()
+                await asyncio.sleep(0)
+                allow_finish.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await start_task
+
+            replay = await client.post(
+                "/rl/start_session", json=body, headers=_headers()
+            )
+
+        assert replay.status_code == 201
+        assert replay.json()["group_id"] == "group-settled-pull"
+        assert mock_query.await_count == 1
+        assert mock_forward.await_count == 1
+        assert mock_register.await_count == 1
+        mock_revoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @patch(f"{MODULE}.notify_online_lease_failure", new_callable=AsyncMock)
     @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
     @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
@@ -1669,6 +1800,7 @@ class TestGatewayOnlineAdmission:
         retryable_cleanup = OnlineLeaseBinding(
             admission_id=lease_id,
             worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
             group_id="",
             session_ids=(),
         )
@@ -2105,6 +2237,7 @@ class TestGatewayOnlineAdmission:
             OnlineLeaseBinding(
                 admission_id="lease-race",
                 worker_addr=WORKER_ADDR,
+                worker_id=WORKER_ID,
                 group_id="grp-race",
                 session_ids=("task-race-0",),
             ),
@@ -2146,6 +2279,7 @@ class TestGatewayOnlineAdmission:
             OnlineLeaseBinding(
                 admission_id="lease-retry",
                 worker_addr=WORKER_ADDR,
+                worker_id=WORKER_ID,
                 group_id="grp-retry",
                 session_ids=("task-retry-0",),
             ),
@@ -2395,6 +2529,8 @@ class TestGatewayExportCleanupCapacity:
                     )
                 )
                 await export_settled.wait()
+                export_task.cancel()
+                await asyncio.sleep(0)
                 export_task.cancel()
                 await asyncio.sleep(0)
                 allow_finish_return.set()
