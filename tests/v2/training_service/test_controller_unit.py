@@ -16,6 +16,7 @@ from areal.v2.training_service.controller.controller import (
     _disk_gateway_save_root,
 )
 from areal.v2.weight_update.gateway.config import WeightUpdateResult
+from areal.v2.weight_update.controller.controller import WeightUpdateController
 
 MODULE = "areal.v2.training_service.controller.controller"
 
@@ -93,6 +94,22 @@ class _FakeAsyncClient:
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
+
+
+class _FailOnceSession:
+    def __init__(self, error: BaseException):
+        self.error = error
+        self.close_count = 0
+        self.raised_traceback = None
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.close_count == 1:
+            try:
+                raise self.error
+            except BaseException as exc:
+                self.raised_traceback = exc.__traceback__
+                raise
 
 
 class TestGatewayTrainControllerInitialization:
@@ -402,26 +419,113 @@ class TestGatewayTrainControllerLifecycle:
         assert controller._weight_update_ctrl is None
 
     def test_destroy_continues_worker_cleanup_when_weight_update_destroy_fails(self):
-        class FailingWeightUpdateController:
-            def __init__(self):
-                self.destroy_count = 0
-
-            def destroy(self):
-                self.destroy_count += 1
-                raise RuntimeError("weight update cleanup failed")
-
         scheduler = MagicMock()
         controller = _make_controller(scheduler)
-        weight_update_controller = FailingWeightUpdateController()
+        session_error = RuntimeError("weight update cleanup failed")
+        session = _FailOnceSession(session_error)
+        weight_update_controller = WeightUpdateController()
+        weight_update_controller._session = session
         controller._weight_update_ctrl = weight_update_controller
         controller._service_roles = ["actor"]
 
         controller.destroy()
 
-        assert weight_update_controller.destroy_count == 1
+        assert session.close_count == 1
         scheduler.delete_workers.assert_called_once_with(role="actor")
         assert controller._weight_update_ctrl is weight_update_controller
         assert controller._service_roles == []
+
+        controller.destroy()
+
+        assert session.close_count == 2
+        assert weight_update_controller._session is None
+        assert controller._weight_update_ctrl is None
+
+    def test_destroy_defers_weight_update_keyboard_interrupt_until_cleanup_finishes(
+        self,
+    ):
+        primary_error = KeyboardInterrupt("session close interrupted")
+        session = _FailOnceSession(primary_error)
+        weight_update_controller = WeightUpdateController()
+        weight_update_controller._session = session
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        graceful_shutdown = MagicMock()
+        kill_forked_service = MagicMock()
+        controller._graceful_shutdown_workers = graceful_shutdown
+        controller._kill_forked_service = kill_forked_service
+        controller._weight_update_ctrl = weight_update_controller
+        controller._worker_addrs = ["http://train-worker"]
+        controller._forked_services = [("http://guard", "router", 0)]
+        controller._service_roles = ["actor"]
+        controller.api_key = "test-api-key"
+
+        try:
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                controller.destroy()
+
+            assert exc_info.value is primary_error
+            traceback_cursor = exc_info.tb
+            assert session.raised_traceback is not None
+            traceback_nodes = []
+            while traceback_cursor is not None:
+                traceback_nodes.append(traceback_cursor)
+                traceback_cursor = traceback_cursor.tb_next
+            assert session.raised_traceback in traceback_nodes
+
+            graceful_shutdown.assert_called_once_with()
+            kill_forked_service.assert_called_once_with("http://guard", "router", 0)
+            scheduler.delete_workers.assert_called_once_with(role="actor")
+            assert controller._weight_update_ctrl is weight_update_controller
+            assert weight_update_controller._session is session
+            assert controller._worker_addrs == []
+            assert controller._forked_services == []
+            assert controller._service_roles == []
+            assert controller.api_key is None
+
+            controller.destroy()
+
+            assert session.close_count == 2
+            assert weight_update_controller._session is None
+            assert controller._weight_update_ctrl is None
+        finally:
+            if controller._weight_update_ctrl is not None:
+                controller.destroy()
+
+    def test_destroy_keeps_weight_update_base_exception_primary_when_cleanup_fails(
+        self,
+    ):
+        primary_error = KeyboardInterrupt("session close interrupted")
+        secondary_error = RuntimeError("worker cleanup failed")
+        session = _FailOnceSession(primary_error)
+        weight_update_controller = WeightUpdateController()
+        weight_update_controller._session = session
+        scheduler = MagicMock()
+        scheduler.delete_workers.side_effect = secondary_error
+        controller = _make_controller(scheduler)
+        controller._weight_update_ctrl = weight_update_controller
+        controller._service_roles = ["actor"]
+
+        try:
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                controller.destroy()
+
+            assert exc_info.value is primary_error
+            assert any(
+                "RuntimeError: worker cleanup failed" in note
+                for note in getattr(primary_error, "__notes__", [])
+            )
+            scheduler.delete_workers.assert_called_once_with(role="actor")
+            assert controller._service_roles == []
+            assert controller._weight_update_ctrl is weight_update_controller
+
+            controller.destroy()
+
+            assert session.close_count == 2
+            assert controller._weight_update_ctrl is None
+        finally:
+            if controller._weight_update_ctrl is not None:
+                controller.destroy()
 
     def test_connect_engine_failure_releases_weight_update_controller(
         self, monkeypatch

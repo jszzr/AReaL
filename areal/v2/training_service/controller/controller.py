@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from threading import Lock
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -1247,14 +1248,36 @@ class GatewayTrainController:
         logger.info("All training worker engines destroyed gracefully")
 
     def _cleanup_runtime_state(self) -> None:
+        primary_cleanup_error: BaseException | None = None
+        primary_cleanup_traceback: TracebackType | None = None
+
+        def _add_secondary_cleanup_note(
+            stage: str, cleanup_error: BaseException
+        ) -> None:
+            assert primary_cleanup_error is not None
+            primary_cleanup_error.add_note(
+                f"{stage} also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
         with self._weight_update_lock:
             weight_update_ctrl = self._weight_update_ctrl
             if weight_update_ctrl is not None:
+                # Preserve the existing best-effort contract for ordinary cleanup
+                # errors. Control-flow BaseExceptions must still reach the caller,
+                # but only after the rest of this controller's resources are reaped.
                 try:
                     weight_update_ctrl.destroy()
                 except Exception:
                     logger.error(
                         "Failed to destroy WeightUpdateController", exc_info=True
+                    )
+                except BaseException as exc:
+                    primary_cleanup_error = exc
+                    primary_cleanup_traceback = exc.__traceback__
+                    logger.error(
+                        "WeightUpdateController cleanup interrupted; "
+                        "continuing runtime cleanup before re-raising",
+                        exc_info=True,
                     )
                 else:
                     if self._weight_update_ctrl is weight_update_ctrl:
@@ -1270,20 +1293,44 @@ class GatewayTrainController:
                     headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
                     timeout=10,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
+                if primary_cleanup_error is not None:
+                    _add_secondary_cleanup_note("Model unregister cleanup", exc)
+            except BaseException as exc:
+                if primary_cleanup_error is None:
+                    raise
+                logger.error("Failed to unregister model", exc_info=True)
+                _add_secondary_cleanup_note("Model unregister cleanup", exc)
 
-        self._graceful_shutdown_workers()
+        try:
+            self._graceful_shutdown_workers()
+        except BaseException as exc:
+            if primary_cleanup_error is None:
+                raise
+            logger.error("Failed to shut down worker engines gracefully", exc_info=True)
+            _add_secondary_cleanup_note("Graceful worker shutdown", exc)
 
         for guard_addr, role, worker_index in reversed(self._forked_services):
             try:
                 self._kill_forked_service(guard_addr, role, worker_index)
-            except Exception:
+            except Exception as exc:
                 logger.error(
                     "Error killing %s/%d: %s",
                     role,
                     worker_index,
                     traceback.format_exc(),
+                )
+                if primary_cleanup_error is not None:
+                    _add_secondary_cleanup_note(
+                        f"Forked service {role}/{worker_index} cleanup", exc
+                    )
+            except BaseException as exc:
+                if primary_cleanup_error is None:
+                    raise
+                logger.error("Error killing %s/%d", role, worker_index, exc_info=True)
+                _add_secondary_cleanup_note(
+                    f"Forked service {role}/{worker_index} cleanup", exc
                 )
         self._forked_services.clear()
 
@@ -1291,10 +1338,17 @@ class GatewayTrainController:
             try:
                 self.scheduler.delete_workers(role=role)
                 logger.info("Workers deleted for role: %s", role)
-            except Exception:
+            except Exception as exc:
                 logger.error(
                     "Error deleting workers for %s: %s", role, traceback.format_exc()
                 )
+                if primary_cleanup_error is not None:
+                    _add_secondary_cleanup_note(f"Worker role {role} cleanup", exc)
+            except BaseException as exc:
+                if primary_cleanup_error is None:
+                    raise
+                logger.error("Error deleting workers for %s", role, exc_info=True)
+                _add_secondary_cleanup_note(f"Worker role {role} cleanup", exc)
         self._service_roles.clear()
         self._worker_addrs.clear()
         self._router_addr = ""
@@ -1305,23 +1359,41 @@ class GatewayTrainController:
         if self._async_client is not None:
             try:
                 run_async_task(self._async_client.aclose)
-            except Exception:
-                pass
+            except Exception as exc:
+                if primary_cleanup_error is not None:
+                    logger.error("Failed to close async HTTP client", exc_info=True)
+                    _add_secondary_cleanup_note("Async HTTP client cleanup", exc)
+            except BaseException as exc:
+                if primary_cleanup_error is None:
+                    raise
+                logger.error("Failed to close async HTTP client", exc_info=True)
+                _add_secondary_cleanup_note("Async HTTP client cleanup", exc)
             self._async_client = None
             self._async_client_loop = None
 
-        import torch.distributed as dist
-
         if self._own_process_group:
             try:
+                import torch.distributed as dist
+
                 if dist.is_initialized():
                     dist.destroy_process_group()
-            except Exception:
+            except Exception as exc:
                 logger.error(
                     "Failed to destroy process group: %s", traceback.format_exc()
                 )
+                if primary_cleanup_error is not None:
+                    _add_secondary_cleanup_note("Process-group cleanup", exc)
+            except BaseException as exc:
+                if primary_cleanup_error is None:
+                    raise
+                logger.error("Failed to destroy process group", exc_info=True)
+                _add_secondary_cleanup_note("Process-group cleanup", exc)
             finally:
                 self._own_process_group = False
+
+        if primary_cleanup_error is not None:
+            assert primary_cleanup_traceback is not None
+            raise primary_cleanup_error.with_traceback(primary_cleanup_traceback)
 
     def destroy(self) -> None:
         self._shutdown_requested.set()
