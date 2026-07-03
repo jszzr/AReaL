@@ -179,7 +179,10 @@ class RolloutControllerV2:
         self._predecessor_worker_ids: dict[str, str | None] = {}
         self._registration_operation_lock = Lock()
         self._registration_state_lock = Lock()
-        self._destroy_lock = Lock()
+        # Serialize initialize/destroy state transitions.  Re-entrancy is
+        # required when executor submission fails while initialize owns the
+        # lifecycle lock and must roll back the callback server immediately.
+        self._destroy_lock = threading.RLock()
         self._registration_generation = 0
         self._destroyed = False
 
@@ -243,25 +246,44 @@ class RolloutControllerV2:
     ) -> concurrent.futures.Future | None:
         from areal.infra.utils.concurrent import get_executor
 
-        if self._init_future is not None:
-            raise RuntimeError(
-                "initialize() called while a previous initialization is in progress"
-            )
+        with self._destroy_lock:
+            if self._destroyed or self._shutdown_requested.is_set():
+                raise RuntimeError("initialize() called after controller shutdown")
+            if self._init_future is not None:
+                raise RuntimeError(
+                    "initialize() called while a previous initialization is in progress"
+                )
 
-        self._worker_role = role
-        self._start_online_callback_server()
+            self._worker_role = role
+            self._start_online_callback_server()
 
-        self._workers_ready.clear()
-        self._shutdown_requested.clear()
-        self._initialization_error = None
-        future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
-        )
-        self._init_future = future
+            self._workers_ready.clear()
+            self._initialization_error = None
+            try:
+                future = get_executor("ctrl_init").submit(
+                    self._guarded_bg_initialize,
+                    server_args,
+                    server_infos,
+                    *args,
+                    **kwargs,
+                )
+            except BaseException as exc:
+                self._initialization_error = exc
+                self._shutdown_requested.set()
+                self.destroy()
+                raise
+            # Holding the lifecycle lock prevents a fast background failure
+            # from destroying the controller before this owner is published.
+            self._init_future = future
 
         ready_timeout = self.config.workers_ready_timeout
         if not self._workers_ready.wait(timeout=ready_timeout):
-            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
+            timeout_error = TimeoutError(
+                f"Worker creation timed out after {ready_timeout}s"
+            )
+            self._initialization_error = timeout_error
+            self._shutdown_requested.set()
+            raise timeout_error
         if future.done():
             future.result()
 
@@ -277,8 +299,8 @@ class RolloutControllerV2:
             self._bg_initialize(*args, **kwargs)
         except BaseException as exc:
             primary_error = exc
-            self._initialization_error = exc
-            self._workers_ready.set()
+            if self._initialization_error is None:
+                self._initialization_error = exc
             logger.error(
                 "RolloutControllerV2 initialization failed, rolling back",
                 exc_info=True,
@@ -292,6 +314,7 @@ class RolloutControllerV2:
                 )
             raise
         finally:
+            self._workers_ready.set()
             if primary_error is None and self._shutdown_requested.is_set():
                 # A concurrent destroy may finish before an in-flight scheduler
                 # or HTTP call publishes its acknowledged owner. The initializer
@@ -307,6 +330,8 @@ class RolloutControllerV2:
     ) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
+        if self._shutdown_requested.is_set():
+            return
         run_async_task(
             self._async_initialize, server_args, server_infos, *args, **kwargs
         )
@@ -2269,25 +2294,24 @@ class RolloutControllerV2:
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
     ) -> None:
+        if getattr(self._sync_client, "is_closed", False) is True:
+            # A concurrent destroy may close the client before the initializer
+            # publishes a late owner.  The initializer's terminal cleanup pass
+            # must still be able to reap that acknowledged child.
+            self._sync_client = httpx.Client(timeout=30.0)
         try:
             resp = self._sync_client.post(
                 f"{guard_addr}/kill_forked_worker",
                 json={"role": role, "worker_index": worker_index},
                 timeout=10,
             )
-            if resp.status_code == 200:
-                logger.info("Killed forked service %s/%d", role, worker_index)
-            else:
-                logger.warning(
-                    "Failed to kill forked service %s/%d: %s",
-                    role,
-                    worker_index,
-                    resp.text,
-                )
+            resp.raise_for_status()
+            logger.info("Killed forked service %s/%d", role, worker_index)
         except httpx.HTTPError as exc:
             logger.error(
                 "Error killing forked service %s/%d: %s", role, worker_index, exc
             )
+            raise
 
     async def _get_async_client(self) -> httpx.AsyncClient:
         """Return the shared async HTTP client, recreating it when the event loop changes.

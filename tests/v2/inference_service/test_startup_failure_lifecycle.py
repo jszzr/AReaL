@@ -253,6 +253,54 @@ def test_rollout_initialization_failure_rolls_back_in_reverse_order() -> None:
     assert later_exc_info.value is primary
 
 
+def test_destroy_retains_fork_owner_when_guard_rejects_kill() -> None:
+    controller = _controller()
+    owner = ("http://guard", "inf-server", 0)
+    controller._forked_services.append(owner)
+    rejected = httpx.Response(
+        500,
+        text="kill failed",
+        request=httpx.Request("POST", "http://guard/kill_forked_worker"),
+    )
+
+    with (
+        patch.object(controller._sync_client, "post", return_value=rejected),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        controller.destroy()
+
+    assert controller._forked_services == [owner]
+    assert controller._destroyed is False
+
+
+def test_terminal_cleanup_reopens_closed_sync_client_for_late_owner() -> None:
+    controller = _controller()
+    owner = ("http://guard", "late-inf-server", 0)
+    observed_requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        observed_requests.append(request)
+        return httpx.Response(200, json={"status": "success"})
+
+    controller._sync_client.close()
+    controller._forked_services.append(owner)
+    real_httpx_client = httpx.Client
+
+    def make_sync_client(*_args, **_kwargs) -> httpx.Client:
+        return real_httpx_client(transport=httpx.MockTransport(handle))
+
+    with patch(
+        "areal.v2.inference_service.controller.controller.httpx.Client",
+        side_effect=make_sync_client,
+    ):
+        controller.destroy()
+
+    assert len(observed_requests) == 1
+    assert observed_requests[0].url == httpx.URL("http://guard/kill_forked_worker")
+    assert controller._forked_services == []
+    assert controller._destroyed is True
+
+
 def test_initialization_thread_reaps_owner_published_after_concurrent_destroy() -> None:
     controller = _controller()
     initialization_started = threading.Event()
@@ -292,6 +340,117 @@ def test_initialization_thread_reaps_owner_published_after_concurrent_destroy() 
     assert thread_errors == []
     assert killed_owners == [owner]
     assert controller._forked_services == []
+    assert controller._destroyed is True
+
+
+def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner() -> None:
+    controller = _controller()
+    controller.config.workers_ready_timeout = 0.01
+    initialization_started = threading.Event()
+    release_late_publish = threading.Event()
+    owner = ("http://guard", "late-inf-server", 0)
+    killed_owners: list[tuple[str, str, int]] = []
+    deleted_roles: list[str] = []
+
+    def publish_after_timeout(*_args, **_kwargs) -> None:
+        initialization_started.set()
+        assert release_late_publish.wait(timeout=1.0)
+        controller._forked_services.append(owner)
+        controller._service_roles.append("rollout-inf")
+
+    controller.scheduler.delete_workers.side_effect = (
+        lambda *, role: deleted_roles.append(role)
+    )
+
+    with (
+        patch.object(controller, "_bg_initialize", publish_after_timeout),
+        patch.object(controller, "_start_online_callback_server"),
+        patch.object(controller, "_stop_online_callback_server"),
+        patch.object(
+            controller,
+            "_kill_forked_service",
+            side_effect=lambda *args: killed_owners.append(args),
+        ),
+    ):
+        with pytest.raises(TimeoutError, match="Worker creation timed out"):
+            controller.initialize("rollout")
+        assert initialization_started.is_set()
+        assert controller._shutdown_requested.is_set()
+        future = controller._init_future
+        assert future is not None
+        release_late_publish.set()
+        future.result(timeout=1.0)
+
+    assert killed_owners == [owner]
+    assert deleted_roles == ["rollout-inf"]
+    assert controller._forked_services == []
+    assert controller._service_roles == []
+    assert controller._destroyed is True
+
+
+def test_initialize_and_destroy_are_linearized_across_callback_start() -> None:
+    controller = _controller()
+    callback_start_entered = threading.Event()
+    release_callback_start = threading.Event()
+    destroy_called = threading.Event()
+    destroy_finished = threading.Event()
+    deleted_roles: list[str] = []
+    initialize_errors: list[BaseException] = []
+    destroy_errors: list[BaseException] = []
+
+    def start_callback() -> None:
+        callback_start_entered.set()
+        assert release_callback_start.wait(timeout=1.0)
+
+    def publish_role(*_args, **_kwargs) -> None:
+        controller._service_roles.append("late-role")
+
+    def initialize() -> None:
+        try:
+            controller.initialize("rollout")
+        except BaseException as exc:
+            initialize_errors.append(exc)
+
+    def destroy() -> None:
+        destroy_called.set()
+        try:
+            controller.destroy()
+        except BaseException as exc:
+            destroy_errors.append(exc)
+        finally:
+            destroy_finished.set()
+
+    controller.scheduler.delete_workers.side_effect = (
+        lambda *, role: deleted_roles.append(role)
+    )
+
+    with (
+        patch.object(
+            controller, "_start_online_callback_server", side_effect=start_callback
+        ),
+        patch.object(controller, "_stop_online_callback_server"),
+        patch.object(controller, "_bg_initialize", side_effect=publish_role),
+    ):
+        initialize_thread = threading.Thread(target=initialize)
+        initialize_thread.start()
+        assert callback_start_entered.wait(timeout=1.0)
+
+        destroy_thread = threading.Thread(target=destroy)
+        destroy_thread.start()
+        assert destroy_called.wait(timeout=1.0)
+        assert not destroy_finished.wait(timeout=0.05)
+
+        release_callback_start.set()
+        initialize_thread.join(timeout=1.0)
+        destroy_thread.join(timeout=1.0)
+
+    assert not initialize_thread.is_alive()
+    assert not destroy_thread.is_alive()
+    assert initialize_errors == []
+    assert destroy_errors == []
+    assert controller._shutdown_requested.is_set()
+    assert controller._service_roles == []
+    assert deleted_roles == ["late-role"]
     assert controller._destroyed is True
 
 

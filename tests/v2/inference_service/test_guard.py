@@ -263,6 +263,24 @@ class TestKillForkedWorker:
         assert resp.status_code == 200
         mock_kill.assert_not_called()
 
+    @patch(
+        f"{GUARD_APP}.kill_process_tree",
+        side_effect=OSError("process tree is still alive"),
+    )
+    def test_kill_failure_keeps_worker_tracked_for_retry(self, _mock_kill, client):
+        mock_proc = _make_mock_process(pid=457)
+        guard_module._state.forked_children.append(mock_proc)
+        guard_module._state.forked_children_map[("retry", 0)] = mock_proc
+
+        resp = client.post(
+            "/kill_forked_worker",
+            json={"role": "retry", "worker_index": 0},
+        )
+
+        assert resp.status_code == 500
+        assert guard_module._state.forked_children_map[("retry", 0)] is mock_proc
+        assert mock_proc in guard_module._state.forked_children
+
     def test_kill_missing_role(self, client):
         resp = client.post("/kill_forked_worker", json={"worker_index": 0})
         assert resp.status_code == 400

@@ -95,6 +95,7 @@ class GatewayTrainController:
         # Pipelined initialization state
         self._init_future: concurrent.futures.Future | None = None
         self._init_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
 
@@ -109,45 +110,75 @@ class GatewayTrainController:
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
-        if self._init_future is not None:
-            raise RuntimeError(
-                "initialize() called while a previous initialization is in progress"
-            )
+        with self._lifecycle_lock:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError("initialize() called after controller shutdown")
+            if self._init_future is not None:
+                raise RuntimeError(
+                    "initialize() called while a previous initialization is in progress"
+                )
 
-        self._role = role
-
-        self._workers_ready.clear()
-        self._shutdown_requested.clear()
-        self._init_future = get_executor("ctrl_init").submit(
-            self._guarded_bg_initialize,
-            role,
-            ft_spec,
-            base_seed=base_seed,
-            **kwargs,
-        )
+            self._role = role
+            self._workers_ready.clear()
+            try:
+                future = get_executor("ctrl_init").submit(
+                    self._guarded_bg_initialize,
+                    role,
+                    ft_spec,
+                    base_seed=base_seed,
+                    **kwargs,
+                )
+            except BaseException:
+                self._shutdown_requested.set()
+                self.destroy()
+                raise
+            self._init_future = future
 
         ready_timeout = self.config.workers_ready_timeout
         if not self._workers_ready.wait(timeout=ready_timeout):
+            self._shutdown_requested.set()
             raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
-        if self._init_future.done():
-            self._init_future.result()
+        if future.done():
+            future.result()
 
         if wait:
             self._ensure_initialized()
             return None
-        return self._init_future
+        return future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
+        primary_error: BaseException | None = None
         try:
             self._bg_initialize(*args, **kwargs)
-        except BaseException:
-            self._workers_ready.set()
+        except BaseException as exc:
+            primary_error = exc
+            self._shutdown_requested.set()
+            logger.error(
+                "GatewayTrainController initialization failed, rolling back",
+                exc_info=True,
+            )
+            try:
+                self.destroy()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "Rollback cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
+        finally:
+            self._workers_ready.set()
+            if primary_error is None and self._shutdown_requested.is_set():
+                # A timeout or concurrent destroy can precede publication of
+                # an acknowledged child.  The initializer owns the terminal
+                # cleanup pass after all late publishers have stopped.
+                self.destroy()
 
     def _bg_initialize(
         self, role: str, ft_spec: FinetuneSpec | None = None, **kwargs: Any
     ) -> None:
+        if self._shutdown_requested.is_set():
+            return
         run_async_task(self._async_initialize, role, ft_spec, **kwargs)
         if self._shutdown_requested.is_set():
             return
@@ -1431,10 +1462,11 @@ class GatewayTrainController:
             raise primary_cleanup_error.with_traceback(primary_cleanup_traceback)
 
     def destroy(self) -> None:
-        self._shutdown_requested.set()
-        future = self._init_future
-        self._init_future = None
-        if future is not None:
-            future.cancel()
+        with self._lifecycle_lock:
+            self._shutdown_requested.set()
+            future = self._init_future
+            self._init_future = None
+            if future is not None:
+                future.cancel()
 
-        self._cleanup_runtime_state()
+            self._cleanup_runtime_state()

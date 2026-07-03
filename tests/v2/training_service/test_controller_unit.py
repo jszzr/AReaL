@@ -117,6 +117,49 @@ class _FailOnceSession:
 
 
 class TestGatewayTrainControllerInitialization:
+    def test_workers_ready_timeout_requests_shutdown_and_reaps_late_owner(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        controller.config.workers_ready_timeout = 0.01
+        initialization_started = threading.Event()
+        release_late_publish = threading.Event()
+        owner = ("http://guard", "late-train-worker", 0)
+        killed_owners: list[tuple[str, str, int]] = []
+        deleted_roles: list[str] = []
+
+        def publish_after_timeout(*_args, **_kwargs) -> None:
+            initialization_started.set()
+            assert release_late_publish.wait(timeout=1.0)
+            controller._forked_services.append(owner)
+            controller._service_roles.append("actor-guard")
+
+        scheduler.delete_workers.side_effect = lambda *, role: deleted_roles.append(
+            role
+        )
+
+        with (
+            patch.object(controller, "_bg_initialize", publish_after_timeout),
+            patch.object(
+                controller,
+                "_kill_forked_service",
+                side_effect=lambda *args: killed_owners.append(args),
+            ),
+        ):
+            with pytest.raises(TimeoutError, match="Worker creation timed out"):
+                controller.initialize("actor")
+
+            assert initialization_started.is_set()
+            assert controller._shutdown_requested.is_set()
+            future = controller._init_future
+            assert future is not None
+            release_late_publish.set()
+            future.result(timeout=1.0)
+
+        assert killed_owners == [owner]
+        assert deleted_roles == ["actor-guard"]
+        assert controller._forked_services == []
+        assert controller._service_roles == []
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("invalid_seed", [-1, 2**32, True])
     async def test_invalid_base_seed_fails_before_guard_creation(self, invalid_seed):

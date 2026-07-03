@@ -390,17 +390,10 @@ def create_app(state: GuardState) -> Flask:
 
             key = (role, worker_index)
 
-            # Remove from tracking structures (hold lock only for dict/list ops)
+            # Look up the owner without consuming it.  The process remains
+            # retryable if the blocking tree kill below fails.
             with s.forked_children_lock:
-                child_process = s.forked_children_map.pop(key, None)
-                if child_process:
-                    try:
-                        s.forked_children.remove(child_process)
-                    except ValueError:
-                        logger.warning(
-                            f"Process for {role}/{worker_index} was in map "
-                            "but not in list"
-                        )
+                child_process = s.forked_children_map.get(key)
 
             if child_process is None:
                 return (
@@ -433,6 +426,20 @@ def create_app(state: GuardState) -> Flask:
                     ),
                     500,
                 )
+
+            # Commit ownership removal only after the child is known to have
+            # exited (or the kill completed).  Guard against an ABA-style
+            # replacement of the same logical role while the kill was
+            # blocking: never remove a newer map entry.
+            with s.forked_children_lock:
+                if s.forked_children_map.get(key) is child_process:
+                    s.forked_children_map.pop(key, None)
+                try:
+                    s.forked_children.remove(child_process)
+                except ValueError:
+                    logger.warning(
+                        f"Process for {role}/{worker_index} was in map but not in list"
+                    )
 
             return jsonify(
                 {
