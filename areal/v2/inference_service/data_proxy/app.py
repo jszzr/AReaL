@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
+import math
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -12,8 +15,8 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.wsgi import WSGIMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.responses import Response as RawResponse
-from fastapi.responses import StreamingResponse
 from flask import Flask
 from pydantic import BaseModel
 
@@ -344,11 +347,30 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     admission_lock = asyncio.Lock()
     export_lock = asyncio.Lock()
-    admission_records: dict[str, tuple[str, StartSessionResponse]] = {}
-    cancelled_admissions: dict[str, None] = {}
+    admission_records: dict[bytes, tuple[bytes, float, StartSessionResponse]] = {}
+    cancelled_admissions: dict[bytes, float] = {}
 
-    def _tombstone_admission_locked(admission_id: str) -> None:
-        cancelled_admissions[admission_id] = None
+    def _admission_digest(admission_id: str | bytes) -> bytes:
+        if isinstance(admission_id, bytes):
+            return admission_id
+        return hashlib.sha256(admission_id.encode("utf-8")).digest()
+
+    def _purge_expired_admissions_locked() -> None:
+        now = time.time()
+        for admission_id, (_, deadline, _) in list(admission_records.items()):
+            if deadline <= now:
+                admission_records.pop(admission_id, None)
+        for admission_id, deadline in list(cancelled_admissions.items()):
+            if deadline <= now:
+                cancelled_admissions.pop(admission_id, None)
+
+    def _tombstone_admission_locked(
+        admission_id: str | bytes, request_expires_at: float | None = None
+    ) -> None:
+        deadline = request_expires_at or (
+            time.time() + config.export_replay_ttl_seconds
+        )
+        cancelled_admissions[_admission_digest(admission_id)] = deadline
         if len(cancelled_admissions) > _MAX_ADMISSION_TOMBSTONES:
             oldest = next(iter(cancelled_admissions))
             cancelled_admissions.pop(oldest, None)
@@ -359,13 +381,16 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         if not session_ids:
             return
         async with admission_lock:
-            for admission_id, (_, response) in list(admission_records.items()):
+            _purge_expired_admissions_locked()
+            for admission_id, (_, deadline, response) in list(
+                admission_records.items()
+            ):
                 if any(
                     credential.session_id in session_ids
                     for credential in response.sessions
                 ):
                     admission_records.pop(admission_id, None)
-                    _tombstone_admission_locked(admission_id)
+                    _tombstone_admission_locked(admission_id, deadline)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -532,6 +557,19 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         _require_worker_identity(request, config)
 
         group_size = max(body.group_size, 1)
+        now = time.time()
+        if not math.isfinite(body.request_expires_at):
+            raise HTTPException(
+                status_code=422,
+                detail="request_expires_at must be a finite Unix timestamp",
+            )
+        if body.request_expires_at <= now:
+            raise HTTPException(status_code=410, detail="request deadline expired")
+        if body.request_expires_at - now > config.export_replay_ttl_seconds:
+            raise HTTPException(
+                status_code=422,
+                detail="request_expires_at exceeds the maximum replay horizon",
+            )
         if body.delivery_mode is TrajectoryDeliveryMode.CALLBACK:
             if group_size != 1:
                 raise HTTPException(
@@ -566,7 +604,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     ),
                 )
 
-        fingerprint = json.dumps(body.model_dump(mode="json"), sort_keys=True)
+        fingerprint = hashlib.sha256(
+            json.dumps(body.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+        ).digest()
 
         async def _create() -> StartSessionResponse:
             group_id = f"grp-{uuid.uuid4()}"
@@ -597,15 +637,20 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             return await _create()
 
         async with admission_lock:
-            if body.admission_id in cancelled_admissions:
+            _purge_expired_admissions_locked()
+            admission_id_digest = _admission_digest(body.admission_id)
+            if admission_id_digest in cancelled_admissions:
                 raise HTTPException(
                     status_code=410,
                     detail=f"Admission {body.admission_id} is closed or cancelled",
                 )
-            existing = admission_records.get(body.admission_id)
+            existing = admission_records.get(admission_id_digest)
             if existing is not None:
-                existing_fingerprint, response = existing
-                if existing_fingerprint != fingerprint:
+                existing_fingerprint, existing_deadline, response = existing
+                if (
+                    existing_fingerprint != fingerprint
+                    or existing_deadline != body.request_expires_at
+                ):
                     raise HTTPException(
                         status_code=409,
                         detail=(
@@ -616,7 +661,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 return response
 
             response = await _create()
-            admission_records[body.admission_id] = (fingerprint, response)
+            admission_records[admission_id_digest] = (
+                fingerprint,
+                body.request_expires_at,
+                response,
+            )
             return response
 
     @app.post("/rl/cancel_sessions")
@@ -625,13 +674,18 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         _require_admin_key(request, store)
         _require_worker_identity(request, config)
         async with admission_lock:
-            _tombstone_admission_locked(body.admission_id)
+            _purge_expired_admissions_locked()
             session_ids = set(body.session_ids)
-            existing = admission_records.pop(body.admission_id, None)
+            admission_id_digest = _admission_digest(body.admission_id)
+            existing = admission_records.pop(admission_id_digest, None)
             if existing is not None:
+                _, deadline, existing_response = existing
+                _tombstone_admission_locked(body.admission_id, deadline)
                 session_ids.update(
-                    credential.session_id for credential in existing[1].sessions
+                    credential.session_id for credential in existing_response.sessions
                 )
+            else:
+                _tombstone_admission_locked(body.admission_id)
             removed = 0
             for session_id in session_ids:
                 if store.get_session(session_id) is not None:
@@ -894,7 +948,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         request_fingerprint = body.replay_fingerprint()
         try:
             reservation = store.reserve_export_replay(
-                body.request_id, request_fingerprint
+                body.request_id,
+                request_fingerprint,
+                request_expires_at=body.request_expires_at,
             )
         except ExportReplayConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -902,11 +958,19 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             raise HTTPException(status_code=410, detail=str(exc)) from exc
         except ExportReplayCapacityError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not reservation.is_owner:
             if reservation.payload is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Export request_id {body.request_id} is still pending",
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "code": "export_pending",
+                        "detail": (
+                            f"Export request_id {body.request_id} is still pending"
+                        ),
+                    },
+                    headers={"Retry-After": "1"},
                 )
             return ExportTrajectoriesResponse(traj=reservation.payload)
 
@@ -955,8 +1019,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                             "sessions"
                         ),
                     )
-                if body.remove_session and body.group_id is not None:
-                    group_members = store.session_ids_for_group(body.group_id)
+                if body.remove_session and actual_group_id is not None:
+                    group_members = store.session_ids_for_group(actual_group_id)
                     if set(body.session_ids) != group_members:
                         raise HTTPException(
                             status_code=409,

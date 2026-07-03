@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
+import uuid
 
 import requests
 from _fmt import (
@@ -72,7 +74,12 @@ def main() -> None:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {args.admin_key}",
             },
-            json={"task_id": args.task_id, "api_key": args.api_key},
+            json={
+                "task_id": args.task_id,
+                "api_key": args.api_key,
+                "request_id": f"openclaw-{uuid.uuid4()}",
+                "request_expires_at": time.time() + 300.0,
+            },
             timeout=130 if is_refresh else 10,
         )
     except requests.RequestException as e:

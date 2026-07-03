@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -67,6 +69,17 @@ class RequestWorkerBinding:
     worker_addr: str
     worker_id: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "fingerprint",
+            hashlib.sha256(self.fingerprint.encode("utf-8")).hexdigest(),
+        )
+
+    @staticmethod
+    def digest_fingerprint(fingerprint: str) -> str:
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class RequestWorkerOwnership:
@@ -89,15 +102,22 @@ class RequestWorkerOwnershipRegistry:
     def __init__(self, max_owned_records: int = 4096) -> None:
         if max_owned_records < 1:
             raise ValueError("max_owned_records must be >= 1")
-        self._records: dict[str, _RequestWorkerOwnershipRecord] = {}
+        self._records: dict[bytes, _RequestWorkerOwnershipRecord] = {}
         self._lock = asyncio.Lock()
         self._max_owned_records = max_owned_records
+
+    @staticmethod
+    def _request_digest(request_id: str | bytes) -> bytes:
+        if isinstance(request_id, bytes):
+            return request_id
+        return hashlib.sha256(request_id.encode("utf-8")).digest()
 
     async def remember(
         self, request_id: str, binding: RequestWorkerBinding
     ) -> RequestWorkerBinding:
         async with self._lock:
-            record = self._records.get(request_id)
+            request_id_digest = self._request_digest(request_id)
+            record = self._records.get(request_id_digest)
             if record is not None:
                 if record.binding != binding:
                     raise ValueError(
@@ -109,17 +129,21 @@ class RequestWorkerOwnershipRegistry:
                     "Request worker ownership capacity is exhausted; retry after "
                     "pending mutations or cleanup complete"
                 )
-            self._records[request_id] = _RequestWorkerOwnershipRecord(binding=binding)
+            self._records[request_id_digest] = _RequestWorkerOwnershipRecord(
+                binding=binding
+            )
             return binding
 
     async def recall(
         self, request_id: str, fingerprint: str
     ) -> RequestWorkerOwnership | None:
         async with self._lock:
-            record = self._records.get(request_id)
+            record = self._records.get(self._request_digest(request_id))
             if record is None:
                 return None
-            if record.binding.fingerprint != fingerprint:
+            if record.binding.fingerprint != RequestWorkerBinding.digest_fingerprint(
+                fingerprint
+            ):
                 raise ValueError(f"Request {request_id} has a conflicting replay")
             state = (
                 RequestWorkerOwnershipState.CLEANUP_PENDING
@@ -141,7 +165,7 @@ class RequestWorkerOwnershipRegistry:
         """Transfer a pinned mutation to reaper-owned cleanup."""
 
         async with self._lock:
-            record = self._records.get(request_id)
+            record = self._records.get(self._request_digest(request_id))
             if record is None or record.binding != binding:
                 raise ValueError(f"Request {request_id} has no matching worker owner")
             if (
@@ -160,45 +184,47 @@ class RequestWorkerOwnershipRegistry:
 
     async def pending_cleanups(
         self,
-    ) -> list[tuple[str, RequestWorkerBinding, OnlineLeaseBinding]]:
+    ) -> list[tuple[bytes, RequestWorkerBinding, OnlineLeaseBinding]]:
         async with self._lock:
             return [
-                (request_id, record.binding, record.cleanup_binding)
-                for request_id, record in self._records.items()
+                (request_id_digest, record.binding, record.cleanup_binding)
+                for request_id_digest, record in self._records.items()
                 if record.cleanup_binding is not None
             ]
 
     async def acknowledge_cleanup(
         self,
-        request_id: str,
+        request_id: str | bytes,
         binding: RequestWorkerBinding,
         cleanup_binding: OnlineLeaseBinding,
     ) -> bool:
         """Remove ownership only when both worker and cleanup bindings match."""
 
         async with self._lock:
-            record = self._records.get(request_id)
+            request_id_digest = self._request_digest(request_id)
+            record = self._records.get(request_id_digest)
             if (
                 record is None
                 or record.binding != binding
                 or record.cleanup_binding != cleanup_binding
             ):
                 return False
-            self._records.pop(request_id)
+            self._records.pop(request_id_digest)
             return True
 
     async def forget(self, request_id: str, binding: RequestWorkerBinding) -> bool:
         """Release a definitively settled worker mutation using exact ownership."""
 
         async with self._lock:
-            record = self._records.get(request_id)
+            request_id_digest = self._request_digest(request_id)
+            record = self._records.get(request_id_digest)
             if (
                 record is None
                 or record.binding != binding
                 or record.cleanup_binding is not None
             ):
                 return False
-            self._records.pop(request_id)
+            self._records.pop(request_id_digest)
             return True
 
 
@@ -212,6 +238,7 @@ class _LeaseRecord:
     expires_at: float = 0.0
     cleanup_acknowledged: bool = False
     start_in_flight: bool = False
+    export_in_flight: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,6 +270,7 @@ class OnlineLeaseRegistry:
         return (
             record.terminal_at is None
             or record.start_in_flight
+            or record.export_in_flight
             or (record.binding is not None and not record.cleanup_acknowledged)
         )
 
@@ -252,6 +280,7 @@ class OnlineLeaseRegistry:
             for lease_id, record in self._records.items()
             if record.terminal_at is not None
             and not record.start_in_flight
+            and not record.export_in_flight
             and (record.binding is None or record.cleanup_acknowledged)
         ]
         terminal_records.sort(key=lambda item: item[1])
@@ -313,6 +342,8 @@ class OnlineLeaseRegistry:
                     OnlineLeaseState.CANCELLED,
                 }:
                     continue
+                if record.export_in_flight:
+                    continue
                 if record.expires_at > resolved_now:
                     continue
                 reason = (
@@ -350,7 +381,11 @@ class OnlineLeaseRegistry:
             }:
                 binding = (
                     None
-                    if record.start_in_flight or record.cleanup_acknowledged
+                    if (
+                        record.start_in_flight
+                        or record.export_in_flight
+                        or record.cleanup_acknowledged
+                    )
                     else record.binding
                 )
                 return False, binding
@@ -362,7 +397,11 @@ class OnlineLeaseRegistry:
             # Router registration is still in flight.  Let that owner reach its
             # commit point before compensation; otherwise cleanup can run first
             # and the late registration would resurrect a stale route.
-            binding = None if record.start_in_flight else record.binding
+            binding = (
+                None
+                if record.start_in_flight or record.export_in_flight
+                else record.binding
+            )
             self._purge_terminal_records_locked()
             return True, binding
 
@@ -384,11 +423,13 @@ class OnlineLeaseRegistry:
     async def complete(self, lease_id: str) -> bool:
         async with self._lock:
             record = self._records.get(lease_id)
-            if record is None or record.state not in {
-                OnlineLeaseState.ACQUIRED,
-                OnlineLeaseState.DELIVERED,
-            }:
+            if (
+                record is None
+                or record.state is not OnlineLeaseState.DELIVERED
+                or not record.export_in_flight
+            ):
                 return False
+            record.export_in_flight = False
             record.state = OnlineLeaseState.COMPLETED
             # A successful destructive export consumed the DataProxy session;
             # Router group cleanup is tracked separately by the Gateway export
@@ -419,6 +460,8 @@ class OnlineLeaseRegistry:
                 return False
             if record.start_in_flight or record.binding is None:
                 return False
+            if record.export_in_flight:
+                return False
             if group_id is not None and record.binding.group_id != group_id:
                 raise ValueError(f"Lease {lease_id} does not own group {group_id}")
             if session_ids is not None and record.binding.session_ids != session_ids:
@@ -426,7 +469,19 @@ class OnlineLeaseRegistry:
                     f"Lease {lease_id} does not own the requested sessions"
                 )
             record.state = OnlineLeaseState.DELIVERED
+            record.export_in_flight = True
             record.expires_at = time.monotonic() + ttl_seconds
+            return True
+
+    async def release_export(self, lease_id: str) -> bool:
+        """Release an export pin after a non-terminal attempt."""
+
+        async with self._lock:
+            record = self._records.get(lease_id)
+            if record is None or not record.export_in_flight:
+                return False
+            record.export_in_flight = False
+            self._purge_terminal_records_locked()
             return True
 
     async def bind(
@@ -474,6 +529,7 @@ class OnlineLeaseRegistry:
                 and record.binding is not None
                 and not record.cleanup_acknowledged
                 and not record.start_in_flight
+                and not record.export_in_flight
             ]
 
     async def acknowledge_cleanup(
@@ -540,7 +596,8 @@ class ReplayableHTTPResult:
 
 @dataclass
 class _RequestReplayRecord:
-    fingerprint: str
+    fingerprint_digest: bytes
+    request_expires_at: float
     ready: asyncio.Event
     result: ReplayableHTTPResult | None = None
     terminal_at: float | None = None
@@ -558,11 +615,10 @@ class RequestReplayReservation:
 class RequestReplayRegistry:
     """Bounded in-memory replay ledger for state-changing requests.
 
-    Request IDs are never silently forgotten.  Completed response bodies are
-    replayable for ``retry_ttl_seconds`` and are then compacted to permanent,
-    payload-free fences.  Because those fences cannot be safely discarded
-    without durable storage or an external request-ID lifetime contract, a
-    full ledger rejects new IDs instead of risking duplicate execution.
+    Callers declare a finite absolute retry deadline.  After that deadline the
+    request is rejected independently of retained state, so terminal records
+    can be reclaimed without making a destructive request executable again.
+    Request IDs and semantic fingerprints are retained only as SHA-256 digests.
     """
 
     def __init__(
@@ -601,28 +657,47 @@ class RequestReplayRegistry:
         self._max_total_result_bytes = max_total_result_bytes
         self._total_result_bytes = 0
 
-    def _compact_expired_results_locked(self, now: float) -> None:
-        for record in self._records.values():
-            if (
-                record.result is None
-                or record.terminal_at is None
-                or record.terminal_at + self._retry_ttl_seconds > now
-            ):
-                continue
-            self._total_result_bytes -= len(record.result.content)
-            record.result = None
-            record.expired_reason = "request replay retry horizon expired"
+    @staticmethod
+    def _digest(value: str) -> bytes:
+        return hashlib.sha256(value.encode("utf-8")).digest()
+
+    def _purge_expired_records_locked(self, now: float) -> None:
+        expired_ids = [
+            request_id_digest
+            for request_id_digest, record in self._records.items()
+            if record.terminal_at is not None and record.request_expires_at <= now
+        ]
+        for request_id_digest in expired_ids:
+            record = self._records.pop(request_id_digest)
+            if record.result is not None:
+                self._total_result_bytes -= len(record.result.content)
 
     async def reserve(
-        self, request_id: str, fingerprint: str
+        self,
+        request_id: str,
+        fingerprint: str,
+        *,
+        request_expires_at: float,
     ) -> RequestReplayReservation:
         """Return an owner/replay handle without a second lookup race."""
 
         async with self._lock:
-            self._compact_expired_results_locked(time.monotonic())
-            existing = self._records.get(request_id)
+            now = time.time()
+            self._purge_expired_records_locked(now)
+            if not math.isfinite(request_expires_at) or request_expires_at <= now:
+                raise RequestReplayExpiredError("request deadline expired")
+            if request_expires_at - now > self._retry_ttl_seconds:
+                raise ValueError(
+                    "request_expires_at exceeds the maximum replay horizon"
+                )
+            request_id_digest = self._digest(request_id)
+            fingerprint_digest = self._digest(fingerprint)
+            existing = self._records.get(request_id_digest)
             if existing is not None:
-                if existing.fingerprint != fingerprint:
+                if (
+                    existing.fingerprint_digest != fingerprint_digest
+                    or existing.request_expires_at != request_expires_at
+                ):
                     raise ValueError(f"Request {request_id} has a conflicting replay")
                 if existing.expired_reason is not None:
                     raise RequestReplayExpiredError(existing.expired_reason)
@@ -633,10 +708,11 @@ class RequestReplayRegistry:
                     "request_id or restart with a durable replay ledger"
                 )
             record = _RequestReplayRecord(
-                fingerprint=fingerprint,
+                fingerprint_digest=fingerprint_digest,
+                request_expires_at=request_expires_at,
                 ready=asyncio.Event(),
             )
-            self._records[request_id] = record
+            self._records[request_id_digest] = record
             return RequestReplayReservation(True, record)
 
     async def release_pending(
@@ -648,22 +724,25 @@ class RequestReplayRegistry:
         """Wake current duplicates, then allow a future retry to reserve again."""
 
         async with self._lock:
-            record = self._records.get(request_id)
+            request_id_digest = self._digest(request_id)
+            record = self._records.get(request_id_digest)
             if (
                 record is not None
-                and record.fingerprint == fingerprint
+                and record.fingerprint_digest == self._digest(fingerprint)
                 and record.result is None
             ):
                 record.result = result
                 record.ready.set()
-                self._records.pop(request_id, None)
+                self._records.pop(request_id_digest, None)
 
     async def finish(self, request_id: str, result: ReplayableHTTPResult) -> bool:
         """Settle a request and report whether its response body is replayable."""
 
         async with self._lock:
-            self._compact_expired_results_locked(time.monotonic())
-            record = self._records.get(request_id)
+            now = time.time()
+            self._purge_expired_records_locked(now)
+            request_id_digest = self._digest(request_id)
+            record = self._records.get(request_id_digest)
             if record is None:
                 raise RuntimeError(f"Unknown request: {request_id}")
             if record.result is not None:
@@ -689,6 +768,7 @@ class RequestReplayRegistry:
                 record.expired_reason = "response exceeds replay byte limits"
             record.terminal_at = time.monotonic()
             record.ready.set()
+            self._purge_expired_records_locked(time.time())
             return replayable
 
     async def wait(

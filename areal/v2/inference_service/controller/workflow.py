@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -184,10 +185,12 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
     ) -> tuple[str | None, list[tuple[str, str]]]:
         """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...])."""
+        request_lifetime = max(min(float(self.timeout or 300.0), 300.0), 30.0)
         return await self._start_session_once(
             session,
             task_id,
             request_id=str(uuid.uuid4()),
+            request_expires_at=time.time() + request_lifetime,
             group_size=group_size,
             delivery_mode=delivery_mode,
         )
@@ -198,6 +201,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         task_id: str,
         request_id: str,
+        request_expires_at: float,
         group_size: int,
         delivery_mode: TrajectoryDeliveryMode,
     ) -> tuple[str | None, list[tuple[str, str]]]:
@@ -206,6 +210,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         payload: dict[str, Any] = {
             "task_id": task_id,
             "request_id": request_id,
+            "request_expires_at": request_expires_at,
             "group_size": group_size,
             "delivery_mode": delivery_mode.value,
         }
@@ -244,10 +249,12 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         trajectory_id: int | None = None,
         lease_id: str | None = None,
     ) -> dict[str, Any]:
+        request_lifetime = max(min(float(self.timeout or 300.0), 300.0), 30.0)
         return await self._export_interactions_once(
             session,
             session_ids,
             request_id=str(uuid.uuid4()),
+            request_expires_at=time.time() + request_lifetime,
             group_id=group_id,
             trajectory_id=trajectory_id,
             lease_id=lease_id,
@@ -259,6 +266,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         session_ids: list[str],
         request_id: str,
+        request_expires_at: float,
         group_id: str | None = None,
         trajectory_id: int | None = None,
         lease_id: str | None = None,
@@ -267,6 +275,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
             "request_id": request_id,
+            "request_expires_at": request_expires_at,
             "session_ids": session_ids,
             "group_id": group_id,
             "trajectory_id": trajectory_id,

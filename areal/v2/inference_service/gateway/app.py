@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 import traceback
-import uuid
 from contextlib import asynccontextmanager
 
 import httpx
@@ -171,6 +172,33 @@ def create_app(config: GatewayConfig) -> FastAPI:
             if _fallback_client is None:
                 _fallback_client = create_httpx_client(timeout=config.router_timeout)
             return _fallback_client
+
+    def _validate_request_deadline(
+        body: dict,
+    ) -> tuple[float | None, JSONResponse | None]:
+        value = body.get("request_expires_at")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, JSONResponse(
+                {"error": "request_expires_at must be a finite Unix timestamp"},
+                status_code=422,
+            )
+        deadline = float(value)
+        now = time.time()
+        if not math.isfinite(deadline):
+            return None, JSONResponse(
+                {"error": "request_expires_at must be a finite Unix timestamp"},
+                status_code=422,
+            )
+        if deadline <= now:
+            return None, JSONResponse(
+                {"error": "request deadline expired"}, status_code=410
+            )
+        if deadline - now > config.request_replay_ttl_seconds:
+            return None, JSONResponse(
+                {"error": "request_expires_at exceeds the maximum replay horizon"},
+                status_code=422,
+            )
+        return deadline, None
 
     async def _await_critical_task(task: asyncio.Task, operation: str):
         """Finish a state transition even if its request is cancelled repeatedly."""
@@ -768,7 +796,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 {"error": "request_id and admission_id must match when both are set"},
                 status_code=422,
             )
-        if request_id is not None and (
+        if request_id is None or (
             not isinstance(request_id, str)
             or not request_id.strip()
             or len(request_id) > 256
@@ -778,15 +806,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 status_code=422,
             )
 
+        request_expires_at, deadline_error = _validate_request_deadline(body_json)
+        if deadline_error is not None:
+            return deadline_error
+        assert request_expires_at is not None
+
         lease: OnlineLease | None = None
         if delivery_mode == "callback":
-            if request_id is None:
-                return JSONResponse(
-                    {
-                        "error": "Callback delivery requires a caller-generated request_id"
-                    },
-                    status_code=422,
-                )
             try:
                 group_size = max(int(body_json.get("group_size", 1)), 1)
             except (TypeError, ValueError):
@@ -802,16 +828,15 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     status_code=422,
                 )
 
-        # Pull callers may omit the key for backwards compatibility. The
-        # gateway-generated value still makes Gateway→DataProxy retries safe;
-        # callers that retry the outer request should provide their own ID.
-        resolved_request_id = request_id or f"gateway-{uuid.uuid4()}"
+        resolved_request_id = request_id
         fingerprint = json.dumps(
             body_json, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
         try:
             reservation = await start_request_registry.reserve(
-                resolved_request_id, fingerprint
+                resolved_request_id,
+                fingerprint,
+                request_expires_at=request_expires_at,
             )
         except RequestReplayExpiredError as exc:
             return JSONResponse({"error": str(exc)}, status_code=410)
@@ -1500,7 +1525,12 @@ def create_app(config: GatewayConfig) -> FastAPI:
             return JSONResponse(
                 {"error": "remove_session must be a boolean"}, status_code=422
             )
-        destructive_group_cleanup = group_id is not None and remove_session
+        if remove_session and (not isinstance(group_id, str) or not group_id.strip()):
+            return JSONResponse(
+                {"error": "destructive export requires a non-empty group_id"},
+                status_code=422,
+            )
+        destructive_group_cleanup = remove_session
 
         request_id = body_json.get("request_id")
         if (
@@ -1512,6 +1542,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 {"error": "request_id must be a non-empty string up to 256 characters"},
                 status_code=422,
             )
+        request_expires_at, deadline_error = _validate_request_deadline(body_json)
+        if deadline_error is not None:
+            return deadline_error
+        assert request_expires_at is not None
         fingerprint_payload = dict(body_json)
         fingerprint_payload.pop("request_id", None)
         fingerprint = json.dumps(
@@ -1521,7 +1555,11 @@ def create_app(config: GatewayConfig) -> FastAPI:
             ensure_ascii=False,
         )
         try:
-            reservation = await export_request_registry.reserve(request_id, fingerprint)
+            reservation = await export_request_registry.reserve(
+                request_id,
+                fingerprint,
+                request_expires_at=request_expires_at,
+            )
         except RequestReplayExpiredError as exc:
             return JSONResponse({"error": str(exc)}, status_code=410)
         except RequestReplayCapacityError as exc:
@@ -1582,6 +1620,14 @@ def create_app(config: GatewayConfig) -> FastAPI:
             )
             await _await_critical_task(release_task, "Export replay release")
 
+        async def _release_lease_export_pin() -> None:
+            if lease_id is None:
+                return
+            release_task = asyncio.create_task(
+                online_lease_registry.release_export(lease_id)
+            )
+            await _await_critical_task(release_task, "Online lease export release")
+
         if lease_id is not None:
             try:
                 delivered = await online_lease_registry.mark_delivered(
@@ -1591,6 +1637,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     session_ids=tuple(session_ids),
                 )
             except asyncio.CancelledError:
+                await _release_lease_export_pin()
                 await _release_export_replay(
                     ReplayableHTTPResult(
                         status_code=503,
@@ -1633,6 +1680,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     group_id
                 )
             except asyncio.CancelledError:
+                await _release_lease_export_pin()
                 await _release_export_replay(
                     ReplayableHTTPResult(
                         status_code=503,
@@ -1654,6 +1702,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     ).encode(),
                     media_type="application/json",
                 )
+                await _release_lease_export_pin()
                 await _release_export_replay(result)
                 return Response(
                     content=result.content,
@@ -1668,7 +1717,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
             *,
             terminal: bool,
             cleanup_required: bool,
-        ) -> None:
+        ) -> ReplayableHTTPResult:
             """Settle replay and cleanup-slot ownership as one critical section."""
 
             if cleanup_required:
@@ -1682,24 +1731,43 @@ def create_app(config: GatewayConfig) -> FastAPI:
             elif cleanup_slot_reserved:
                 await _release_export_group_cleanup_reservation(group_id)
 
+            settled_result = result
             if terminal:
-                if result.status_code == 200 and lease_id is not None:
-                    await online_lease_registry.complete(lease_id)
-                await export_request_registry.finish(request_id, result)
+                if lease_id is not None:
+                    if result.status_code == 200:
+                        completed = await online_lease_registry.complete(lease_id)
+                        if not completed:
+                            settled_result = ReplayableHTTPResult(
+                                status_code=409,
+                                content=json.dumps(
+                                    {
+                                        "error": (
+                                            f"Online lease {lease_id} ended before "
+                                            "export completion committed"
+                                        )
+                                    }
+                                ).encode(),
+                                media_type="application/json",
+                            )
+                    else:
+                        await online_lease_registry.release_export(lease_id)
+                await export_request_registry.finish(request_id, settled_result)
                 assert export_worker_binding is not None
                 await _forget_export_worker(request_id, export_worker_binding)
             else:
+                await _release_lease_export_pin()
                 await _release_export_replay(result)
 
             if cleanup_required:
                 await _ensure_export_group_cleanup(group_id)
+            return settled_result
 
         async def _settle_export_ownership(
             result: ReplayableHTTPResult,
             *,
             terminal: bool,
             cleanup_required: bool = False,
-        ) -> None:
+        ) -> ReplayableHTTPResult:
             finalize_task = asyncio.create_task(
                 _finalize_export_ownership(
                     result,
@@ -1707,7 +1775,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
                     cleanup_required=cleanup_required,
                 )
             )
-            await _await_critical_task(finalize_task, "Export ownership settlement")
+            return await _await_critical_task(
+                finalize_task, "Export ownership settlement"
+            )
 
         try:
             recalled = await _recalled_export_worker(request_id, fingerprint)
@@ -1832,15 +1902,17 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 replay_worker_addr=worker_addr,
                 replay_worker_id=worker_id,
             )
-        await _settle_export_ownership(
+        settled_result = await _settle_export_ownership(
             replay_result,
             terminal=True,
             cleanup_required=resp.status_code == 200 and destructive_group_cleanup,
         )
+        if settled_result is replay_result:
+            settled_result = result
         return Response(
-            content=result.content,
-            status_code=result.status_code,
-            media_type=result.media_type,
+            content=settled_result.content,
+            status_code=settled_result.status_code,
+            media_type=settled_result.media_type,
         )
 
     # =========================================================================

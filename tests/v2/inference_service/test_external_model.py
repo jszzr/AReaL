@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -374,7 +375,12 @@ class TestGatewayExternalEndpoints:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"request_id": "gateway-external-export", "session_ids": ["ext-1"]},
+            json={
+                "request_id": "gateway-external-export",
+                "request_expires_at": time.time() + 30.0,
+                "session_ids": ["ext-1"],
+                "remove_session": False,
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 200
@@ -509,6 +515,7 @@ class TestDataProxyExternalEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "external-not-ready-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["__hitl__"],
                 "remove_session": False,
             },
@@ -529,6 +536,7 @@ class TestDataProxyExternalEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "external-ready-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["__hitl__"],
             },
             headers={"Authorization": "Bearer areal-admin-key"},
@@ -609,6 +617,7 @@ class TestDataProxyExternalEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "external-stream-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["__hitl__"],
             },
             headers={"Authorization": "Bearer areal-admin-key"},
@@ -621,6 +630,7 @@ class TestDataProxyExternalEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "external-stream-export-again",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["__hitl__"],
             },
             headers={"Authorization": "Bearer areal-admin-key"},

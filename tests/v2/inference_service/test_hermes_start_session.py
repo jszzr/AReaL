@@ -63,6 +63,7 @@ def _run_main(
         monotonic = iter(monotonic_values)
         monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(module.time, "time", lambda: 1_000.0)
     monkeypatch.setattr(
         module.sys,
         "argv",
@@ -96,6 +97,7 @@ def test_prints_request_id_and_omits_unsupported_refresh_key(
         "task_id": "demo-task",
         "delivery_mode": "callback",
         "request_id": "logical-start-1",
+        "request_expires_at": 1_010.0,
     }
 
 
@@ -125,6 +127,10 @@ def test_retries_transient_failure_with_same_request_id(
     assert [call["json"]["request_id"] for call in calls] == [
         "logical-start-1",
         "logical-start-1",
+    ]
+    assert [call["json"]["request_expires_at"] for call in calls] == [
+        1_010.0,
+        1_010.0,
     ]
 
 

@@ -160,16 +160,40 @@ class TestOnlineLeaseRegistry:
 
         now = 105.0
         assert await registry.mark_delivered(lease.lease_id, ttl_seconds=20.0) is True
-        now = 111.0
+        now = 1000.0
         assert await registry.expire_stale(now=now) == []
         assert await registry.complete(lease.lease_id) is True
-        now = 1000.0
         assert await registry.expire_stale(now=now) == []
         assert await registry.pending_cleanup_bindings() == []
         assert await registry.cancel_and_take_binding(lease.lease_id) == (
             False,
             None,
         )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_inflight_export_cannot_commit_success_and_defers_cleanup(
+        self,
+    ):
+        registry = OnlineLeaseRegistry()
+        lease = OnlineLease("lease-export-race", expected_version=0)
+        binding = OnlineLeaseBinding(
+            admission_id=lease.lease_id,
+            worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
+            group_id="group-export-race",
+            session_ids=("session-export-race",),
+        )
+        await registry.grant(lease)
+        await registry.try_acquire()
+        await registry.bind(lease.lease_id, binding)
+        await registry.finish_start(lease.lease_id)
+        assert await registry.mark_delivered(lease.lease_id, 30.0)
+
+        assert await registry.cancel_and_take_binding(lease.lease_id) == (True, None)
+        assert await registry.complete(lease.lease_id) is False
+        assert await registry.pending_cleanup_bindings() == []
+        assert await registry.release_export(lease.lease_id) is True
+        assert await registry.pending_cleanup_bindings() == [(lease.lease_id, binding)]
 
     @pytest.mark.asyncio
     async def test_terminal_lease_retains_cleanup_until_acknowledged(self):
@@ -281,10 +305,46 @@ class TestOnlineLeaseRegistry:
 
 class TestRequestReplayRegistry:
     @pytest.mark.asyncio
+    async def test_expired_terminal_record_is_reclaimed_but_old_request_stays_410(
+        self, monkeypatch
+    ):
+        now = 100.0
+        monkeypatch.setattr(admission_module.time, "time", lambda: now)
+        registry = RequestReplayRegistry(
+            max_records=1,
+            retry_ttl_seconds=10.0,
+            max_result_bytes=128,
+            max_total_result_bytes=256,
+        )
+        owner = await registry.reserve(
+            "request-1", "x" * 1_000_000, request_expires_at=105.0
+        )
+        assert owner.is_owner is True
+        await registry.finish("request-1", ReplayableHTTPResult(201, b"created"))
+
+        record = next(iter(registry._records.values()))
+        assert len(record.fingerprint_digest) == 32
+
+        now = 106.0
+        with pytest.raises(RuntimeError, match="request deadline expired"):
+            await registry.reserve(
+                "request-1", "x" * 1_000_000, request_expires_at=105.0
+            )
+        replacement = await registry.reserve(
+            "request-2", "fingerprint-2", request_expires_at=110.0
+        )
+        assert replacement.is_owner is True
+
+    @pytest.mark.asyncio
     async def test_replay_handle_survives_release_between_reserve_and_wait(self):
         registry = RequestReplayRegistry()
-        owner = await registry.reserve("request-1", "fingerprint")
-        replay = await registry.reserve("request-1", "fingerprint")
+        deadline = time.time() + 30.0
+        owner = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
+        replay = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
         transient = ReplayableHTTPResult(429, b'{"error":"no capacity"}')
 
         assert owner.is_owner is True
@@ -298,20 +358,22 @@ class TestRequestReplayRegistry:
         self, monkeypatch
     ):
         now = 100.0
-        monkeypatch.setattr(admission_module.time, "monotonic", lambda: now)
+        monkeypatch.setattr(admission_module.time, "time", lambda: now)
         registry = RequestReplayRegistry(
             max_records=2,
             retry_ttl_seconds=10.0,
             max_result_bytes=128,
             max_total_result_bytes=256,
         )
-        owner = await registry.reserve("request-1", "fingerprint")
+        owner = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=110.0
+        )
         assert owner.is_owner is True
         await registry.finish("request-1", ReplayableHTTPResult(201, b"created"))
 
         now = 111.0
-        with pytest.raises(RuntimeError, match="retry horizon expired"):
-            await registry.reserve("request-1", "fingerprint")
+        with pytest.raises(RuntimeError, match="request deadline expired"):
+            await registry.reserve("request-1", "fingerprint", request_expires_at=110.0)
 
     @pytest.mark.asyncio
     async def test_pending_records_are_bounded_and_exact_replays_still_join(self):
@@ -321,13 +383,22 @@ class TestRequestReplayRegistry:
             max_result_bytes=128,
             max_total_result_bytes=256,
         )
-        owner = await registry.reserve("request-1", "fingerprint")
+        deadline = time.time() + 5.0
+        owner = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
 
-        replay = await registry.reserve("request-1", "fingerprint")
+        replay = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
         assert owner.is_owner is True
         assert replay.is_owner is False
         with pytest.raises(RuntimeError, match="replay capacity"):
-            await registry.reserve("request-2", "fingerprint-2")
+            await registry.reserve(
+                "request-2",
+                "fingerprint-2",
+                request_expires_at=time.time() + 5.0,
+            )
 
     @pytest.mark.asyncio
     async def test_oversized_terminal_result_keeps_only_an_expired_fence(self):
@@ -337,8 +408,13 @@ class TestRequestReplayRegistry:
             max_result_bytes=4,
             max_total_result_bytes=8,
         )
-        owner = await registry.reserve("request-1", "fingerprint")
-        replay = await registry.reserve("request-1", "fingerprint")
+        deadline = time.time() + 5.0
+        owner = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
+        replay = await registry.reserve(
+            "request-1", "fingerprint", request_expires_at=deadline
+        )
         assert owner.is_owner is True
 
         replayable = await registry.finish(
@@ -349,7 +425,9 @@ class TestRequestReplayRegistry:
         with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
             await registry.wait(replay, timeout=0.1)
         with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
-            await registry.reserve("request-1", "fingerprint")
+            await registry.reserve(
+                "request-1", "fingerprint", request_expires_at=deadline
+            )
 
     @pytest.mark.asyncio
     async def test_total_result_bytes_are_bounded_without_evicting_old_result(self):
@@ -359,20 +437,48 @@ class TestRequestReplayRegistry:
             max_result_bytes=8,
             max_total_result_bytes=8,
         )
-        await registry.reserve("request-1", "fingerprint-1")
+        first_deadline = time.time() + 5.0
+        second_deadline = time.time() + 5.0
+        await registry.reserve(
+            "request-1", "fingerprint-1", request_expires_at=first_deadline
+        )
         assert await registry.finish("request-1", ReplayableHTTPResult(200, b"123456"))
-        await registry.reserve("request-2", "fingerprint-2")
+        await registry.reserve(
+            "request-2", "fingerprint-2", request_expires_at=second_deadline
+        )
 
         assert not await registry.finish(
             "request-2", ReplayableHTTPResult(200, b"1234")
         )
-        first = await registry.reserve("request-1", "fingerprint-1")
+        first = await registry.reserve(
+            "request-1", "fingerprint-1", request_expires_at=first_deadline
+        )
         assert await registry.wait(first) == ReplayableHTTPResult(200, b"123456")
         with pytest.raises(RuntimeError, match="response exceeds replay byte limits"):
-            await registry.reserve("request-2", "fingerprint-2")
+            await registry.reserve(
+                "request-2", "fingerprint-2", request_expires_at=second_deadline
+            )
 
 
 class TestGatewayReplayLedgerBoundaries:
+    @pytest.mark.asyncio
+    async def test_start_requires_a_finite_request_deadline(self):
+        _, client = _app_client()
+
+        async with client:
+            response = await client.post(
+                "/rl/start_session",
+                json={
+                    "request_id": "missing-deadline",
+                    "task_id": "deadline-test",
+                    "delivery_mode": "pull",
+                },
+                headers=_headers(),
+            )
+
+        assert response.status_code == 422
+        assert "request_expires_at" in response.text
+
     @pytest.mark.asyncio
     async def test_start_returns_503_when_new_request_id_cannot_be_admitted(self):
         app, client = _configured_app_client(
@@ -382,13 +488,18 @@ class TestGatewayReplayLedgerBoundaries:
                 max_request_replay_records=1,
             )
         )
-        await app.state.start_request_registry.reserve("occupied", "fingerprint")
+        await app.state.start_request_registry.reserve(
+            "occupied",
+            "fingerprint",
+            request_expires_at=time.time() + 30.0,
+        )
 
         async with client:
             response = await client.post(
                 "/rl/start_session",
                 json={
                     "request_id": "new-request",
+                    "request_expires_at": time.time() + 30.0,
                     "task_id": "capacity-test",
                     "delivery_mode": "pull",
                 },
@@ -417,6 +528,7 @@ class TestGatewayReplayLedgerBoundaries:
                         "/rl/start_session",
                         json={
                             "request_id": request_id,
+                            "request_expires_at": time.time() + 30.0,
                             "task_id": "cancel-before-lease",
                             "delivery_mode": "callback",
                         },
@@ -428,8 +540,7 @@ class TestGatewayReplayLedgerBoundaries:
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
-        record = app.state.start_request_registry._records.get(request_id)
-        assert record is None or record.result is not None
+        assert not app.state.start_request_registry._records
 
     @pytest.mark.asyncio
     async def test_cancel_while_marking_lease_delivered_releases_export_owner(self):
@@ -452,6 +563,7 @@ class TestGatewayReplayLedgerBoundaries:
                         "/export_trajectories",
                         json={
                             "request_id": request_id,
+                            "request_expires_at": time.time() + 30.0,
                             "session_ids": ["session-1"],
                             "group_id": "group-1",
                             "lease_id": "lease-1",
@@ -464,8 +576,7 @@ class TestGatewayReplayLedgerBoundaries:
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
-        record = app.state.export_request_registry._records.get(request_id)
-        assert record is None or record.result is not None
+        assert not app.state.export_request_registry._records
 
     @pytest.mark.asyncio
     async def test_start_returns_410_after_retry_horizon_instead_of_reexecuting(self):
@@ -476,13 +587,22 @@ class TestGatewayReplayLedgerBoundaries:
                 request_replay_ttl_seconds=0.001,
             )
         )
+        request_expires_at = time.time() + 0.001
         fingerprint = json.dumps(
-            {"delivery_mode": "pull", "task_id": "expired-replay"},
+            {
+                "delivery_mode": "pull",
+                "request_expires_at": request_expires_at,
+                "task_id": "expired-replay",
+            },
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
         )
-        await app.state.start_request_registry.reserve("expired-request", fingerprint)
+        await app.state.start_request_registry.reserve(
+            "expired-request",
+            fingerprint,
+            request_expires_at=request_expires_at,
+        )
         await app.state.start_request_registry.finish(
             "expired-request", ReplayableHTTPResult(201, b"created")
         )
@@ -493,6 +613,7 @@ class TestGatewayReplayLedgerBoundaries:
                 "/rl/start_session",
                 json={
                     "request_id": "expired-request",
+                    "request_expires_at": request_expires_at,
                     "task_id": "expired-replay",
                     "delivery_mode": "pull",
                 },
@@ -500,7 +621,7 @@ class TestGatewayReplayLedgerBoundaries:
             )
 
         assert response.status_code == 410
-        assert "retry horizon expired" in response.json()["error"]
+        assert "request deadline expired" in response.json()["error"]
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
@@ -523,6 +644,7 @@ class TestGatewayReplayLedgerBoundaries:
         )
         request_body = {
             "request_id": "delegated-large-export",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-1"],
             "group_id": "group-1",
         }
@@ -540,9 +662,7 @@ class TestGatewayReplayLedgerBoundaries:
         mock_query.assert_awaited_once()
         assert mock_forward.await_count == 2
         mock_revoke.assert_awaited_once()
-        cached = app.state.export_request_registry._records[
-            "delegated-large-export"
-        ].result
+        cached = next(iter(app.state.export_request_registry._records.values())).result
         assert cached is not None
         assert cached.content == b""
         assert cached.replay_worker_addr == WORKER_ADDR
@@ -564,6 +684,7 @@ class TestGatewayReplayLedgerBoundaries:
                 "/export_trajectories",
                 json={
                     "request_id": "non-destructive-export",
+                    "request_expires_at": time.time() + 30.0,
                     "session_ids": ["session-1"],
                     "group_id": "group-1",
                     "remove_session": False,
@@ -573,6 +694,69 @@ class TestGatewayReplayLedgerBoundaries:
 
         assert response.status_code == 200
         mock_revoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_destructive_export_requires_group_for_router_cleanup(
+        self, mock_query
+    ):
+        _, client = _app_client()
+
+        async with client:
+            response = await client.post(
+                "/export_trajectories",
+                json={
+                    "request_id": "missing-cleanup-group",
+                    "request_expires_at": time.time() + 30.0,
+                    "session_ids": ["session-1"],
+                    "remove_session": True,
+                },
+                headers=_headers(),
+            )
+
+        assert response.status_code == 422
+        assert "group_id" in response.text
+        mock_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_data_proxy_pending_export_remains_retriable_on_same_worker(
+        self, mock_query, mock_forward, mock_revoke
+    ):
+        mock_query.return_value = RouterDestination(WORKER_ADDR, WORKER_ID)
+        mock_forward.side_effect = [
+            httpx.Response(
+                503,
+                json={"code": "export_pending", "detail": "still pending"},
+            ),
+            httpx.Response(200, json={"traj": {"reward": 1.0}}),
+        ]
+        mock_revoke.return_value = True
+        _, client = _app_client()
+        body = {
+            "request_id": "pending-then-replayed",
+            "request_expires_at": time.time() + 30.0,
+            "session_ids": ["session-1"],
+            "group_id": "group-1",
+        }
+
+        async with client:
+            pending = await client.post(
+                "/export_trajectories", json=body, headers=_headers()
+            )
+            recovered = await client.post(
+                "/export_trajectories", json=body, headers=_headers()
+            )
+            replay = await client.post(
+                "/export_trajectories", json=body, headers=_headers()
+            )
+
+        assert pending.status_code == 503
+        assert recovered.status_code == replay.status_code == 200
+        mock_query.assert_awaited_once()
+        assert mock_forward.await_count == 2
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
@@ -621,6 +805,7 @@ class TestGatewayReplayLedgerBoundaries:
                 "/rl/start_session",
                 json={
                     "request_id": "callback-export-start",
+                    "request_expires_at": time.time() + 30.0,
                     "task_id": "callback-export-task",
                     "delivery_mode": "callback",
                 },
@@ -630,6 +815,7 @@ class TestGatewayReplayLedgerBoundaries:
                 "/export_trajectories",
                 json={
                     "request_id": "callback-export-request",
+                    "request_expires_at": time.time() + 30.0,
                     "session_ids": ["callback-export-session"],
                     "group_id": "callback-export-group",
                     "lease_id": "callback-export-lease",
@@ -652,6 +838,23 @@ class TestGatewayReplayLedgerBoundaries:
 
 
 class TestRequestWorkerOwnershipRegistry:
+    @pytest.mark.asyncio
+    async def test_registry_retains_only_fixed_size_identity_digests(self):
+        registry = admission_module.RequestWorkerOwnershipRegistry()
+        binding = admission_module.RequestWorkerBinding(
+            fingerprint="x" * 1_000_000,
+            worker_addr=WORKER_ADDR,
+            worker_id=WORKER_ID,
+        )
+
+        remembered = await registry.remember("r" * 1_000_000, binding)
+
+        assert len(remembered.fingerprint) == 64
+        request_key = next(iter(registry._records))
+        assert isinstance(request_key, bytes)
+        assert len(request_key) == 32
+        assert await registry.recall("r" * 1_000_000, "x" * 1_000_000) is not None
+
     def test_capacity_must_be_positive(self):
         with pytest.raises(ValueError, match="max_owned_records must be >= 1"):
             admission_module.RequestWorkerOwnershipRegistry(max_owned_records=0)
@@ -742,7 +945,7 @@ class TestRequestWorkerOwnershipRegistry:
         )
         assert ownership.cleanup_binding == cleanup_binding
         assert await registry.pending_cleanups() == [
-            ("request-1", worker_binding, cleanup_binding)
+            (registry._request_digest("request-1"), worker_binding, cleanup_binding)
         ]
 
     @pytest.mark.asyncio
@@ -838,7 +1041,7 @@ class TestRequestWorkerOwnershipRegistry:
             is False
         )
         assert await registry.pending_cleanups() == [
-            ("request-1", worker_binding, cleanup_binding)
+            (registry._request_digest("request-1"), worker_binding, cleanup_binding)
         ]
         assert (
             await registry.acknowledge_cleanup(
@@ -900,7 +1103,7 @@ class TestRequestWorkerOwnershipRegistry:
 
         assert await registry.forget("request-1", worker_binding) is False
         assert await registry.pending_cleanups() == [
-            ("request-1", worker_binding, cleanup_binding)
+            (registry._request_digest("request-1"), worker_binding, cleanup_binding)
         ]
 
 
@@ -930,6 +1133,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-zero-lease",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -959,6 +1163,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-1",
             "delivery_mode": "callback",
             "request_id": "request-waits",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1012,6 +1217,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-consume",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1042,6 +1248,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-1",
             "delivery_mode": "callback",
             "request_id": "producer-request-1",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1095,6 +1302,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "same-request",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1104,6 +1312,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "different-task",
                     "delivery_mode": "callback",
                     "request_id": "same-request",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1142,6 +1351,7 @@ class TestGatewayOnlineAdmission:
                             "task_id": f"task-{index}",
                             "delivery_mode": "callback",
                             "request_id": f"request-{index}",
+                            "request_expires_at": time.time() + 30.0,
                         },
                         headers=_headers(),
                     )
@@ -1177,6 +1387,8 @@ class TestGatewayOnlineAdmission:
             response = await client.post(
                 "/rl/start_session",
                 json={
+                    "request_id": "pull-bypass-admission",
+                    "request_expires_at": time.time() + 30.0,
                     "task_id": "task-pull",
                     "delivery_mode": "pull",
                     "group_size": 2,
@@ -1187,7 +1399,7 @@ class TestGatewayOnlineAdmission:
         assert response.status_code == 201
         forwarded = json.loads(mock_forward.call_args.args[1])
         assert "lease_id" not in forwarded
-        assert forwarded["admission_id"].startswith("gateway-")
+        assert forwarded["admission_id"] == "pull-bypass-admission"
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.register_session_in_router", new_callable=AsyncMock)
@@ -1207,6 +1419,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-pull",
             "delivery_mode": "pull",
             "request_id": "pull-request-1",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1253,6 +1466,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-pull",
             "delivery_mode": "pull",
             "request_id": "pull-lost-response",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1318,11 +1532,13 @@ class TestGatewayOnlineAdmission:
             "task_id": "capacity-a",
             "delivery_mode": "pull",
             "request_id": "capacity-start-a",
+            "request_expires_at": time.time() + 30.0,
         }
         second_body = {
             "task_id": "capacity-b",
             "delivery_mode": "pull",
             "request_id": "capacity-start-b",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1389,6 +1605,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-pull-retry",
             "delivery_mode": "pull",
             "request_id": "pull-transient-503",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1438,6 +1655,7 @@ class TestGatewayOnlineAdmission:
                     "delivery_mode": "callback",
                     "group_size": 2,
                     "request_id": "request-group",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1474,6 +1692,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-routing-failure",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1526,6 +1745,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-registration-failure",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -1623,6 +1843,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-stale-callback",
             "delivery_mode": "callback",
             "request_id": "request-stale-callback",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1690,6 +1911,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-stale-pull",
             "delivery_mode": "pull",
             "request_id": "request-stale-pull",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -1766,12 +1988,12 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-pending-pull-cleanup",
             "delivery_mode": "pull",
             "request_id": "request-pending-pull-cleanup",
+            "request_expires_at": time.time() + 30.0,
         }
+        fingerprint_payload = dict(request_body)
+        fingerprint_payload.pop("request_id")
         fingerprint = json.dumps(
-            {
-                "task_id": "task-pending-pull-cleanup",
-                "delivery_mode": "pull",
-            },
+            fingerprint_payload,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -1843,12 +2065,12 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-cancelled-pull-cleanup",
             "delivery_mode": "pull",
             "request_id": "request-cancelled-pull-cleanup",
+            "request_expires_at": time.time() + 30.0,
         }
+        fingerprint_payload = dict(request_body)
+        fingerprint_payload.pop("request_id")
         fingerprint = json.dumps(
-            {
-                "task_id": "task-cancelled-pull-cleanup",
-                "delivery_mode": "pull",
-            },
+            fingerprint_payload,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -1914,6 +2136,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-settled-pull",
             "delivery_mode": "pull",
             "request_id": "request-settled-pull",
+            "request_expires_at": time.time() + 30.0,
         }
         async with client:
             with patch.object(replay_registry, "finish", side_effect=_blocking_finish):
@@ -1975,6 +2198,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-cancel-after-commit",
             "delivery_mode": "pull",
             "request_id": "request-cancel-after-commit",
+            "request_expires_at": time.time() + 30.0,
         }
         async with client:
             with patch.object(registry, "forget", side_effect=_blocking_forget):
@@ -2075,6 +2299,7 @@ class TestGatewayOnlineAdmission:
                         "task_id": "task-racing-delete",
                         "delivery_mode": "callback",
                         "request_id": "request-racing-delete",
+                        "request_expires_at": time.time() + 30.0,
                     },
                     headers=_headers(),
                 )
@@ -2169,6 +2394,7 @@ class TestGatewayOnlineAdmission:
                         "task_id": f"task-cancel-{delivery_mode}",
                         "delivery_mode": delivery_mode,
                         "request_id": request_id,
+                        "request_expires_at": time.time() + 30.0,
                     },
                     headers=_headers(),
                 )
@@ -2235,6 +2461,7 @@ class TestGatewayOnlineAdmission:
                         "task_id": "task-cancel-during-notify",
                         "delivery_mode": "callback",
                         "request_id": request_id,
+                        "request_expires_at": time.time() + 30.0,
                     },
                     headers=_headers(),
                 )
@@ -2314,6 +2541,7 @@ class TestGatewayOnlineAdmission:
                             "task_id": "task-cancel-non-201-bind",
                             "delivery_mode": "callback",
                             "request_id": request_id,
+                            "request_expires_at": time.time() + 30.0,
                         },
                         headers=_headers(),
                     )
@@ -2398,6 +2626,7 @@ class TestGatewayOnlineAdmission:
                             "task_id": "task-second-cancel-forward",
                             "delivery_mode": "callback",
                             "request_id": request_id,
+                            "request_expires_at": time.time() + 30.0,
                         },
                         headers=_headers(),
                     )
@@ -2489,6 +2718,7 @@ class TestGatewayOnlineAdmission:
                             "task_id": "task-second-cancel-registration-failure",
                             "delivery_mode": "callback",
                             "request_id": request_id,
+                            "request_expires_at": time.time() + 30.0,
                         },
                         headers=_headers(),
                     )
@@ -2542,6 +2772,7 @@ class TestGatewayOnlineAdmission:
             "task_id": "task-callback-retry",
             "delivery_mode": "callback",
             "request_id": "callback-transient-502",
+            "request_expires_at": time.time() + 30.0,
         }
 
         async with client:
@@ -2608,6 +2839,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-ambiguous",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -2654,6 +2886,7 @@ class TestGatewayOnlineAdmission:
                     "task_id": "task-1",
                     "delivery_mode": "callback",
                     "request_id": "request-cancel",
+                    "request_expires_at": time.time() + 30.0,
                 },
                 headers=_headers(),
             )
@@ -2787,11 +3020,15 @@ class TestGatewayExportCleanupCapacity:
         )
         first_body = {
             "request_id": "capacity-export-a",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-a"],
+            "group_id": "group-a",
         }
         second_body = {
             "request_id": "capacity-export-b",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-b"],
+            "group_id": "group-b",
         }
 
         async with client:
@@ -2820,7 +3057,11 @@ class TestGatewayExportCleanupCapacity:
             await app.state.export_request_workers.recall(
                 "capacity-export-a",
                 json.dumps(
-                    {"session_ids": ["session-a"]},
+                    {
+                        "group_id": "group-a",
+                        "request_expires_at": first_body["request_expires_at"],
+                        "session_ids": ["session-a"],
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -2886,11 +3127,13 @@ class TestGatewayExportCleanupCapacity:
 
         first_body = {
             "request_id": first_request_id,
+            "request_expires_at": time.time() + 30.0,
             "session_ids": [f"session-{failure_stage}"],
             "group_id": f"group-{failure_stage}",
         }
         second_body = {
             "request_id": f"export-after-{failure_stage}",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": [f"session-after-{failure_stage}"],
             "group_id": f"group-after-{failure_stage}",
         }
@@ -2961,11 +3204,13 @@ class TestGatewayExportCleanupCapacity:
 
         first_body = {
             "request_id": first_request_id,
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-cancelled-export"],
             "group_id": "group-cancelled-export",
         }
         second_body = {
             "request_id": "export-after-cancelled-export",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-after-cancelled-export"],
             "group_id": "group-after-cancelled-export",
         }
@@ -3022,11 +3267,13 @@ class TestGatewayExportCleanupCapacity:
         )
         first_body = {
             "request_id": "export-cleanup-1",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-1"],
             "group_id": "group-1",
         }
         second_body = {
             "request_id": "export-cleanup-2",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["session-2"],
             "group_id": "group-2",
         }

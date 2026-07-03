@@ -20,6 +20,8 @@ import argparse
 import json
 import os
 import sys
+import time
+import uuid
 
 import requests
 from _fmt import (
@@ -186,7 +188,11 @@ def main() -> None:
                 "Requesting a new RL session (admin auth → gateway routes to a worker)"
             )
 
-        start_body: dict = {"task_id": task_id}
+        start_body: dict = {
+            "task_id": task_id,
+            "request_id": f"openclaw-demo-{uuid.uuid4()}",
+            "request_expires_at": time.time() + 300.0,
+        }
         if session_api_key is not None:
             start_body["api_key"] = session_api_key
 

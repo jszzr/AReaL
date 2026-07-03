@@ -61,15 +61,16 @@ curl -X POST http://<gateway>/rl/start_session \
   -d '{
     "task_id": "gsm8k-17",
     "request_id": "run-42:gsm8k-17",
+    "request_expires_at": 1783075200,
     "delivery_mode": "callback",
     "group_size": 1
   }'
 ```
 
-`request_id` is a caller-generated idempotency key for one logical creation. Reuse it
-unchanged after a timeout or lost response. An identical replay returns the original
-credentials without consuming another lease; the same ID with different parameters
-returns `409`.
+`request_id` is a caller-generated idempotency key and `request_expires_at` is its
+finite Unix-time retry deadline. Reuse both unchanged after a timeout or lost response.
+An identical replay returns the original credentials without consuming another lease;
+the same ID with different parameters returns `409`.
 
 The outcomes are:
 
@@ -146,6 +147,7 @@ explicitly export:
 {
   "task_id": "manual-episode",
   "request_id": "run-42:manual-episode",
+  "request_expires_at": 1783075200,
   "delivery_mode": "pull",
   "group_size": 2
 }
@@ -159,6 +161,7 @@ curl -X POST http://<gateway>/export_trajectories \
   -H 'Authorization: Bearer my-secret-admin-key' \
   -d '{
     "request_id": "run-42:manual-export-0",
+    "request_expires_at": 1783075200,
     "session_ids": ["opaque-session-id"],
     "group_id": "grp-2a61...",
     "trajectory_id": 0,
@@ -181,13 +184,14 @@ so Router cleanup cannot orphan an omitted session. Validation happens before an
 trajectory is consumed. Callback exports also carry the owning `lease_id`; the
 controller adds it automatically.
 
-Replay ledgers have an explicit in-process horizon. By default, response bytes are
-retained for 300 seconds; afterward the request ID remains as a payload-free fence and
-returns `410` instead of executing again. Pending requests, replayable responses, and
-expired fences share a fixed record capacity; a new ID receives `503` when it is full.
-Per-result and total response-byte limits prevent replay data from growing without a
-bound. A Data Proxy returns `507` before consuming a trajectory if its serialized export
-cannot fit its replay byte budget.
+Replay ledgers have an explicit in-process horizon. Every mutation carries a finite
+`request_expires_at`, at most 300 seconds in the future by default. After that deadline
+the request itself returns `410`, even after its terminal ledger record is reclaimed.
+Pending requests and live replayable responses share a fixed record capacity; a new ID
+receives `503` while that live capacity is full. Per-result and total response-byte
+limits prevent replay data from growing without a bound. A Data Proxy returns `507`
+before consuming a trajectory if its serialized export cannot fit its replay byte
+budget.
 
 The relevant programmatic settings are `GatewayConfig.max_request_replay_records`,
 `GatewayConfig.request_replay_ttl_seconds`,
@@ -218,8 +222,8 @@ The relevant programmatic settings are `GatewayConfig.max_request_replay_records
   begins, the lease enters a delivered phase whose deadline covers the bounded Gateway
   forward; a successful destructive export completes it. Cleanup independently retries
   worker cancellation and Router revocation.
-- Start/export request IDs are never silently evicted within one process. Response
-  payloads compact to `410` fences, and capacity exhaustion backpressures new IDs.
+- Start/export requests remain replayable until their declared deadline. Terminal
+  records are reclaimed afterward while expired requests still return `410`.
 
 ## Fixed Held-Out Evaluation (V2 Only)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -90,7 +91,12 @@ class TestGatewayUnifiedExportTrajectories:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"request_id": "external-gateway-export", "session_ids": ["ext-1"]},
+            json={
+                "request_id": "external-gateway-export",
+                "request_expires_at": time.time() + 30,
+                "session_ids": ["ext-1"],
+                "remove_session": False,
+            },
             headers=admin_headers(),
         )
 
@@ -118,6 +124,7 @@ class TestGatewayUnifiedExportTrajectories:
             "/export_trajectories",
             json={
                 "request_id": "internal-gateway-export",
+                "request_expires_at": time.time() + 30,
                 "session_ids": ["ses-1"],
                 "group_id": "grp-test",
                 "discount": 1.0,
@@ -403,7 +410,9 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
                 "/export_trajectories",
                 json={
                     "request_id": "external-e2e-export",
+                    "request_expires_at": time.time() + 30,
                     "session_ids": ["__hitl__"],
+                    "remove_session": False,
                 },
                 headers=admin_headers(),
             )

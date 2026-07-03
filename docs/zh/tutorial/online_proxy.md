@@ -54,13 +54,14 @@ curl -X POST http://<gateway>/rl/start_session \
   -d '{
     "task_id": "gsm8k-17",
     "request_id": "run-42:gsm8k-17",
+    "request_expires_at": 1783075200,
     "delivery_mode": "callback",
     "group_size": 1
   }'
 ```
 
-`request_id` 是调用方为一次逻辑创建生成的幂等键。请求超时或响应丢失后，必须原样复用它。相同请求会重放第一次 返回的凭据，不会再次消费 lease；同一个 ID
-搭配不同参数会返回 `409`。
+`request_id` 是调用方生成的幂等键，`request_expires_at` 是有限的 Unix
+时间重试截止点。请求超时或响应丢失后必须原样复用两者。相同请求会重放第一次 返回的凭据，不会再次消费 lease；同一个 ID 搭配不同参数会返回 `409`。
 
 主要响应是：
 
@@ -130,6 +131,7 @@ controller 驱动的智能体、分组会话或自行导出的客户端应使用
 {
   "task_id": "manual-episode",
   "request_id": "run-42:manual-episode",
+  "request_expires_at": 1783075200,
   "delivery_mode": "pull",
   "group_size": 2
 }
@@ -143,6 +145,7 @@ curl -X POST http://<gateway>/export_trajectories \
   -H 'Authorization: Bearer my-secret-admin-key' \
   -d '{
     "request_id": "run-42:manual-export-0",
+    "request_expires_at": 1783075200,
     "session_ids": ["opaque-session-id"],
     "group_id": "grp-2a61...",
     "trajectory_id": 0,
@@ -160,8 +163,8 @@ Proxy。只有参数变化或真正的新导出才使用新的 ID。
 全部属于同一个 `group_id`。破坏性分组导出必须包含该组当前的所有成员，避免 Router 清理使未列出的 session 失去
 路由。所有检查都在消费任何轨迹之前完成。callback 导出还会携带所属 `lease_id`，controller 会自动补上这个字段。
 
-重放账本具有明确的进程内窗口。默认保留响应内容 300 秒；超过窗口后不会遗忘 request ID，而是把它压缩成不含 payload 的 fence，并返回
-`410`，绝不会静默重做。pending 请求、可重放响应和过期 fence 共用固定的记录容量； 容量满时，新 ID 返回
+重放账本具有明确的进程内窗口。每个变更请求都携带有限的 `request_expires_at`，默认最多在未来 300 秒。超过截止点后请求本身恒返回
+`410`，因此终态记录可以安全回收，旧 ID 仍不会静默重做。pending 请求和有效期内的可重放响应共用固定记录容量；容量满时，新 ID 返回
 `503`。单条与总响应字节上限保证重放数据有界。如果序列化导出无法放入 Data Proxy 的 重放预算，Data Proxy 会在消费轨迹之前返回 `507`。
 
 对应的程序化配置包括 `GatewayConfig.max_request_replay_records`、
@@ -184,7 +187,7 @@ Proxy。只有参数变化或真正的新导出才使用新的 ID。
   证明精确清理已经完成，CLI 会保留本地进程及其 worker ID，使 `areal inf deregister` 能够安全重试清理。
 - 尚未领取的 lease 在 controller 持有的超时后过期。callback 导出开始后，lease 进入 delivered 阶段，其新期限 覆盖有界的
   Gateway 转发；破坏性导出成功后进入 completed。worker 取消和 Router 撤销会独立重试。
-- 同一进程内不会静默淘汰 start/export request ID；响应 payload 会压缩为返回 `410` 的 fence，容量耗尽则对 新 ID 背压。
+- start/export 在声明的截止点前可安全重放；之后终态记录可回收，而过期请求本身仍确定返回 `410`。
 
 ## 固定留出集评测（仅限 V2）
 

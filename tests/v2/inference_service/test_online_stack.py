@@ -7,6 +7,7 @@ GPU-backed serving stack used by the slow integration suites.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -342,6 +343,7 @@ async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stac
         "/export_trajectories",
         json={
             "request_id": "latest-ready-export",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["__hitl__"],
             "discount": 1.0,
             "style": "individual",
@@ -390,6 +392,7 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
         "/export_trajectories",
         json={
             "request_id": "explicit-trajectory-export",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["__hitl__"],
             "trajectory_id": 0,
             "discount": 1.0,
@@ -405,6 +408,7 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
         "/export_trajectories",
         json={
             "request_id": "latest-trajectory-export",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["__hitl__"],
             "discount": 1.0,
             "style": "individual",
@@ -451,6 +455,7 @@ async def test_online_stack_callback_session_requires_and_carries_lease(online_s
             "task_id": "task-1",
             "delivery_mode": "callback",
             "request_id": "request-rejected",
+            "request_expires_at": time.time() + 30.0,
         },
         headers=_admin_headers(),
     )
@@ -469,6 +474,7 @@ async def test_online_stack_callback_session_requires_and_carries_lease(online_s
             "task_id": "task-1",
             "delivery_mode": "callback",
             "request_id": "request-admitted",
+            "request_expires_at": time.time() + 30.0,
         },
         headers=_admin_headers(),
     )

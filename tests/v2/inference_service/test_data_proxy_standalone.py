@@ -7,6 +7,7 @@ otherwise (no auth, admin key, unknown key) → standalone mode (no caching).
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -232,7 +233,11 @@ class TestSessionKeyUnchanged:
         # Start a session first
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "test-task", "delivery_mode": "pull"},
+            json={
+                "task_id": "test-task",
+                "delivery_mode": "pull",
+                "request_expires_at": time.time() + 30,
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 201

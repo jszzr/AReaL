@@ -134,6 +134,7 @@ def main() -> None:
     show_request("POST", "rl/start_session", "Bearer ***", args.gateway_url)
 
     deadline = time.monotonic() + args.capacity_timeout
+    request_expires_at = time.time() + args.capacity_timeout
     resp: requests.Response | None = None
     last_error: requests.RequestException | None = None
     first_attempt = True
@@ -150,6 +151,7 @@ def main() -> None:
                     "task_id": args.task_id,
                     "delivery_mode": "callback",
                     "request_id": request_id,
+                    "request_expires_at": request_expires_at,
                 },
                 timeout=10,
             )

@@ -6,6 +6,7 @@ Uses ``unittest.mock.patch`` to mock ``streaming.py`` functions at module level.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -105,7 +106,11 @@ class TestAuthRejection:
         """POST /rl/start_session with session key → 403."""
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "t1"},
+            json={
+                "request_id": "test-request",
+                "request_expires_at": time.time() + 30.0,
+                "task_id": "t1",
+            },
             headers=session_headers(),
         )
         assert resp.status_code == 403
@@ -212,7 +217,12 @@ class TestAdminEndpoints:
 
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "task-1", "delivery_mode": "pull"},
+            json={
+                "request_id": "test-request",
+                "request_expires_at": time.time() + 30.0,
+                "task_id": "task-1",
+                "delivery_mode": "pull",
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 201
@@ -256,6 +266,8 @@ class TestAdminEndpoints:
         response = await client.post(
             "/rl/start_session",
             json={
+                "request_id": "refresh-request",
+                "request_expires_at": time.time() + 30.0,
                 "task_id": "task-refresh",
                 "api_key": "old-key",
                 "delivery_mode": "pull",
@@ -287,7 +299,12 @@ class TestAdminEndpoints:
 
         response = await client.post(
             "/rl/start_session",
-            json={"task_id": "task-legacy", "delivery_mode": "pull"},
+            json={
+                "request_id": "test-request",
+                "request_expires_at": time.time() + 30.0,
+                "task_id": "task-legacy",
+                "delivery_mode": "pull",
+            },
             headers=admin_headers(),
         )
 
@@ -318,7 +335,12 @@ class TestAdminEndpoints:
 
         resp = await client.post(
             "/rl/start_session",
-            json={"task_id": "t", "delivery_mode": "pull"},
+            json={
+                "request_id": "test-request",
+                "request_expires_at": time.time() + 30.0,
+                "task_id": "t",
+                "delivery_mode": "pull",
+            },
             headers=admin_headers(),
         )
         assert resp.status_code == 502
@@ -342,6 +364,7 @@ class TestAdminEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "admin-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["task-1-0"],
                 "group_id": "grp-test",
                 "discount": 1.0,
@@ -369,6 +392,7 @@ class TestAdminEndpoints:
         mock_revoke.return_value = True
         request_body = {
             "request_id": "export-replay-1",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["task-1-0"],
             "group_id": "grp-test",
         }
@@ -403,7 +427,9 @@ class TestAdminEndpoints:
         ]
         request_body = {
             "request_id": "export-lost-worker-response",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["task-1-0"],
+            "group_id": "grp-test",
         }
 
         first = await client.post(
@@ -420,7 +446,7 @@ class TestAdminEndpoints:
         assert {
             call.args[2][WORKER_ID_HEADER] for call in mock_forward.await_args_list
         } == {"worker-epoch-1"}
-        mock_revoke.assert_not_awaited()
+        mock_revoke.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
@@ -433,7 +459,9 @@ class TestAdminEndpoints:
         ]
         request_body = {
             "request_id": "export-router-error",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["task-1-0"],
+            "group_id": "grp-test",
         }
 
         first = await client.post(
@@ -463,6 +491,7 @@ class TestAdminEndpoints:
         mock_revoke.side_effect = [False, True]
         request_body = {
             "request_id": "export-cleanup-retry",
+            "request_expires_at": time.time() + 30.0,
             "session_ids": ["task-1-0"],
             "group_id": "grp-test",
         }
@@ -498,10 +527,12 @@ class TestAdminEndpoints:
             "/export_trajectories",
             json={
                 "request_id": "online-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["__hitl__"],
                 "trajectory_id": 0,
                 "discount": 1.0,
                 "style": "individual",
+                "remove_session": False,
             },
             headers=admin_headers(),
         )
@@ -976,7 +1007,9 @@ class TestRouterErrors:
             "/export_trajectories",
             json={
                 "request_id": "missing-route-export",
+                "request_expires_at": time.time() + 30.0,
                 "session_ids": ["nonexistent"],
+                "group_id": "missing-group",
                 "discount": 1.0,
                 "style": "sft",
             },
@@ -1024,6 +1057,7 @@ class TestStartSessionCapacity:
                 "task_id": "t",
                 "delivery_mode": "callback",
                 "request_id": "request-full-flow",
+                "request_expires_at": time.time() + 30.0,
             },
             headers=admin_headers(),
         )

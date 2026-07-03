@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import torch
@@ -1518,6 +1518,7 @@ class TestInferenceServiceWorkflow:
             json={
                 "task_id": "42",
                 "request_id": "request-1",
+                "request_expires_at": ANY,
                 "group_size": 1,
                 "delivery_mode": "pull",
             },
@@ -1556,6 +1557,7 @@ class TestInferenceServiceWorkflow:
             "http://test:8080/export_trajectories",
             json={
                 "request_id": "export-request-1",
+                "request_expires_at": ANY,
                 "session_ids": ["session-1"],
                 "group_id": "group-1",
                 "trajectory_id": 3,
