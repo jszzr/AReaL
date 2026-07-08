@@ -14,6 +14,10 @@ from areal.v2.memory_service.errors import (
 
 
 def test_persistence_errors_have_one_narrow_hierarchy() -> None:
+    assert MemoryPersistenceError.__bases__ == (MemoryServiceError,)
+    assert MemoryPersistenceBusyError.__bases__ == (MemoryPersistenceError,)
+    assert MemoryPersistenceSchemaError.__bases__ == (MemoryPersistenceError,)
+    assert MemoryPersistenceCorruptionError.__bases__ == (MemoryPersistenceError,)
     assert issubclass(MemoryPersistenceError, MemoryServiceError)
     assert issubclass(MemoryPersistenceBusyError, MemoryPersistenceError)
     assert issubclass(MemoryPersistenceSchemaError, MemoryPersistenceError)
