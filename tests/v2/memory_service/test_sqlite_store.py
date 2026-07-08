@@ -8,7 +8,9 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import sqlite3
+import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -514,6 +516,31 @@ def _revision_graph_state(
         counts[3],
         counts[4],
     ), foreign_key_violations
+
+
+def _revision_graph_rows(
+    database_path: str | Path,
+) -> tuple[tuple[tuple[object, ...], ...], ...]:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.text_factory = bytes
+    try:
+        return tuple(
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+            )
+            for table in (
+                "memory_scopes",
+                "memory_evidence",
+                "memory_candidates",
+                "memory_candidate_evidence",
+                "memory_revisions",
+            )
+        )
+    finally:
+        connection.close()
 
 
 class _StableDigest:
@@ -6501,3 +6528,1151 @@ def test_sqlite_concurrent_sibling_revisions_all_survive(
         ),
         [],
     )
+
+
+def test_sqlite_revision_snapshot_loads_each_scalar_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-scalar-once.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-scalar-once")
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"scalar-once-{index}",
+        )[0]
+        for index in range(5)
+    )
+    root = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[0].candidate_id,
+            idempotency_key="scalar-once-root",
+        )
+    )
+    left = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[1].candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id=root.revision_id,
+            idempotency_key="scalar-once-left",
+        )
+    )
+    right = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[2].candidate_id,
+            operation=RevisionOperation.CONTRADICT,
+            parent_revision_id=root.revision_id,
+            idempotency_key="scalar-once-right",
+        )
+    )
+    grandchild = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[3].candidate_id,
+            operation=RevisionOperation.SUPERSEDE,
+            parent_revision_id=left.revision_id,
+            idempotency_key="scalar-once-grandchild",
+        )
+    )
+    second_root = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[4].candidate_id,
+            idempotency_key="scalar-once-second-root",
+        )
+    )
+    expected = tuple(
+        sorted(
+            (root, left, right, grandchild, second_root),
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    revision_select_sql = _normalize_sql(sqlite_store_module._REVISION_SELECT)
+    address_scan_sql = _normalize_sql(
+        "SELECT scope_id, revision_id FROM memory_revisions"
+    )
+    scalar_loads: dict[tuple[object, ...], int] = {}
+    address_scans = 0
+    real_connect = sqlite_backend._connect
+
+    class CountingRevisionCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> CountingRevisionCursor:
+            nonlocal address_scans
+            normalized = _normalize_sql(sql)
+            if normalized == address_scan_sql:
+                address_scans += 1
+            elif normalized == revision_select_sql:
+                assert isinstance(parameters, tuple)
+                scalar_loads[parameters] = scalar_loads.get(parameters, 0) + 1
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class CountingRevisionConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> CountingRevisionCursor:
+            return CountingRevisionCursor(self._real_connection.cursor(*args, **kwargs))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> CountingRevisionConnection:
+        return CountingRevisionConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+
+    assert store.list_revisions(scope) == expected
+    assert address_scans == 1
+    assert len(scalar_loads) == len(expected)
+    assert set(load_count for load_count in scalar_loads.values()) == {1}
+    assert {parameters[1] for parameters in scalar_loads} == {
+        revision.revision_id for revision in expected
+    }
+
+
+def test_revision_topology_handles_a_chain_deeper_than_recursion_limit() -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-deep-chain")
+    chain_length = sys.getrecursionlimit() + 64
+    root_hash = "a" * 64
+    memory_id = f"mem_{root_hash[:24]}"
+    revision_by_address: dict[tuple[int, str], MemoryRevision] = {}
+    parent_by_address: dict[tuple[int, str], tuple[int, str] | None] = {}
+    parent_revision_id: str | None = None
+
+    for generation in range(chain_length):
+        revision_id = f"rev_{generation:024x}"
+        operation = (
+            RevisionOperation.ADD if generation == 0 else RevisionOperation.REFINE
+        )
+        proposal = _make_sqlite_revision(
+            scope=scope,
+            candidate_id=f"cand_{generation:024x}",
+            operation=operation,
+            parent_revision_id=parent_revision_id,
+            idempotency_key=f"deep-chain-{generation}",
+        )
+        revision = MemoryRevision(
+            revision_id=revision_id,
+            memory_id=memory_id,
+            generation=generation,
+            proposal=proposal,
+            content_hash=root_hash if generation == 0 else f"{generation:064x}",
+            created_at=datetime(2026, 7, 8, tzinfo=UTC),
+        )
+        address = (1, revision_id)
+        revision_by_address[address] = revision
+        parent_by_address[address] = (
+            None if parent_revision_id is None else (1, parent_revision_id)
+        )
+        parent_revision_id = revision_id
+
+    revision_by_address = dict(reversed(tuple(revision_by_address.items())))
+    parent_by_address = {
+        address: parent_by_address[address] for address in revision_by_address
+    }
+    deepest_address = (1, f"rev_{chain_length - 1:024x}")
+    assert next(iter(revision_by_address)) == deepest_address
+
+    sqlite_store_module._validate_revision_topology(
+        revision_by_address,
+        parent_by_address,
+    )
+
+    assert len(revision_by_address) == chain_length
+    assert max(item.generation for item in revision_by_address.values()) == (
+        chain_length - 1
+    )
+
+
+def test_sqlite_revision_snapshot_rejects_parent_cycles_iteratively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-cycle.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-cycle")
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"cycle-{index}",
+        )[0]
+        for index in range(2)
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    first_revision_id = f"rev_{'a' * 24}"
+    second_revision_id = f"rev_{'b' * 24}"
+    first_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[0].candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=second_revision_id,
+        idempotency_key="cycle-first",
+    )
+    second_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[1].candidate_id,
+        operation=RevisionOperation.CONTRADICT,
+        parent_revision_id=first_revision_id,
+        idempotency_key="cycle-second",
+    )
+    first_hash = "a" * 64
+    second_hash = "b" * 64
+    created_at_text = datetime(2026, 7, 8, 5, 6, 7, tzinfo=UTC).isoformat()
+    memory_id = "mem_cycle"
+
+    def virtual_row(
+        revision_id: str,
+        proposal: RevisionProposal,
+        content_hash: str,
+    ) -> tuple[object, ...]:
+        return (
+            revision_id,
+            proposal.canonical_bytes(),
+            content_hash,
+            created_at_text,
+            sqlite_store_module._record_storage_hash(
+                record_kind="revision",
+                scope=scope,
+                record_id=revision_id,
+                content_hash=content_hash,
+                created_at_text=created_at_text,
+                memory_id=memory_id,
+                generation=1,
+            ),
+            proposal.candidate_id,
+            memory_id,
+            1,
+            proposal.operation.value,
+            proposal.parent_revision_id,
+            proposal.idempotency_key,
+        )
+
+    rows_by_address = {
+        (scope_id, first_revision_id): virtual_row(
+            first_revision_id,
+            first_proposal,
+            first_hash,
+        ),
+        (scope_id, second_revision_id): virtual_row(
+            second_revision_id,
+            second_proposal,
+            second_hash,
+        ),
+    }
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(
+            {
+                first_proposal.canonical_bytes(): first_hash,
+                second_proposal.canonical_bytes(): second_hash,
+            }
+        ),
+    )
+    address_sql = _normalize_sql("SELECT scope_id, revision_id FROM memory_revisions")
+    scalar_sql = _normalize_sql(sqlite_store_module._REVISION_SELECT)
+    proxy_hits = {"address": 0, "scalar": 0}
+    topology_hits = 0
+    real_connect = sqlite_backend._connect
+    real_validate_topology = sqlite_store_module._validate_revision_topology
+
+    class VirtualCycleCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+            self._parameters: object = ()
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> VirtualCycleCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._parameters = parameters
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            if self._last_sql == address_sql:
+                assert rows == []
+                proxy_hits["address"] += 1
+                return list(rows_by_address)
+            return rows
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            row = self._real_cursor.fetchone()
+            if self._last_sql == scalar_sql and self._parameters in rows_by_address:
+                assert row is None
+                proxy_hits["scalar"] += 1
+                return rows_by_address[self._parameters]  # type: ignore[index]
+            return None if row is None else tuple(row)
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class VirtualCycleConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> VirtualCycleCursor:
+            return VirtualCycleCursor(self._real_connection.cursor(*args, **kwargs))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> VirtualCycleConnection:
+        return VirtualCycleConnection(real_connect(path))
+
+    def observed_topology(
+        revision_by_address: dict[tuple[int, str], MemoryRevision],
+        parent_by_address: dict[tuple[int, str], tuple[int, str] | None],
+    ) -> None:
+        nonlocal topology_hits
+        topology_hits += 1
+        real_validate_topology(revision_by_address, parent_by_address)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_validate_revision_topology",
+        observed_topology,
+    )
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((1, 2, 2, 2, 0), [])
+
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="revision parent graph contains a cycle",
+    ) as raised:
+        store.list_revisions(scope)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert raised.value.__cause__ is None
+    assert proxy_hits == {"address": 1, "scalar": 2}
+    assert topology_hits == 1
+    assert _revision_graph_state(database_path) == baseline_state
+
+
+def test_sqlite_revision_snapshot_validates_unrelated_lower_graph_first(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "revision-unrelated-base.sqlite3"
+    store = SQLiteMemoryStore(base_path)
+    target_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-unrelated-target",
+    )
+    target_candidate, _target_evidence = _append_sqlite_revision_candidate(
+        store,
+        target_scope,
+        index=0,
+        key="unrelated-target",
+    )
+    target_proposal = _make_sqlite_revision(
+        scope=target_scope,
+        candidate_id=target_candidate.candidate_id,
+        idempotency_key="unrelated-target-revision",
+    )
+    target_revision = store.append_revision(target_proposal)
+    evidence_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-unrelated-evidence",
+    )
+    unrelated_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=evidence_scope,
+            payload="unrelated evidence-only scope",
+            idempotency_key="unrelated-evidence-only",
+        )
+    )
+    candidate_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-unrelated-candidate",
+    )
+    unrelated_candidate, _candidate_evidence = _append_sqlite_revision_candidate(
+        store,
+        candidate_scope,
+        index=0,
+        key="unrelated-candidate-only",
+    )
+    revision_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-unrelated-revision",
+    )
+    revision_candidate, _revision_evidence = _append_sqlite_revision_candidate(
+        store,
+        revision_scope,
+        index=0,
+        key="unrelated-revision-only",
+    )
+    unrelated_revision = store.append_revision(
+        _make_sqlite_revision(
+            scope=revision_scope,
+            candidate_id=revision_candidate.candidate_id,
+            idempotency_key="unrelated-revision-only",
+        )
+    )
+    assert _revision_graph_state(base_path) == ((4, 4, 3, 3, 2), [])
+
+    corruption_expectations = {
+        "evidence": (
+            "stored evidence row failed integrity validation",
+            "evidence ID disagrees with its content hash",
+        ),
+        "candidate": (
+            "stored candidate row failed integrity validation",
+            "candidate ID disagrees with its content hash",
+        ),
+        "revision": (
+            "stored revision row failed integrity validation",
+            "revision ID disagrees with its content hash",
+        ),
+    }
+    for corruption_kind in ("evidence", "candidate", "revision"):
+        for operation in ("missing-get", "list-filter", "exact-retry"):
+            database_path = tmp_path / (
+                f"revision-unrelated-{corruption_kind}-{operation}.sqlite3"
+            )
+            shutil.copyfile(base_path, database_path)
+            connection = sqlite3.connect(database_path, isolation_level=None)
+            try:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+                if corruption_kind == "evidence":
+                    moved_id = f"evd_{'0' * 24}"
+                    assert moved_id != unrelated_evidence.evidence_id
+                    connection.execute(
+                        "UPDATE memory_evidence SET evidence_id = ? "
+                        "WHERE evidence_id = ?",
+                        (moved_id, unrelated_evidence.evidence_id),
+                    )
+                elif corruption_kind == "candidate":
+                    moved_id = f"cand_{'0' * 24}"
+                    assert moved_id != unrelated_candidate.candidate_id
+                    connection.execute(
+                        "UPDATE memory_candidate_evidence SET candidate_id = ? "
+                        "WHERE candidate_id = ?",
+                        (moved_id, unrelated_candidate.candidate_id),
+                    )
+                    connection.execute(
+                        "UPDATE memory_candidates SET candidate_id = ? "
+                        "WHERE candidate_id = ?",
+                        (moved_id, unrelated_candidate.candidate_id),
+                    )
+                else:
+                    moved_id = f"rev_{'0' * 24}"
+                    assert moved_id != unrelated_revision.revision_id
+                    connection.execute(
+                        "UPDATE memory_revisions SET revision_id = ? "
+                        "WHERE revision_id = ?",
+                        (moved_id, unrelated_revision.revision_id),
+                    )
+            finally:
+                connection.close()
+
+            corrupted_state = _revision_graph_state(database_path)
+            assert corrupted_state == ((4, 4, 3, 3, 2), [])
+            corrupted_rows = _revision_graph_rows(database_path)
+            corrupted_store = SQLiteMemoryStore(database_path)
+            retry = RevisionProposal(
+                scope=target_proposal.scope,
+                candidate_id=target_proposal.candidate_id,
+                operation=target_proposal.operation,
+                parent_revision_id=target_proposal.parent_revision_id,
+                idempotency_key=target_proposal.idempotency_key,
+            )
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                if operation == "missing-get":
+                    corrupted_store.get_revision(target_scope, "rev_missing")
+                elif operation == "list-filter":
+                    corrupted_store.list_revisions(
+                        target_scope,
+                        memory_id=target_revision.memory_id,
+                    )
+                else:
+                    corrupted_store.append_revision(retry)
+
+            expected_outer, expected_cause = corruption_expectations[corruption_kind]
+            assert type(raised.value) is MemoryPersistenceCorruptionError
+            assert str(raised.value) == expected_outer
+            assert type(raised.value.__cause__) is ValueError
+            assert str(raised.value.__cause__) == expected_cause
+            assert _revision_graph_state(database_path) == corrupted_state
+            assert _revision_graph_rows(database_path) == corrupted_rows
+
+
+def test_sqlite_revision_loader_rejects_malformed_and_duplicate_rows(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-malformed-duplicate.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-malformed")
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"malformed-{index}",
+        )[0]
+        for index in range(3)
+    )
+    root_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[0].candidate_id,
+        idempotency_key="malformed-root",
+    )
+    root = store.append_revision(root_proposal)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+        scalar_row = connection.execute(
+            sqlite_store_module._REVISION_SELECT,
+            (scope_id, root.revision_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert scalar_row is not None
+
+    class StaticScalarCursor:
+        def __init__(self, row: tuple[object, ...]) -> None:
+            self._row = row
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticScalarCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return self._row
+
+    malformed_scalars: list[
+        tuple[str, tuple[object, ...], str, type[ValueError] | type[TypeError]]
+    ] = [
+        (
+            "wrong-arity",
+            tuple(scalar_row[:-1]),
+            "revision row has the wrong field count",
+            ValueError,
+        )
+    ]
+    wrong_values = (
+        b"revision-id",
+        "canonical-not-blob",
+        b"content-hash",
+        b"created-at",
+        b"storage-hash",
+        b"candidate-id",
+        b"memory-id",
+        True,
+        b"operation",
+        b"parent-id",
+        b"idempotency-key",
+    )
+    for index, wrong_value in enumerate(wrong_values):
+        changed_row = list(scalar_row)
+        changed_row[index] = wrong_value
+        malformed_scalars.append(
+            (
+                f"wrong-storage-{index}",
+                tuple(changed_row),
+                f"revision row field {index} has the wrong storage class",
+                TypeError,
+            )
+        )
+    overflow_generation_row = list(scalar_row)
+    overflow_generation_row[7] = 2**63
+    malformed_scalars.append(
+        (
+            "generation-overflow",
+            tuple(overflow_generation_row),
+            "generation must fit the non-negative signed-64 range",
+            ValueError,
+        )
+    )
+
+    for case, row, expected_cause, cause_type in malformed_scalars:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_revision(
+                StaticScalarCursor(row),  # type: ignore[arg-type]
+                scope,
+                scope_id,
+                root.revision_id,
+            )
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == (
+            "stored revision row failed integrity validation"
+        ), case
+        assert type(raised.value.__cause__) is cause_type, case
+        assert str(raised.value.__cause__) == expected_cause, case
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as requested_id_error:
+        sqlite_store_module._load_revision(
+            StaticScalarCursor(tuple(scalar_row)),  # type: ignore[arg-type]
+            scope,
+            scope_id,
+            "rev_requested_id_drift",
+        )
+    assert type(requested_id_error.value) is MemoryPersistenceCorruptionError
+    assert str(requested_id_error.value) == (
+        "stored revision row failed integrity validation"
+    )
+    assert type(requested_id_error.value.__cause__) is ValueError
+    assert str(requested_id_error.value.__cause__) == (
+        "loaded revision ID differs from requested ID"
+    )
+
+    class StaticRowsCursor:
+        def __init__(self, rows: tuple[tuple[object, ...], ...]) -> None:
+            self._rows = rows
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticRowsCursor:
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return list(self._rows)
+
+    address_cases = (
+        (
+            "wrong-arity",
+            ((scope_id,),),
+            "revision address row does not contain exactly two values",
+        ),
+        (
+            "boolean-scope",
+            ((True, root.revision_id),),
+            "revision address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "overflow-scope",
+            ((2**63, root.revision_id),),
+            "revision address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "missing-scope",
+            ((2**63 - 1, root.revision_id),),
+            "revision address refers to a missing scope",
+        ),
+        (
+            "nontext-revision",
+            ((scope_id, b"revision-id"),),
+            "revision address contains a non-text identifier",
+        ),
+    )
+    for case, rows, expected_message in address_cases:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_revision_addresses(
+                StaticRowsCursor(rows),  # type: ignore[arg-type]
+                {scope_id: scope},
+            )
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_message, case
+        assert raised.value.__cause__ is None, case
+
+    virtual_proposals = {
+        "idempotency": _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[1].candidate_id,
+            idempotency_key=root.proposal.idempotency_key,
+        ),
+        "candidate": _make_sqlite_revision(
+            scope=scope,
+            candidate_id=root.proposal.candidate_id,
+            idempotency_key="duplicate-candidate",
+        ),
+        "parent": _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[2].candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id="rev_missing",
+            idempotency_key="missing-parent",
+        ),
+    }
+    created_at_text = datetime(2026, 7, 8, 6, 7, 8, tzinfo=UTC).isoformat()
+    virtual_rows: dict[str, tuple[int, str, tuple[object, ...]]] = {}
+    for case, proposal in virtual_proposals.items():
+        canonical = proposal.canonical_bytes()
+        content_hash = hashlib.sha256(canonical).hexdigest()
+        revision_id = f"rev_{content_hash[:24]}"
+        generation = 0 if proposal.operation is RevisionOperation.ADD else 1
+        memory_id = (
+            f"mem_{content_hash[:24]}"
+            if proposal.operation is RevisionOperation.ADD
+            else root.memory_id
+        )
+        virtual_rows[case] = (
+            scope_id,
+            revision_id,
+            (
+                revision_id,
+                canonical,
+                content_hash,
+                created_at_text,
+                sqlite_store_module._record_storage_hash(
+                    record_kind="revision",
+                    scope=scope,
+                    record_id=revision_id,
+                    content_hash=content_hash,
+                    created_at_text=created_at_text,
+                    memory_id=memory_id,
+                    generation=generation,
+                ),
+                proposal.candidate_id,
+                memory_id,
+                generation,
+                proposal.operation.value,
+                proposal.parent_revision_id,
+                proposal.idempotency_key,
+            ),
+        )
+    expected_messages = {
+        "address": "revision address appears multiple times",
+        "idempotency": "revision idempotency key appears multiple times in one scope",
+        "candidate": "candidate backs multiple revisions in one scope",
+        "parent": "revision refers to a missing same-scope parent",
+    }
+    address_sql = _normalize_sql("SELECT scope_id, revision_id FROM memory_revisions")
+    scalar_sql = _normalize_sql(sqlite_store_module._REVISION_SELECT)
+    real_connect = sqlite_backend._connect
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((1, 3, 3, 3, 1), [])
+
+    for case in ("address", "idempotency", "candidate", "parent"):
+        hits = {"address": 0, "scalar": 0}
+
+        class DuplicateRevisionCursor:
+            def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+                self._real_cursor = real_cursor
+                self._last_sql = ""
+                self._parameters: object = ()
+
+            def execute(
+                self,
+                sql: str,
+                parameters: object = (),
+            ) -> DuplicateRevisionCursor:
+                self._last_sql = _normalize_sql(sql)
+                self._parameters = parameters
+                self._real_cursor.execute(sql, parameters)
+                return self
+
+            def fetchall(self) -> list[tuple[object, ...]]:
+                rows = [tuple(row) for row in self._real_cursor.fetchall()]
+                if self._last_sql == address_sql:
+                    hits["address"] += 1
+                    if case == "address":
+                        return [*rows, (scope_id, root.revision_id)]
+                    virtual_scope_id, virtual_revision_id, _row = virtual_rows[case]
+                    return [*rows, (virtual_scope_id, virtual_revision_id)]
+                return rows
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                row = self._real_cursor.fetchone()
+                if case != "address":
+                    virtual_scope_id, virtual_revision_id, virtual_row = virtual_rows[
+                        case
+                    ]
+                    if self._last_sql == scalar_sql and self._parameters == (
+                        virtual_scope_id,
+                        virtual_revision_id,
+                    ):
+                        assert row is None
+                        hits["scalar"] += 1
+                        return virtual_row
+                return None if row is None else tuple(row)
+
+            def __iter__(self) -> Any:
+                return iter(self._real_cursor)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_cursor, name)
+
+        class DuplicateRevisionConnection:
+            def __init__(self, real_connection: sqlite3.Connection) -> None:
+                self._real_connection = real_connection
+
+            def cursor(
+                self,
+                *args: object,
+                **kwargs: object,
+            ) -> DuplicateRevisionCursor:
+                return DuplicateRevisionCursor(
+                    self._real_connection.cursor(*args, **kwargs)
+                )
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_connection, name)
+
+        def connect(path: str) -> DuplicateRevisionConnection:
+            return DuplicateRevisionConnection(real_connect(path))
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sqlite_backend, "_connect", connect)
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                store.list_revisions(scope)
+
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_messages[case], case
+        assert raised.value.__cause__ is None, case
+        assert hits == {
+            "address": 1,
+            "scalar": 0 if case == "address" else 1,
+        }, case
+        assert _revision_graph_state(database_path) == baseline_state, case
+
+
+def test_sqlite_revision_loader_rejects_projection_lineage_and_storage_drift(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "revision-drift-base.sqlite3"
+    store = SQLiteMemoryStore(base_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-drift")
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"drift-{index}",
+        )[0]
+        for index in range(4)
+    )
+    root = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[0].candidate_id,
+            idempotency_key="drift-root",
+        )
+    )
+    alternate_root = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[1].candidate_id,
+            idempotency_key="drift-alternate-root",
+        )
+    )
+    child = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[2].candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id=root.revision_id,
+            idempotency_key="drift-child",
+        )
+    )
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-drift-foreign",
+    )
+    foreign_candidate, _foreign_evidence = _append_sqlite_revision_candidate(
+        store,
+        foreign_scope,
+        index=0,
+        key="drift-foreign",
+    )
+    foreign_root = store.append_revision(
+        _make_sqlite_revision(
+            scope=foreign_scope,
+            candidate_id=foreign_candidate.candidate_id,
+            idempotency_key="drift-foreign-root",
+        )
+    )
+    assert foreign_root.revision_id not in {
+        root.revision_id,
+        alternate_root.revision_id,
+        child.revision_id,
+    }
+    baseline_state = _revision_graph_state(base_path)
+    assert baseline_state == ((2, 5, 5, 5, 4), [])
+    canonical_variant = b" \n" + child.proposal.canonical_bytes()
+    assert canonical_variant != child.proposal.canonical_bytes()
+    assert json.loads(canonical_variant) == json.loads(child.proposal.canonical_bytes())
+    hash_suffix = "0" * 40 if child.content_hash[24:] != "0" * 40 else "1" * 40
+    changed_content_hash = child.content_hash[:24] + hash_suffix
+    assert changed_content_hash != child.content_hash
+    scalar_outer = "stored revision row failed integrity validation"
+    cases: dict[str, tuple[str, str | None]] = {
+        "canonical": (
+            scalar_outer,
+            "canonical revision bytes disagree with projections",
+        ),
+        "content-hash": (
+            scalar_outer,
+            "revision content hash disagrees with canonical bytes",
+        ),
+        "revision-id": (
+            scalar_outer,
+            "revision ID disagrees with its content hash",
+        ),
+        "created-at-z": (
+            scalar_outer,
+            "revision created_at is not exact UTC isoformat text",
+        ),
+        "storage-hash": (
+            scalar_outer,
+            "revision storage hash disagrees with stored metadata",
+        ),
+        "candidate-id": (
+            scalar_outer,
+            "canonical revision bytes disagree with projections",
+        ),
+        "operation": (
+            scalar_outer,
+            "canonical revision bytes disagree with projections",
+        ),
+        "parent": (
+            scalar_outer,
+            "canonical revision bytes disagree with projections",
+        ),
+        "idempotency": (
+            scalar_outer,
+            "canonical revision bytes disagree with projections",
+        ),
+        "root-memory": (
+            "ADD revision memory ID disagrees with its content hash",
+            None,
+        ),
+        "root-generation": (
+            "ADD revision generation is not zero",
+            None,
+        ),
+        "child-memory": (
+            "child revision memory ID differs from parent memory ID",
+            None,
+        ),
+        "generation": (
+            "child revision generation is not exactly parent generation plus one",
+            None,
+        ),
+        "missing-parent": (
+            "Memory Service SQLite data failed foreign key validation",
+            None,
+        ),
+        "foreign-parent": (
+            "Memory Service SQLite data failed foreign key validation",
+            None,
+        ),
+        "invalid-utf8": (
+            "SQLite TEXT contains invalid UTF-8",
+            "unicode",
+        ),
+    }
+
+    for case, (expected_outer, expected_cause) in cases.items():
+        database_path = tmp_path / f"revision-drift-{case}.sqlite3"
+        shutil.copyfile(base_path, database_path)
+        case_store = SQLiteMemoryStore(database_path)
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+            target_revision_id = child.revision_id
+            if case == "canonical":
+                connection.execute(
+                    "UPDATE memory_revisions SET canonical = ? WHERE revision_id = ?",
+                    (sqlite3.Binary(canonical_variant), child.revision_id),
+                )
+            elif case == "content-hash":
+                connection.execute(
+                    "UPDATE memory_revisions SET content_hash = ? "
+                    "WHERE revision_id = ?",
+                    (changed_content_hash, child.revision_id),
+                )
+            elif case == "revision-id":
+                target_revision_id = f"rev_{'0' * 24}"
+                assert target_revision_id != child.revision_id
+                connection.execute(
+                    "UPDATE memory_revisions SET revision_id = ? WHERE revision_id = ?",
+                    (target_revision_id, child.revision_id),
+                )
+            elif case == "created-at-z":
+                connection.execute(
+                    "UPDATE memory_revisions SET created_at = ? WHERE revision_id = ?",
+                    (
+                        child.created_at.isoformat().replace("+00:00", "Z"),
+                        child.revision_id,
+                    ),
+                )
+            elif case == "storage-hash":
+                connection.execute(
+                    "UPDATE memory_revisions SET storage_hash = ? "
+                    "WHERE revision_id = ?",
+                    ("0" * 64, child.revision_id),
+                )
+            elif case == "candidate-id":
+                connection.execute(
+                    "UPDATE memory_revisions SET candidate_id = ? "
+                    "WHERE revision_id = ?",
+                    (candidates[3].candidate_id, child.revision_id),
+                )
+            elif case == "operation":
+                connection.execute(
+                    "UPDATE memory_revisions SET operation = ? WHERE revision_id = ?",
+                    (RevisionOperation.CONTRADICT.value, child.revision_id),
+                )
+            elif case == "parent":
+                connection.execute(
+                    "UPDATE memory_revisions SET parent_revision_id = ? "
+                    "WHERE revision_id = ?",
+                    (alternate_root.revision_id, child.revision_id),
+                )
+            elif case == "idempotency":
+                connection.execute(
+                    "UPDATE memory_revisions SET idempotency_key = ? "
+                    "WHERE revision_id = ?",
+                    ("moved-drift-child", child.revision_id),
+                )
+            elif case == "root-memory":
+                target_revision_id = root.revision_id
+                connection.execute(
+                    "UPDATE memory_revisions SET memory_id = ? WHERE revision_id = ?",
+                    ("mem_moved_root", root.revision_id),
+                )
+            elif case == "root-generation":
+                target_revision_id = root.revision_id
+                connection.execute(
+                    "UPDATE memory_revisions SET generation = 1 WHERE revision_id = ?",
+                    (root.revision_id,),
+                )
+            elif case == "child-memory":
+                connection.execute(
+                    "UPDATE memory_revisions SET memory_id = ? WHERE revision_id = ?",
+                    (alternate_root.memory_id, child.revision_id),
+                )
+            elif case == "generation":
+                connection.execute(
+                    "UPDATE memory_revisions SET generation = 2 WHERE revision_id = ?",
+                    (child.revision_id,),
+                )
+            elif case == "missing-parent":
+                connection.execute(
+                    "UPDATE memory_revisions SET parent_revision_id = ? "
+                    "WHERE revision_id = ?",
+                    ("rev_missing", child.revision_id),
+                )
+            elif case == "foreign-parent":
+                connection.execute(
+                    "UPDATE memory_revisions SET parent_revision_id = ? "
+                    "WHERE revision_id = ?",
+                    (foreign_root.revision_id, child.revision_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE memory_revisions "
+                    "SET idempotency_key = CAST(X'80' AS TEXT) "
+                    "WHERE revision_id = ?",
+                    (child.revision_id,),
+                )
+
+            if case in {
+                "root-memory",
+                "root-generation",
+                "child-memory",
+                "generation",
+            }:
+                row = connection.execute(
+                    "SELECT revision_id, content_hash, created_at, memory_id, generation "
+                    "FROM memory_revisions WHERE revision_id = ?",
+                    (target_revision_id,),
+                ).fetchone()
+                assert row is not None
+                revision_id, content_hash, created_at_text, memory_id, generation = row
+                connection.execute(
+                    "UPDATE memory_revisions SET storage_hash = ? "
+                    "WHERE revision_id = ?",
+                    (
+                        sqlite_store_module._record_storage_hash(
+                            record_kind="revision",
+                            scope=scope,
+                            record_id=revision_id,
+                            content_hash=content_hash,
+                            created_at_text=created_at_text,
+                            memory_id=memory_id,
+                            generation=generation,
+                        ),
+                        revision_id,
+                    ),
+                )
+        finally:
+            connection.close()
+
+        corrupted_state = _revision_graph_state(database_path)
+        assert corrupted_state[0] == baseline_state[0]
+        if case in {"missing-parent", "foreign-parent"}:
+            assert len(corrupted_state[1]) == 1
+            table, _rowid, parent_table, _foreign_key_id = corrupted_state[1][0]
+            assert table == "memory_revisions"
+            assert parent_table == "memory_revisions"
+        else:
+            assert corrupted_state[1] == []
+        corrupted_rows = _revision_graph_rows(database_path)
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            case_store.get_revision(scope, "rev_missing")
+
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_outer, case
+        if expected_cause is None:
+            assert raised.value.__cause__ is None, case
+        elif expected_cause == "unicode":
+            assert type(raised.value.__cause__) is UnicodeDecodeError, case
+            assert raised.value.__cause__.object == b"\x80", case
+        else:
+            assert type(raised.value.__cause__) is ValueError, case
+            assert str(raised.value.__cause__) == expected_cause, case
+        assert _revision_graph_state(database_path) == corrupted_state, case
+        assert _revision_graph_rows(database_path) == corrupted_rows, case
