@@ -1144,6 +1144,14 @@ def _load_release_snapshot(
         scope_by_id,
         release_by_address,
     )
+    aliased_release_addresses = {
+        (scope_id, release.release_id)
+        for (scope_id, _idempotency_key), release in release_by_alias.items()
+    }
+    if aliased_release_addresses != set(release_by_address):
+        raise MemoryPersistenceCorruptionError(
+            "release exists without an idempotency alias"
+        )
     return (
         scope_by_id,
         revision_by_address,

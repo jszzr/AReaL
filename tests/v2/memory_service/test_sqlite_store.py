@@ -292,6 +292,111 @@ class _ReadbackOverrideConnection:
         return getattr(self._real_connection, name)
 
 
+@dataclass(slots=True)
+class _SQLiteReadOverridePlan:
+    fetchall_transforms: dict[
+        str,
+        Callable[
+            [tuple[tuple[object, ...], ...], object],
+            tuple[tuple[object, ...], ...],
+        ],
+    ] = field(default_factory=dict)
+    fetchone_transforms: dict[
+        str,
+        Callable[
+            [tuple[object, ...] | None, object],
+            tuple[object, ...] | None,
+        ],
+    ] = field(default_factory=dict)
+    executions: list[tuple[str, object]] = field(default_factory=list)
+
+
+class _SQLiteReadOverrideCursor:
+    def __init__(
+        self,
+        real_cursor: sqlite3.Cursor,
+        plan: _SQLiteReadOverridePlan,
+    ) -> None:
+        self._real_cursor = real_cursor
+        self._plan = plan
+        self._last_sql = ""
+        self._parameters: object = ()
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _SQLiteReadOverrideCursor:
+        self._last_sql = _normalize_sql(sql)
+        self._parameters = parameters
+        self._plan.executions.append((self._last_sql, parameters))
+        self._real_cursor.execute(sql, parameters)
+        return self
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        rows = tuple(tuple(row) for row in self._real_cursor.fetchall())
+        transform = self._plan.fetchall_transforms.get(self._last_sql)
+        if transform is not None:
+            rows = transform(rows, self._parameters)
+        return list(rows)
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        row = self._real_cursor.fetchone()
+        normalized_row = None if row is None else tuple(row)
+        transform = self._plan.fetchone_transforms.get(self._last_sql)
+        if transform is not None:
+            normalized_row = transform(normalized_row, self._parameters)
+        return normalized_row
+
+    def __iter__(self) -> Any:
+        return iter(self._real_cursor)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_cursor, name)
+
+
+class _SQLiteReadOverrideConnection:
+    def __init__(
+        self,
+        real_connection: sqlite3.Connection,
+        plan: _SQLiteReadOverridePlan,
+    ) -> None:
+        self._real_connection = real_connection
+        self._plan = plan
+
+    def cursor(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _SQLiteReadOverrideCursor:
+        return _SQLiteReadOverrideCursor(
+            self._real_connection.cursor(*args, **kwargs),
+            self._plan,
+        )
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _SQLiteReadOverrideCursor:
+        return self.cursor().execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_connection, name)
+
+
+def _install_sqlite_read_override_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: _SQLiteReadOverridePlan,
+) -> None:
+    real_connect = sqlite_backend._connect
+
+    def connect(path: str) -> _SQLiteReadOverrideConnection:
+        return _SQLiteReadOverrideConnection(real_connect(path), plan)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+
+
 def _install_sqlite_failure_proxy(
     monkeypatch: pytest.MonkeyPatch,
     plan: _SQLiteFailurePlan,
@@ -8955,3 +9060,1012 @@ def test_sqlite_release_id_collision_is_scoped_atomic_and_loser_key_reusable(
         (2, 3, 3, 3, 3, 3, 3, 3),
         [],
     )
+
+
+def test_sqlite_release_loader_rejects_scalar_projection_and_storage_drift(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "release-scalar-base.sqlite3"
+    store = SQLiteMemoryStore(base_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "release-scalar")
+    revision, _candidate, _evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="release-scalar",
+    )
+    manifest = ReleaseManifest(scope, (revision.revision_id,))
+    release = store.append_release(
+        manifest,
+        idempotency_key="release-scalar-owner",
+    )
+    connection = sqlite3.connect(base_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+        scalar_row = connection.execute(
+            sqlite_store_module._RELEASE_SELECT,
+            (scope_id, release.release_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert scalar_row is not None
+
+    class StaticScalarCursor:
+        def __init__(self, row: tuple[object, ...]) -> None:
+            self._row = row
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticScalarCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return self._row
+
+    malformed_scalars: list[
+        tuple[str, tuple[object, ...], str, type[ValueError] | type[TypeError]]
+    ] = [
+        (
+            "wrong-arity",
+            tuple(scalar_row[:-1]),
+            "release row has the wrong field count",
+            ValueError,
+        )
+    ]
+    wrong_values = (
+        b"release-id",
+        "canonical-not-blob",
+        b"content-hash",
+        b"created-at",
+        b"storage-hash",
+    )
+    for index, wrong_value in enumerate(wrong_values):
+        changed_row = list(scalar_row)
+        changed_row[index] = wrong_value
+        malformed_scalars.append(
+            (
+                f"wrong-storage-{index}",
+                tuple(changed_row),
+                f"release row field {index} has the wrong storage class",
+                TypeError,
+            )
+        )
+
+    for case, row, expected_cause, cause_type in malformed_scalars:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_release(
+                StaticScalarCursor(row),  # type: ignore[arg-type]
+                scope,
+                scope_id,
+                release.release_id,
+                (revision,),
+            )
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == "stored release row failed integrity validation", (
+            case
+        )
+        assert type(raised.value.__cause__) is cause_type, case
+        assert str(raised.value.__cause__) == expected_cause, case
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as requested_id_error:
+        sqlite_store_module._load_release(
+            StaticScalarCursor(tuple(scalar_row)),  # type: ignore[arg-type]
+            scope,
+            scope_id,
+            "rel_requested_id_drift",
+            (revision,),
+        )
+    assert str(requested_id_error.value) == (
+        "stored release row failed integrity validation"
+    )
+    assert type(requested_id_error.value.__cause__) is ValueError
+    assert str(requested_id_error.value.__cause__) == (
+        "loaded release ID differs from requested ID"
+    )
+
+    canonical_variant = b" \n" + manifest.canonical_bytes()
+    assert canonical_variant != manifest.canonical_bytes()
+    assert json.loads(canonical_variant) == json.loads(manifest.canonical_bytes())
+    hash_suffix = "0" * 40 if release.content_hash[24:] != "0" * 40 else "1" * 40
+    changed_content_hash = release.content_hash[:24] + hash_suffix
+    moved_release_id = f"rel_{'0' * 24}"
+    assert moved_release_id != release.release_id
+    drift_cases = {
+        "canonical": "canonical release bytes disagree with projections",
+        "content-hash": "release content hash disagrees with canonical bytes",
+        "release-id": "release ID disagrees with its content hash",
+        "created-at-z": "release created_at is not exact UTC isoformat text",
+        "storage-hash": "release storage hash disagrees with stored metadata",
+    }
+
+    for case, expected_cause in drift_cases.items():
+        database_path = tmp_path / f"release-scalar-{case}.sqlite3"
+        shutil.copyfile(base_path, database_path)
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            if case == "canonical":
+                connection.execute(
+                    "UPDATE memory_releases SET canonical = ? WHERE release_id = ?",
+                    (sqlite3.Binary(canonical_variant), release.release_id),
+                )
+            elif case == "content-hash":
+                connection.execute(
+                    "UPDATE memory_releases SET content_hash = ? WHERE release_id = ?",
+                    (changed_content_hash, release.release_id),
+                )
+            elif case == "release-id":
+                binding_hash = sqlite_store_module._release_binding_hash(
+                    scope=scope,
+                    idempotency_key="release-scalar-owner",
+                    release_id=moved_release_id,
+                )
+                connection.execute(
+                    "UPDATE memory_release_revisions SET release_id = ? "
+                    "WHERE scope_id = ? AND release_id = ?",
+                    (moved_release_id, scope_id, release.release_id),
+                )
+                connection.execute(
+                    "UPDATE memory_release_aliases "
+                    "SET release_id = ?, binding_hash = ? "
+                    "WHERE scope_id = ? AND release_id = ?",
+                    (
+                        moved_release_id,
+                        binding_hash,
+                        scope_id,
+                        release.release_id,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE memory_releases SET release_id = ? "
+                    "WHERE scope_id = ? AND release_id = ?",
+                    (moved_release_id, scope_id, release.release_id),
+                )
+            elif case == "created-at-z":
+                connection.execute(
+                    "UPDATE memory_releases SET created_at = ? WHERE release_id = ?",
+                    (
+                        release.created_at.isoformat().replace("+00:00", "Z"),
+                        release.release_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE memory_releases SET storage_hash = ? WHERE release_id = ?",
+                    ("0" * 64, release.release_id),
+                )
+        finally:
+            connection.close()
+
+        corrupted_rows = _release_graph_rows(database_path)
+        assert corrupted_rows[1] == (), case
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            SQLiteMemoryStore(database_path).get_release(scope, "rel_missing")
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == "stored release row failed integrity validation", (
+            case
+        )
+        assert type(raised.value.__cause__) is ValueError, case
+        assert str(raised.value.__cause__) == expected_cause, case
+        assert _release_graph_rows(database_path) == corrupted_rows, case
+
+
+def test_sqlite_release_snapshot_rejects_malformed_duplicate_and_orphan_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-malformed.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "release-malformed")
+    first_root, _first_candidate, _first_evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="release-malformed-first",
+    )
+    parent, _parent_candidate, _parent_evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=1,
+        key="release-malformed-parent",
+    )
+    left_candidate, _left_evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=2,
+        key="release-malformed-left",
+    )
+    right_candidate, _right_evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=3,
+        key="release-malformed-right",
+    )
+    left = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=left_candidate.candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id=parent.revision_id,
+            idempotency_key="release-malformed-left",
+        )
+    )
+    right = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=right_candidate.candidate_id,
+            operation=RevisionOperation.CONTRADICT,
+            parent_revision_id=parent.revision_id,
+            idempotency_key="release-malformed-right",
+        )
+    )
+    assert left.memory_id == right.memory_id
+    manifest = ReleaseManifest(scope, (first_root.revision_id, left.revision_id))
+    release = store.append_release(
+        manifest,
+        idempotency_key="release-malformed-owner",
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+        member_rows = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT scope_id, release_id, position, revision_id, memory_id "
+                "FROM memory_release_revisions"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+    assert len(member_rows) == 2
+    member_by_revision = {row[3]: row for row in member_rows}
+    assert set(member_by_revision) == {first_root.revision_id, left.revision_id}
+    baseline_rows = _release_graph_rows(database_path)
+    assert baseline_rows[1] == ()
+    address_sql = _normalize_sql("SELECT scope_id, release_id FROM memory_releases")
+    member_sql = _normalize_sql(
+        "SELECT scope_id, release_id, position, revision_id, memory_id "
+        "FROM memory_release_revisions"
+    )
+
+    def run_case(
+        case: str,
+        sql: str,
+        transform: Callable[
+            [tuple[tuple[object, ...], ...], object],
+            tuple[tuple[object, ...], ...],
+        ],
+        message: str,
+    ) -> None:
+        plan = _SQLiteReadOverridePlan(fetchall_transforms={sql: transform})
+        with monkeypatch.context() as guarded:
+            _install_sqlite_read_override_proxy(guarded, plan)
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                store.list_releases(scope)
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == message, case
+        assert raised.value.__cause__ is None, case
+        assert sum(query == sql for query, _parameters in plan.executions) == 1, case
+        assert _release_graph_rows(database_path) == baseline_rows, case
+
+    address_cases = (
+        (
+            "address-arity",
+            lambda _rows, _parameters: ((scope_id,),),
+            "release address row does not contain exactly two values",
+        ),
+        (
+            "address-bool-scope",
+            lambda _rows, _parameters: ((True, release.release_id),),
+            "release address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "address-zero-scope",
+            lambda _rows, _parameters: ((0, release.release_id),),
+            "release address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "address-overflow-scope",
+            lambda _rows, _parameters: ((2**63, release.release_id),),
+            "release address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "address-missing-scope",
+            lambda _rows, _parameters: ((2**63 - 1, release.release_id),),
+            "release address refers to a missing scope",
+        ),
+        (
+            "address-nontext-release",
+            lambda _rows, _parameters: ((scope_id, b"release-id"),),
+            "release address contains a non-text identifier",
+        ),
+        (
+            "address-duplicate",
+            lambda rows, _parameters: (*rows, rows[0]),
+            "release address appears multiple times",
+        ),
+    )
+    for case, transform, message in address_cases:
+        run_case(case, address_sql, transform, message)
+
+    first_member = member_by_revision[first_root.revision_id]
+    right_member = (
+        scope_id,
+        release.release_id,
+        2,
+        right.revision_id,
+        right.memory_id,
+    )
+    member_cases = (
+        (
+            "member-arity",
+            lambda _rows, _parameters: (tuple(first_member[:-1]),),
+            "release member row does not contain exactly five values",
+        ),
+        (
+            "member-nontext-id",
+            lambda _rows, _parameters: (
+                (scope_id, release.release_id, 0, b"revision-id", "memory-id"),
+            ),
+            "release member identifiers must be text",
+        ),
+        (
+            "member-bool-scope",
+            lambda _rows, _parameters: ((True, *first_member[1:]),),
+            "release member contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "member-zero-scope",
+            lambda _rows, _parameters: ((0, *first_member[1:]),),
+            "release member contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "member-overflow-scope",
+            lambda _rows, _parameters: ((2**63, *first_member[1:]),),
+            "release member contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "member-bool-position",
+            lambda _rows, _parameters: ((*first_member[:2], True, *first_member[3:]),),
+            "release member position is not a non-negative signed 64-bit integer",
+        ),
+        (
+            "member-overflow-position",
+            lambda _rows, _parameters: ((*first_member[:2], 2**63, *first_member[3:]),),
+            "release member position is not a non-negative signed 64-bit integer",
+        ),
+        (
+            "member-negative-position",
+            lambda _rows, _parameters: ((*first_member[:2], -1, *first_member[3:]),),
+            "release member position is not a non-negative signed 64-bit integer",
+        ),
+        (
+            "member-duplicate-position",
+            lambda rows, _parameters: (
+                *rows,
+                (*right_member[:2], 0, *right_member[3:]),
+            ),
+            "release member position appears multiple times",
+        ),
+        (
+            "member-duplicate-revision",
+            lambda rows, _parameters: (
+                *rows,
+                (*first_member[:2], 2, *first_member[3:]),
+            ),
+            "release contains the same revision multiple times",
+        ),
+        (
+            "member-duplicate-memory",
+            lambda rows, _parameters: (*rows, right_member),
+            "release contains the same memory multiple times",
+        ),
+        (
+            "member-missing-owner",
+            lambda rows, _parameters: (
+                *rows,
+                (
+                    scope_id,
+                    "rel_missing_owner",
+                    0,
+                    first_root.revision_id,
+                    first_root.memory_id,
+                ),
+            ),
+            "release member refers to a missing release",
+        ),
+        (
+            "member-missing-revision",
+            lambda rows, _parameters: (
+                *rows,
+                (
+                    scope_id,
+                    release.release_id,
+                    2,
+                    "rev_missing_member",
+                    "mem_missing_member",
+                ),
+            ),
+            "release member refers to a missing same-scope revision",
+        ),
+    )
+    for case, transform, message in member_cases:
+        run_case(case, member_sql, transform, message)
+
+    def run_real_case(
+        case: str,
+        mutate: Callable[[sqlite3.Connection], None],
+        message: str,
+    ) -> None:
+        case_path = tmp_path / f"release-malformed-{case}.sqlite3"
+        shutil.copyfile(database_path, case_path)
+        connection = sqlite3.connect(case_path, isolation_level=None)
+        try:
+            mutate(connection)
+        finally:
+            connection.close()
+        corrupted_rows = _release_graph_rows(case_path)
+        assert corrupted_rows != baseline_rows, case
+        assert corrupted_rows[1] == (), case
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            SQLiteMemoryStore(case_path).list_releases(scope)
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == message, case
+        assert raised.value.__cause__ is None, case
+        assert _release_graph_rows(case_path) == corrupted_rows, case
+
+    run_real_case(
+        "member-gap",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_revisions SET position = 3 "
+            "WHERE scope_id = ? AND release_id = ? AND position = 0",
+            (scope_id, release.release_id),
+        ),
+        "release member positions are not contiguous from zero",
+    )
+    run_real_case(
+        "release-without-alias",
+        lambda connection: connection.execute(
+            "DELETE FROM memory_release_aliases WHERE scope_id = ? AND release_id = ?",
+            (scope_id, release.release_id),
+        ),
+        "release exists without an idempotency alias",
+    )
+
+
+def test_sqlite_release_snapshot_rejects_member_relation_and_alias_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-relation-alias-drift.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "release-relation-drift")
+    roots = tuple(
+        _append_sqlite_release_root(
+            store,
+            scope,
+            index=index,
+            key=f"release-relation-{index}",
+        )[0]
+        for index in range(3)
+    )
+    owner_key = "release-relation-owner"
+    other_key = "release-relation-other"
+    owner_manifest = ReleaseManifest(
+        scope,
+        (roots[0].revision_id, roots[1].revision_id),
+    )
+    owner = store.append_release(owner_manifest, idempotency_key=owner_key)
+    other = store.append_release(
+        ReleaseManifest(scope, (roots[2].revision_id,)),
+        idempotency_key=other_key,
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+        member_rows = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT scope_id, release_id, position, revision_id, memory_id "
+                "FROM memory_release_revisions"
+            ).fetchall()
+        )
+        alias_rows = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT scope_id, idempotency_key, release_id, binding_hash "
+                "FROM memory_release_aliases"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+    owner_members = tuple(row for row in member_rows if row[1] == owner.release_id)
+    assert len(owner_members) == 2
+    owner_alias = next(row for row in alias_rows if row[1] == owner_key)
+    baseline_rows = _release_graph_rows(database_path)
+    assert baseline_rows[1] == ()
+    member_sql = _normalize_sql(
+        "SELECT scope_id, release_id, position, revision_id, memory_id "
+        "FROM memory_release_revisions"
+    )
+    alias_sql = _normalize_sql(
+        "SELECT scope_id, idempotency_key, release_id, binding_hash "
+        "FROM memory_release_aliases"
+    )
+
+    def run_proxy_case(
+        case: str,
+        sql: str,
+        transform: Callable[
+            [tuple[tuple[object, ...], ...], object],
+            tuple[tuple[object, ...], ...],
+        ],
+        message: str,
+    ) -> None:
+        plan = _SQLiteReadOverridePlan(fetchall_transforms={sql: transform})
+        with monkeypatch.context() as guarded:
+            _install_sqlite_read_override_proxy(guarded, plan)
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                store.get_release(scope, owner.release_id)
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == message, case
+        assert raised.value.__cause__ is None, case
+        assert sum(query == sql for query, _parameters in plan.executions) == 1, case
+        assert _release_graph_rows(database_path) == baseline_rows, case
+
+    def run_real_case(
+        case: str,
+        mutate: Callable[[sqlite3.Connection], None],
+        message: str,
+        cause: str | None = None,
+    ) -> None:
+        case_path = tmp_path / f"release-relation-alias-{case}.sqlite3"
+        shutil.copyfile(database_path, case_path)
+        connection = sqlite3.connect(case_path, isolation_level=None)
+        try:
+            mutate(connection)
+        finally:
+            connection.close()
+        corrupted_rows = _release_graph_rows(case_path)
+        assert corrupted_rows != baseline_rows, case
+        assert corrupted_rows[1] == (), case
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            SQLiteMemoryStore(case_path).get_release(scope, owner.release_id)
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == message, case
+        if cause is None:
+            assert raised.value.__cause__ is None, case
+        else:
+            assert type(raised.value.__cause__) is ValueError, case
+            assert str(raised.value.__cause__) == cause, case
+        assert _release_graph_rows(case_path) == corrupted_rows, case
+
+    run_real_case(
+        "member-deletion",
+        lambda connection: connection.execute(
+            "DELETE FROM memory_release_revisions "
+            "WHERE scope_id = ? AND release_id = ? AND position = 1",
+            (scope_id, owner.release_id),
+        ),
+        "stored release row failed integrity validation",
+        "canonical release bytes disagree with projections",
+    )
+    spare = roots[2]
+    run_real_case(
+        "member-substitution",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_revisions "
+            "SET revision_id = ?, memory_id = ? "
+            "WHERE scope_id = ? AND release_id = ? AND position = 1",
+            (spare.revision_id, spare.memory_id, scope_id, owner.release_id),
+        ),
+        "stored release row failed integrity validation",
+        "canonical release bytes disagree with projections",
+    )
+
+    def reorder_members(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "UPDATE memory_release_revisions SET position = position + 100 "
+            "WHERE scope_id = ? AND release_id = ?",
+            (scope_id, owner.release_id),
+        )
+        connection.execute(
+            "UPDATE memory_release_revisions "
+            "SET position = CASE position WHEN 100 THEN 1 WHEN 101 THEN 0 END "
+            "WHERE scope_id = ? AND release_id = ?",
+            (scope_id, owner.release_id),
+        )
+
+    run_real_case(
+        "member-reorder",
+        reorder_members,
+        "stored release row failed integrity validation",
+        "canonical release bytes disagree with projections",
+    )
+    memory_mismatch = (
+        *owner_members[0][:4],
+        roots[1].memory_id,
+    )
+    run_proxy_case(
+        "member-memory-mismatch",
+        member_sql,
+        lambda rows, _parameters: tuple(
+            memory_mismatch if row == owner_members[0] else row for row in rows
+        ),
+        "release member memory ID differs from its revision",
+    )
+
+    def replace_owner_alias(
+        rows: tuple[tuple[object, ...], ...],
+        replacement: tuple[object, ...],
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(replacement if row[1] == owner_key else row for row in rows)
+
+    alias_cases = (
+        (
+            "alias-arity",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                tuple(owner_alias[:-1]),
+            ),
+            "release alias row does not contain exactly four values",
+        ),
+        (
+            "alias-bool-scope",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (True, *owner_alias[1:]),
+            ),
+            "release alias contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "alias-zero-scope",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (0, *owner_alias[1:]),
+            ),
+            "release alias contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "alias-overflow-scope",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (2**63, *owner_alias[1:]),
+            ),
+            "release alias contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "alias-nontext-key",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (scope_id, b"owner-key", *owner_alias[2:]),
+            ),
+            "release alias values must be text",
+        ),
+        (
+            "alias-nontext-release",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (*owner_alias[:2], b"release-id", owner_alias[3]),
+            ),
+            "release alias values must be text",
+        ),
+        (
+            "alias-nontext-binding",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (*owner_alias[:3], b"binding"),
+            ),
+            "release alias values must be text",
+        ),
+        (
+            "alias-duplicate-key",
+            lambda rows, _parameters: (*rows, owner_alias),
+            "release idempotency key appears multiple times in one scope",
+        ),
+        (
+            "alias-missing-scope",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (2**63 - 1, *owner_alias[1:]),
+            ),
+            "release alias refers to a missing scope",
+        ),
+        (
+            "alias-missing-target",
+            lambda rows, _parameters: replace_owner_alias(
+                rows,
+                (*owner_alias[:2], "rel_missing_target", owner_alias[3]),
+            ),
+            "release alias refers to a missing same-scope release",
+        ),
+    )
+    for case, transform, message in alias_cases:
+        run_proxy_case(case, alias_sql, transform, message)
+
+    run_real_case(
+        "alias-blank-key",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_aliases SET idempotency_key = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            (" \t", scope_id, owner_key),
+        ),
+        "stored release alias failed integrity validation",
+        "idempotency_key must not be blank",
+    )
+    run_real_case(
+        "alias-changed-key",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_aliases SET idempotency_key = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            ("release-relation-moved", scope_id, owner_key),
+        ),
+        "release alias binding hash disagrees with stored metadata",
+    )
+    run_real_case(
+        "alias-target-without-binding",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_aliases SET release_id = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            (other.release_id, scope_id, owner_key),
+        ),
+        "release alias binding hash disagrees with stored metadata",
+    )
+    run_real_case(
+        "alias-binding-drift",
+        lambda connection: connection.execute(
+            "UPDATE memory_release_aliases SET binding_hash = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            ("0" * 64, scope_id, owner_key),
+        ),
+        "release alias binding hash disagrees with stored metadata",
+    )
+
+
+def test_sqlite_release_snapshot_validates_unrelated_graph_first(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "release-unrelated-base.sqlite3"
+    store = SQLiteMemoryStore(base_path)
+    target_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-unrelated-target",
+    )
+    target_revision, _target_candidate, _target_evidence = _append_sqlite_release_root(
+        store,
+        target_scope,
+        index=0,
+        key="release-unrelated-target",
+    )
+    target_manifest = ReleaseManifest(
+        target_scope,
+        (target_revision.revision_id,),
+    )
+    target_key = "release-unrelated-target"
+    target_release = store.append_release(
+        target_manifest,
+        idempotency_key=target_key,
+    )
+    lower_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-unrelated-lower",
+    )
+    lower_revision, _lower_candidate, _lower_evidence = _append_sqlite_release_root(
+        store,
+        lower_scope,
+        index=0,
+        key="release-unrelated-lower",
+    )
+    graph_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-unrelated-graph",
+    )
+    graph_revision, _graph_candidate, _graph_evidence = _append_sqlite_release_root(
+        store,
+        graph_scope,
+        index=0,
+        key="release-unrelated-graph",
+    )
+    graph_key = "release-unrelated-graph"
+    graph_release = store.append_release(
+        ReleaseManifest(graph_scope, (graph_revision.revision_id,)),
+        idempotency_key=graph_key,
+    )
+    assert _release_graph_rows(base_path)[1] == ()
+    corruption_expectations: dict[str, tuple[str, str | None]] = {
+        "lower": (
+            "stored revision row failed integrity validation",
+            "revision ID disagrees with its content hash",
+        ),
+        "release": (
+            "stored release row failed integrity validation",
+            "release storage hash disagrees with stored metadata",
+        ),
+        "member": (
+            "stored release row failed integrity validation",
+            "canonical release bytes disagree with projections",
+        ),
+        "alias": (
+            "release alias binding hash disagrees with stored metadata",
+            None,
+        ),
+    }
+
+    for corruption_kind in ("lower", "release", "member", "alias"):
+        for operation in (
+            "missing-get",
+            "list",
+            "member-get",
+            "exact-retry",
+            "alias-only-append",
+        ):
+            database_path = tmp_path / (
+                f"release-unrelated-{corruption_kind}-{operation}.sqlite3"
+            )
+            shutil.copyfile(base_path, database_path)
+            connection = sqlite3.connect(database_path, isolation_level=None)
+            try:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                if corruption_kind == "lower":
+                    moved_id = f"rev_{'0' * 24}"
+                    assert moved_id != lower_revision.revision_id
+                    connection.execute(
+                        "UPDATE memory_revisions SET revision_id = ? "
+                        "WHERE revision_id = ?",
+                        (moved_id, lower_revision.revision_id),
+                    )
+                elif corruption_kind == "release":
+                    connection.execute(
+                        "UPDATE memory_releases SET storage_hash = ? "
+                        "WHERE release_id = ?",
+                        ("0" * 64, graph_release.release_id),
+                    )
+                elif corruption_kind == "member":
+                    connection.execute(
+                        "DELETE FROM memory_release_revisions WHERE release_id = ?",
+                        (graph_release.release_id,),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE memory_release_aliases SET binding_hash = ? "
+                        "WHERE idempotency_key = ?",
+                        ("0" * 64, graph_key),
+                    )
+            finally:
+                connection.close()
+
+            corrupted_rows = _release_graph_rows(database_path)
+            assert corrupted_rows[1] == (), (corruption_kind, operation)
+            corrupted_store = SQLiteMemoryStore(database_path)
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                if operation == "missing-get":
+                    corrupted_store.get_release(target_scope, "rel_missing")
+                elif operation == "list":
+                    corrupted_store.list_releases(target_scope)
+                elif operation == "member-get":
+                    corrupted_store.get_release_revisions(
+                        target_scope,
+                        target_release.release_id,
+                    )
+                elif operation == "exact-retry":
+                    corrupted_store.append_release(
+                        target_manifest,
+                        idempotency_key=target_key,
+                    )
+                else:
+                    corrupted_store.append_release(
+                        target_manifest,
+                        idempotency_key="release-unrelated-new-alias",
+                    )
+
+            expected_outer, expected_cause = corruption_expectations[corruption_kind]
+            assert type(raised.value) is MemoryPersistenceCorruptionError
+            assert str(raised.value) == expected_outer, (corruption_kind, operation)
+            if expected_cause is None:
+                assert raised.value.__cause__ is None, (corruption_kind, operation)
+            else:
+                assert type(raised.value.__cause__) is ValueError
+                assert str(raised.value.__cause__) == expected_cause
+            assert _release_graph_rows(database_path) == corrupted_rows
+
+
+def test_sqlite_release_snapshot_loads_each_scalar_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-scalar-once.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    first_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-scalar-once-first",
+    )
+    second_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-scalar-once-second",
+    )
+    first_roots = tuple(
+        _append_sqlite_release_root(
+            store,
+            first_scope,
+            index=index,
+            key=f"release-scalar-once-first-{index}",
+        )[0]
+        for index in range(3)
+    )
+    second_root, _second_candidate, _second_evidence = _append_sqlite_release_root(
+        store,
+        second_scope,
+        index=0,
+        key="release-scalar-once-second",
+    )
+    first_manifest = ReleaseManifest(
+        first_scope,
+        (first_roots[0].revision_id, first_roots[1].revision_id),
+    )
+    first = store.append_release(
+        first_manifest,
+        idempotency_key="release-scalar-once-first",
+    )
+    assert (
+        store.append_release(
+            first_manifest,
+            idempotency_key="release-scalar-once-first-alias",
+        )
+        == first
+    )
+    second = store.append_release(
+        ReleaseManifest(first_scope, (first_roots[2].revision_id,)),
+        idempotency_key="release-scalar-once-second-release",
+    )
+    foreign = store.append_release(
+        ReleaseManifest(second_scope, (second_root.revision_id,)),
+        idempotency_key="release-scalar-once-foreign",
+    )
+    expected = tuple(sorted((first, second), key=lambda item: item.release_id))
+    release_select_sql = _normalize_sql(sqlite_store_module._RELEASE_SELECT)
+    address_sql = _normalize_sql("SELECT scope_id, release_id FROM memory_releases")
+    member_sql = _normalize_sql(
+        "SELECT scope_id, release_id, position, revision_id, memory_id "
+        "FROM memory_release_revisions"
+    )
+    alias_sql = _normalize_sql(
+        "SELECT scope_id, idempotency_key, release_id, binding_hash "
+        "FROM memory_release_aliases"
+    )
+    plan = _SQLiteReadOverridePlan()
+    _install_sqlite_read_override_proxy(monkeypatch, plan)
+
+    assert store.list_releases(first_scope) == expected
+    assert sum(sql == address_sql for sql, _parameters in plan.executions) == 1
+    assert sum(sql == member_sql for sql, _parameters in plan.executions) == 1
+    assert sum(sql == alias_sql for sql, _parameters in plan.executions) == 1
+    scalar_parameters = tuple(
+        parameters for sql, parameters in plan.executions if sql == release_select_sql
+    )
+    assert len(scalar_parameters) == 3
+    assert len(set(scalar_parameters)) == 3
+    assert all(type(parameters) is tuple for parameters in scalar_parameters)
+    assert {parameters[1] for parameters in scalar_parameters} == {
+        first.release_id,
+        second.release_id,
+        foreign.release_id,
+    }
