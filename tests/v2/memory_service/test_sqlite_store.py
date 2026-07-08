@@ -4865,3 +4865,226 @@ def test_sqlite_candidate_snapshot_rejects_duplicate_addresses_edges_and_idempot
         assert injection.hits == expected_hits[case], case
         assert _memory_graph_state(database_path) == baseline_state, case
         assert store.list_candidates(scope) == (candidate,), case
+
+
+def test_sqlite_candidate_edge_failure_rolls_back_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "candidate-edge-failure.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-edge-failure")
+    evidence = tuple(
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                sequence_no=index,
+                payload=f"candidate edge failure evidence {index}",
+                idempotency_key=f"candidate-edge-failure-evidence-{index}",
+            )
+        )
+        for index in range(3)
+    )
+    proposal = _make_sqlite_candidate(
+        scope=scope,
+        content="candidate whose second edge write fails",
+        evidence_ids=(
+            evidence[2].evidence_id,
+            evidence[0].evidence_id,
+            evidence[1].evidence_id,
+        ),
+        idempotency_key="candidate-edge-failure-request",
+    )
+    baseline_state = _memory_graph_state(database_path)
+    assert baseline_state == ((1, 3, 0, 0), [])
+    injected = sqlite3.OperationalError("injected second candidate edge failure")
+    injected.sqlite_errorcode = sqlite3.SQLITE_IOERR
+    plan = _SQLiteFailurePlan(
+        after_statement="INSERT INTO memory_candidate_evidence",
+        after_occurrence=2,
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        store.append_candidate(proposal)
+
+    assert type(raised.value) is MemoryPersistenceError
+    assert raised.value.__cause__ is injected
+    edge_insert_events = [
+        index
+        for index, event in enumerate(plan.events)
+        if event.startswith("executed:INSERT INTO MEMORY_CANDIDATE_EVIDENCE")
+    ]
+    assert len(edge_insert_events) == 2
+    failure_index = next(
+        index
+        for index, event in enumerate(plan.events)
+        if event.startswith("fail-after:INSERT INTO MEMORY_CANDIDATE_EVIDENCE")
+    )
+    rollback_index = plan.events.index("executed:ROLLBACK")
+    close_index = plan.events.index("executed:CLOSE")
+    assert edge_insert_events[-1] < failure_index < rollback_index < close_index
+    assert "attempt:COMMIT" not in plan.events
+    assert "executed:COMMIT" not in plan.events
+    assert _memory_graph_state(database_path) == baseline_state
+
+    monkeypatch.undo()
+    recovered = store.append_candidate(proposal)
+
+    assert recovered.proposal == proposal
+    assert store.get_candidate_evidence(scope, recovered.candidate_id) == (
+        evidence[2],
+        evidence[0],
+        evidence[1],
+    )
+    assert _memory_graph_state(database_path) == ((1, 3, 1, 3), [])
+
+
+def test_sqlite_candidate_post_insert_graph_readback_prevents_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "candidate-post-insert-readback.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-readback")
+    evidence = tuple(
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                sequence_no=index,
+                payload=f"candidate readback evidence {index}",
+                idempotency_key=f"candidate-readback-evidence-{index}",
+            )
+        )
+        for index in range(4)
+    )
+    proposal = _make_sqlite_candidate(
+        scope=scope,
+        content="candidate whose final edge is tampered before readback",
+        evidence_ids=(
+            evidence[2].evidence_id,
+            evidence[0].evidence_id,
+            evidence[1].evidence_id,
+        ),
+        idempotency_key="candidate-readback-request",
+    )
+    expected_candidate_id = (
+        f"cand_{hashlib.sha256(proposal.canonical_bytes()).hexdigest()[:24]}"
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    baseline_state = _memory_graph_state(database_path)
+    assert baseline_state == ((1, 4, 0, 0), [])
+    edge_scan_sql = _normalize_sql(
+        "SELECT scope_id, candidate_id, position, evidence_id "
+        "FROM memory_candidate_evidence"
+    )
+    candidate_scalar_sql = _normalize_sql(sqlite_store_module._CANDIDATE_SELECT)
+    probe_hits = {"tamper": 0, "edge-scan": 0, "candidate-scalar": 0}
+    executed_sql: list[str] = []
+    real_connect = sqlite_backend._connect
+
+    class TamperFinalCandidateEdgeCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> TamperFinalCandidateEdgeCursor:
+            normalized = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            executed_sql.append(normalized)
+            if normalized.startswith("INSERT INTO MEMORY_CANDIDATE_EVIDENCE"):
+                assert isinstance(parameters, tuple)
+                assert len(parameters) == 4
+                inserted_scope_id, candidate_id, position, evidence_id = parameters
+                if position == len(proposal.evidence_ids) - 1:
+                    assert inserted_scope_id == scope_id
+                    assert candidate_id == expected_candidate_id
+                    assert evidence_id == proposal.evidence_ids[-1]
+                    self._real_cursor.execute(
+                        "UPDATE memory_candidate_evidence SET evidence_id = ? "
+                        "WHERE scope_id = ? AND candidate_id = ? AND position = ?",
+                        (
+                            evidence[3].evidence_id,
+                            inserted_scope_id,
+                            candidate_id,
+                            position,
+                        ),
+                    )
+                    assert self._real_cursor.rowcount == 1
+                    probe_hits["tamper"] += 1
+            elif probe_hits["tamper"]:
+                if normalized == edge_scan_sql:
+                    probe_hits["edge-scan"] += 1
+                elif normalized == candidate_scalar_sql and parameters == (
+                    scope_id,
+                    expected_candidate_id,
+                ):
+                    probe_hits["candidate-scalar"] += 1
+            return self
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class TamperFinalCandidateEdgeConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> TamperFinalCandidateEdgeCursor:
+            return TamperFinalCandidateEdgeCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> TamperFinalCandidateEdgeConnection:
+        return TamperFinalCandidateEdgeConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.append_candidate(proposal)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert str(raised.value) == "stored candidate row failed integrity validation"
+    assert type(raised.value.__cause__) is ValueError
+    assert str(raised.value.__cause__) == (
+        "canonical candidate bytes disagree with projections"
+    )
+    assert probe_hits == {"tamper": 1, "edge-scan": 1, "candidate-scalar": 1}
+    assert "ROLLBACK" in executed_sql
+    assert "COMMIT" not in executed_sql
+    assert _memory_graph_state(database_path) == baseline_state
+
+    monkeypatch.undo()
+    recovered = store.append_candidate(proposal)
+
+    assert recovered.candidate_id == expected_candidate_id
+    assert store.get_candidate_evidence(scope, recovered.candidate_id) == (
+        evidence[2],
+        evidence[0],
+        evidence[1],
+    )
+    assert evidence[3] not in store.get_candidate_evidence(
+        scope,
+        recovered.candidate_id,
+    )
+    assert _memory_graph_state(database_path) == ((1, 4, 1, 3), [])
