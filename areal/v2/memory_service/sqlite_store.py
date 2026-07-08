@@ -13,6 +13,7 @@ from areal.v2.memory_service._sqlite_backend import (
     _initialize_database,
     _read_transaction,
     _record_storage_hash,
+    _release_binding_hash,
     _snapshot_database_path,
     _write_transaction,
 )
@@ -22,6 +23,7 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryPersistenceCorruptionError,
+    ReleaseNotFoundError,
     RevisionConflictError,
     RevisionNotFoundError,
 )
@@ -32,6 +34,7 @@ from areal.v2.memory_service.history_types import (
     RevisionOperation,
     RevisionProposal,
 )
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -87,6 +90,13 @@ _REVISION_ROW_TYPES = (
     (str, type(None)),
     (str,),
 )
+
+_RELEASE_SELECT = """SELECT release_id, canonical, content_hash,
+       created_at, storage_hash
+FROM memory_releases
+WHERE scope_id = ? AND release_id = ?"""
+
+_RELEASE_ROW_TYPES = (str, bytes, str, str, str)
 
 _MAX_SCOPE_ID = 2**63 - 1
 _MAX_GENERATION = 2**63 - 1
@@ -844,6 +854,304 @@ def _load_revision_snapshot(
     )
 
 
+def _load_release_addresses(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+) -> tuple[tuple[int, str], ...]:
+    rows = cursor.execute("SELECT scope_id, release_id FROM memory_releases").fetchall()
+    addresses: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if len(row) != 2:
+            raise MemoryPersistenceCorruptionError(
+                "release address row does not contain exactly two values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "release address contains an invalid positive signed 64-bit scope ID",
+        )
+        release_id = row[1]
+        if type(release_id) is not str:
+            raise MemoryPersistenceCorruptionError(
+                "release address contains a non-text identifier"
+            )
+        if scope_id not in scope_by_id:
+            raise MemoryPersistenceCorruptionError(
+                "release address refers to a missing scope"
+            )
+        address = (scope_id, release_id)
+        if address in seen:
+            raise MemoryPersistenceCorruptionError(
+                "release address appears multiple times"
+            )
+        seen.add(address)
+        addresses.append(address)
+    return tuple(addresses)
+
+
+def _load_release_members(
+    cursor: sqlite3.Cursor,
+    release_addresses: tuple[tuple[int, str], ...],
+    revision_by_address: dict[tuple[int, str], MemoryRevision],
+) -> dict[tuple[int, str], tuple[MemoryRevision, ...]]:
+    release_address_set = set(release_addresses)
+    rows = cursor.execute(
+        "SELECT scope_id, release_id, position, revision_id, memory_id "
+        "FROM memory_release_revisions"
+    ).fetchall()
+    edges_by_release: dict[tuple[int, str], list[tuple[int, MemoryRevision]]] = {
+        address: [] for address in release_addresses
+    }
+    seen_positions: set[tuple[int, str, int]] = set()
+    seen_revisions: set[tuple[int, str, str]] = set()
+    seen_memories: set[tuple[int, str, str]] = set()
+    for row in rows:
+        if len(row) != 5:
+            raise MemoryPersistenceCorruptionError(
+                "release member row does not contain exactly five values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "release member contains an invalid positive signed 64-bit scope ID",
+        )
+        release_id, position, revision_id, memory_id = row[1:]
+        if not all(
+            type(value) is str for value in (release_id, revision_id, memory_id)
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "release member identifiers must be text"
+            )
+        if type(position) is not int or not 0 <= position <= _MAX_SCOPE_ID:
+            raise MemoryPersistenceCorruptionError(
+                "release member position is not a non-negative signed 64-bit integer"
+            )
+        release_address = (scope_id, release_id)
+        if release_address not in release_address_set:
+            raise MemoryPersistenceCorruptionError(
+                "release member refers to a missing release"
+            )
+        revision = revision_by_address.get((scope_id, revision_id))
+        if revision is None:
+            raise MemoryPersistenceCorruptionError(
+                "release member refers to a missing same-scope revision"
+            )
+        if revision.memory_id != memory_id:
+            raise MemoryPersistenceCorruptionError(
+                "release member memory ID differs from its revision"
+            )
+        position_address = (scope_id, release_id, position)
+        revision_address = (scope_id, release_id, revision_id)
+        memory_address = (scope_id, release_id, memory_id)
+        if position_address in seen_positions:
+            raise MemoryPersistenceCorruptionError(
+                "release member position appears multiple times"
+            )
+        if revision_address in seen_revisions:
+            raise MemoryPersistenceCorruptionError(
+                "release contains the same revision multiple times"
+            )
+        if memory_address in seen_memories:
+            raise MemoryPersistenceCorruptionError(
+                "release contains the same memory multiple times"
+            )
+        seen_positions.add(position_address)
+        seen_revisions.add(revision_address)
+        seen_memories.add(memory_address)
+        edges_by_release[release_address].append((position, revision))
+    revisions_by_release: dict[tuple[int, str], tuple[MemoryRevision, ...]] = {}
+    for address, edges in edges_by_release.items():
+        ordered = sorted(edges, key=lambda item: item[0])
+        positions = tuple(position for position, _revision in ordered)
+        if positions != tuple(range(len(ordered))):
+            raise MemoryPersistenceCorruptionError(
+                "release member positions are not contiguous from zero"
+            )
+        revisions_by_release[address] = tuple(
+            revision for _position, revision in ordered
+        )
+    return revisions_by_release
+
+
+def _load_release(
+    cursor: sqlite3.Cursor,
+    scope: MemoryScope,
+    scope_id: int,
+    release_id: str,
+    revisions: tuple[MemoryRevision, ...],
+) -> MemoryRelease | None:
+    _require_scope_id(
+        scope_id,
+        "release lookup received an invalid positive signed 64-bit scope ID",
+    )
+    row = cursor.execute(_RELEASE_SELECT, (scope_id, release_id)).fetchone()
+    if row is None:
+        return None
+    try:
+        if len(row) != len(_RELEASE_ROW_TYPES):
+            raise ValueError("release row has the wrong field count")
+        for index, (value, expected_type) in enumerate(
+            zip(row, _RELEASE_ROW_TYPES, strict=True)
+        ):
+            if type(value) is not expected_type:
+                raise TypeError(
+                    f"release row field {index} has the wrong storage class"
+                )
+        (
+            stored_release_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+        ) = row
+        if stored_release_id != release_id:
+            raise ValueError("loaded release ID differs from requested ID")
+        manifest = ReleaseManifest(
+            scope=scope,
+            revision_ids=tuple(revision.revision_id for revision in revisions),
+        )
+        release = MemoryRelease(
+            release_id=stored_release_id,
+            manifest=manifest,
+            content_hash=content_hash,
+            created_at=datetime.fromisoformat(created_at_text),
+        )
+        if release.created_at.isoformat() != created_at_text:
+            raise ValueError("release created_at is not exact UTC isoformat text")
+        if manifest.canonical_bytes() != canonical:
+            raise ValueError("canonical release bytes disagree with projections")
+        calculated_hash = sha256(canonical).hexdigest()
+        if content_hash != calculated_hash:
+            raise ValueError("release content hash disagrees with canonical bytes")
+        calculated_id = f"rel_{calculated_hash[:24]}"
+        if stored_release_id != calculated_id:
+            raise ValueError("release ID disagrees with its content hash")
+        calculated_storage_hash = _record_storage_hash(
+            record_kind="release",
+            scope=scope,
+            record_id=stored_release_id,
+            content_hash=content_hash,
+            created_at_text=created_at_text,
+        )
+        if storage_hash != calculated_storage_hash:
+            raise ValueError("release storage hash disagrees with stored metadata")
+        return release
+    except MemoryPersistenceCorruptionError:
+        raise
+    except (TypeError, ValueError, OverflowError) as error:
+        raise MemoryPersistenceCorruptionError(
+            "stored release row failed integrity validation"
+        ) from error
+
+
+def _load_release_aliases(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+    release_by_address: dict[tuple[int, str], MemoryRelease],
+) -> dict[tuple[int, str], MemoryRelease]:
+    rows = cursor.execute(
+        "SELECT scope_id, idempotency_key, release_id, binding_hash "
+        "FROM memory_release_aliases"
+    ).fetchall()
+    release_by_alias: dict[tuple[int, str], MemoryRelease] = {}
+    for row in rows:
+        if len(row) != 4:
+            raise MemoryPersistenceCorruptionError(
+                "release alias row does not contain exactly four values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "release alias contains an invalid positive signed 64-bit scope ID",
+        )
+        idempotency_key, release_id, binding_hash = row[1:]
+        if not all(
+            type(value) is str for value in (idempotency_key, release_id, binding_hash)
+        ):
+            raise MemoryPersistenceCorruptionError("release alias values must be text")
+        scope = scope_by_id.get(scope_id)
+        if scope is None:
+            raise MemoryPersistenceCorruptionError(
+                "release alias refers to a missing scope"
+            )
+        try:
+            idempotency_key = _validate_string(idempotency_key, "idempotency_key")
+        except (TypeError, ValueError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "stored release alias failed integrity validation"
+            ) from error
+        release = release_by_address.get((scope_id, release_id))
+        if release is None:
+            raise MemoryPersistenceCorruptionError(
+                "release alias refers to a missing same-scope release"
+            )
+        alias_address = (scope_id, idempotency_key)
+        if alias_address in release_by_alias:
+            raise MemoryPersistenceCorruptionError(
+                "release idempotency key appears multiple times in one scope"
+            )
+        expected_binding_hash = _release_binding_hash(
+            scope=scope,
+            idempotency_key=idempotency_key,
+            release_id=release_id,
+        )
+        if binding_hash != expected_binding_hash:
+            raise MemoryPersistenceCorruptionError(
+                "release alias binding hash disagrees with stored metadata"
+            )
+        release_by_alias[alias_address] = release
+    return release_by_alias
+
+
+def _load_release_snapshot(
+    cursor: sqlite3.Cursor,
+) -> tuple[
+    dict[int, MemoryScope],
+    dict[tuple[int, str], MemoryRevision],
+    dict[tuple[int, str], MemoryRelease],
+    dict[tuple[int, str], MemoryRelease],
+    dict[tuple[int, str], tuple[MemoryRevision, ...]],
+]:
+    (
+        scope_by_id,
+        _candidate_by_address,
+        revision_by_address,
+        _revision_by_idempotency,
+        _revision_by_candidate,
+    ) = _load_revision_snapshot(cursor)
+    release_addresses = _load_release_addresses(cursor, scope_by_id)
+    revisions_by_release = _load_release_members(
+        cursor,
+        release_addresses,
+        revision_by_address,
+    )
+    release_by_address: dict[tuple[int, str], MemoryRelease] = {}
+    for address in release_addresses:
+        scope_id, release_id = address
+        release = _load_release(
+            cursor,
+            scope_by_id[scope_id],
+            scope_id,
+            release_id,
+            revisions_by_release[address],
+        )
+        if release is None:
+            raise MemoryPersistenceCorruptionError(
+                "release address refers to a missing row"
+            )
+        release_by_address[address] = release
+    release_by_alias = _load_release_aliases(
+        cursor,
+        scope_by_id,
+        release_by_address,
+    )
+    return (
+        scope_by_id,
+        revision_by_address,
+        release_by_address,
+        release_by_alias,
+        revisions_by_release,
+    )
+
+
 class SQLiteMemoryStore:
     """Local SQLite backend for immutable evidence and memory history."""
 
@@ -1391,5 +1699,204 @@ class SQLiteMemoryStore:
                         revision.generation,
                         revision.revision_id,
                     ),
+                )
+            )
+
+    def append_release(
+        self, manifest: ReleaseManifest, *, idempotency_key: str
+    ) -> MemoryRelease:
+        """Persist one healthy immutable release manifest or exact retry."""
+
+        if type(manifest) is not ReleaseManifest:
+            raise TypeError("manifest must be a ReleaseManifest")
+        idempotency_key = _validate_string(idempotency_key, "idempotency_key")
+        canonical = manifest.canonical_bytes()
+        content_hash = sha256(canonical).hexdigest()
+        release_id = f"rel_{content_hash[:24]}"
+
+        with _write_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                revision_by_address,
+                release_by_address,
+                release_by_alias,
+                _revisions_by_release,
+            ) = _load_release_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, manifest.scope)
+            existing = (
+                None
+                if scope_id is None
+                else release_by_alias.get((scope_id, idempotency_key))
+            )
+            if existing is not None:
+                return existing
+
+            revisions: list[MemoryRevision] = []
+            for revision_id in manifest.revision_ids:
+                revision = (
+                    None
+                    if scope_id is None
+                    else revision_by_address.get((scope_id, revision_id))
+                )
+                if revision is None:
+                    raise RevisionNotFoundError(
+                        f"revision {revision_id!r} was not found"
+                    )
+                revisions.append(revision)
+            ordered_revisions = tuple(revisions)
+
+            existing = (
+                None
+                if scope_id is None
+                else release_by_address.get((scope_id, release_id))
+            )
+            if existing is None:
+                if scope_id is None:
+                    scope_id = _ensure_scope_id(cursor, manifest.scope)
+                created_at = datetime.now(UTC)
+                created_at_text = created_at.isoformat()
+                storage_hash = _record_storage_hash(
+                    record_kind="release",
+                    scope=manifest.scope,
+                    record_id=release_id,
+                    content_hash=content_hash,
+                    created_at_text=created_at_text,
+                )
+                expected = MemoryRelease(
+                    release_id=release_id,
+                    manifest=manifest,
+                    content_hash=content_hash,
+                    created_at=created_at,
+                )
+                cursor.execute(
+                    """INSERT INTO memory_releases (
+    scope_id, release_id, canonical, content_hash, created_at, storage_hash
+) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        scope_id,
+                        release_id,
+                        canonical,
+                        content_hash,
+                        created_at_text,
+                        storage_hash,
+                    ),
+                )
+                for position, revision in enumerate(ordered_revisions):
+                    cursor.execute(
+                        """INSERT INTO memory_release_revisions (
+    scope_id, release_id, position, revision_id, memory_id
+) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            scope_id,
+                            release_id,
+                            position,
+                            revision.revision_id,
+                            revision.memory_id,
+                        ),
+                    )
+
+            assert scope_id is not None
+            binding_hash = _release_binding_hash(
+                scope=manifest.scope,
+                idempotency_key=idempotency_key,
+                release_id=release_id,
+            )
+            cursor.execute(
+                """INSERT INTO memory_release_aliases (
+    scope_id, idempotency_key, release_id, binding_hash
+) VALUES (?, ?, ?, ?)""",
+                (scope_id, idempotency_key, release_id, binding_hash),
+            )
+            if existing is not None:
+                return existing
+            inserted = _load_release(
+                cursor,
+                manifest.scope,
+                scope_id,
+                release_id,
+                ordered_revisions,
+            )
+            if inserted is None:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted release row could not be reloaded"
+                )
+            if inserted != expected:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted release did not round-trip exactly"
+                )
+            return inserted
+
+    def get_release(self, scope: MemoryScope, release_id: str) -> MemoryRelease:
+        """Load one release only from its exact public scope."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        release_id = _validate_string(release_id, "release_id", allow_blank=True)
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _revision_by_address,
+                release_by_address,
+                _release_by_alias,
+                _revisions_by_release,
+            ) = _load_release_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            release = (
+                None
+                if scope_id is None
+                else release_by_address.get((scope_id, release_id))
+            )
+            if release is None:
+                raise ReleaseNotFoundError(f"release {release_id!r} was not found")
+            return release
+
+    def get_release_revisions(
+        self, scope: MemoryScope, release_id: str
+    ) -> tuple[MemoryRevision, ...]:
+        """Resolve one release's revisions in exact manifest order."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        release_id = _validate_string(release_id, "release_id", allow_blank=True)
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _revision_by_address,
+                release_by_address,
+                _release_by_alias,
+                revisions_by_release,
+            ) = _load_release_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            address = None if scope_id is None else (scope_id, release_id)
+            if address is None or address not in release_by_address:
+                raise ReleaseNotFoundError(f"release {release_id!r} was not found")
+            return revisions_by_release[address]
+
+    def list_releases(self, scope: MemoryScope) -> tuple[MemoryRelease, ...]:
+        """Return a stable release snapshot ordered by public identifier."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _revision_by_address,
+                release_by_address,
+                _release_by_alias,
+                _revisions_by_release,
+            ) = _load_release_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            if scope_id is None:
+                return ()
+            return tuple(
+                sorted(
+                    (
+                        release
+                        for (stored_scope_id, _release_id), release in (
+                            release_by_address.items()
+                        )
+                        if stored_scope_id == scope_id
+                    ),
+                    key=lambda release: release.release_id,
                 )
             )
