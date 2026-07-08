@@ -63,7 +63,6 @@ def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
     rows = cursor.execute(
         "SELECT scope_id, tenant_id, namespace, subject_id FROM memory_scopes"
     ).fetchall()
-    requested_identity = (scope.tenant_id, scope.namespace, scope.subject_id)
     matched_scope_id: int | None = None
     for row in rows:
         if len(row) != 4:
@@ -79,7 +78,17 @@ def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
             raise MemoryPersistenceCorruptionError(
                 "memory scope identity values must be text"
             )
-        if stored_identity == requested_identity:
+        try:
+            stored_scope = MemoryScope(
+                tenant_id=stored_identity[0],
+                namespace=stored_identity[1],
+                subject_id=stored_identity[2],
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "stored memory scope identity failed validation"
+            ) from error
+        if stored_scope == scope:
             if matched_scope_id is not None:
                 raise MemoryPersistenceCorruptionError(
                     "memory scope identity matches multiple rows"

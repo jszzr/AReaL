@@ -1338,6 +1338,85 @@ def test_sqlite_scope_lookup_rejects_invalid_utf8_identity_before_absence(
     assert foreign_key_violations == []
 
 
+@pytest.mark.parametrize("scope_column", ["tenant_id", "namespace", "subject_id"])
+@pytest.mark.parametrize("invalid_value", ["", " \t"])
+def test_sqlite_scope_lookup_rejects_stored_identity_invalid_to_public_contract(
+    tmp_path: Path,
+    scope_column: str,
+    invalid_value: str,
+) -> None:
+    database_path = str(tmp_path / "invalid-public-scope.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    mutation_by_column = {
+        "tenant_id": "UPDATE memory_scopes SET tenant_id = ?",
+        "namespace": "UPDATE memory_scopes SET namespace = ?",
+        "subject_id": "UPDATE memory_scopes SET subject_id = ?",
+    }
+    inspection_by_column = {
+        "tenant_id": "SELECT typeof(tenant_id), tenant_id FROM memory_scopes",
+        "namespace": "SELECT typeof(namespace), namespace FROM memory_scopes",
+        "subject_id": "SELECT typeof(subject_id), subject_id FROM memory_scopes",
+    }
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(mutation_by_column[scope_column], (invalid_value,))
+        identity_state = connection.execute(
+            inspection_by_column[scope_column]
+        ).fetchone()
+    finally:
+        connection.close()
+    assert identity_state == ("text", invalid_value)
+
+    operation_errors: dict[str, Exception | None] = {}
+    for operation in ("get", "list", "retry"):
+        try:
+            if operation == "get":
+                store.get(event.scope, record.evidence_id)
+            elif operation == "list":
+                store.list(event.scope)
+            else:
+                store.append(event)
+        except Exception as error:
+            operation_errors[operation] = error
+        else:
+            operation_errors[operation] = None
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_count = connection.execute(
+            "SELECT COUNT(*) FROM memory_scopes"
+        ).fetchone()
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone()
+        foreign_key_violations = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    error_types = {
+        operation: None if error is None else type(error).__name__
+        for operation, error in operation_errors.items()
+    }
+    assert error_types == {
+        "get": "MemoryPersistenceCorruptionError",
+        "list": "MemoryPersistenceCorruptionError",
+        "retry": "MemoryPersistenceCorruptionError",
+    }, (
+        f"operation errors={error_types}; scope rows={scope_count}; "
+        f"evidence rows={evidence_count}"
+    )
+    for error in operation_errors.values():
+        assert type(error) is MemoryPersistenceCorruptionError
+        assert isinstance(error.__cause__, ValueError)
+    assert scope_count == (1,)
+    assert evidence_count == (1,)
+    assert foreign_key_violations == []
+
+
 @pytest.mark.parametrize(
     ("rows", "message"),
     [
