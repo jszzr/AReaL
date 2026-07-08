@@ -35,6 +35,29 @@ _EVIDENCE_SELECT = """SELECT evidence_id, canonical, content_hash,
 FROM memory_evidence
 WHERE scope_id = ? AND evidence_id = ?"""
 
+_EVIDENCE_ROW_TYPES = (
+    str,
+    bytes,
+    str,
+    str,
+    str,
+    str,
+    str,
+    int,
+    str,
+    str,
+    str,
+    str,
+)
+
+_MAX_SCOPE_ID = 2**63 - 1
+
+
+def _require_scope_id(value: object, message: str) -> int:
+    if type(value) is not int or not 1 <= value <= _MAX_SCOPE_ID:
+        raise MemoryPersistenceCorruptionError(message)
+    return value
+
 
 def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
     row = cursor.execute(
@@ -44,11 +67,14 @@ def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
     ).fetchone()
     if row is None:
         return None
-    if len(row) != 1 or type(row[0]) is not int:
+    if len(row) != 1:
         raise MemoryPersistenceCorruptionError(
-            "memory scope identifier has an invalid storage type"
+            "memory scope row does not contain exactly one identifier"
         )
-    return row[0]
+    return _require_scope_id(
+        row[0],
+        "memory scope identifier is not a positive signed 64-bit integer",
+    )
 
 
 def _ensure_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int:
@@ -59,11 +85,10 @@ def _ensure_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int:
         "INSERT INTO memory_scopes (tenant_id, namespace, subject_id) VALUES (?, ?, ?)",
         (scope.tenant_id, scope.namespace, scope.subject_id),
     )
-    scope_id = cursor.lastrowid
-    if type(scope_id) is not int:
-        raise MemoryPersistenceCorruptionError(
-            "memory scope insert did not return an integer identifier"
-        )
+    scope_id = _require_scope_id(
+        cursor.lastrowid,
+        "memory scope insert did not return a positive signed 64-bit identifier",
+    )
     persisted_scope_id = _find_scope_id(cursor, scope)
     if persisted_scope_id != scope_id:
         raise MemoryPersistenceCorruptionError(
@@ -78,16 +103,29 @@ def _load_evidence(
     scope_id: int,
     evidence_id: str,
 ) -> EvidenceRecord | None:
+    _require_scope_id(
+        scope_id,
+        "evidence lookup received an invalid positive signed 64-bit scope ID",
+    )
     row = cursor.execute(_EVIDENCE_SELECT, (scope_id, evidence_id)).fetchone()
     if row is None:
         return None
     try:
+        if len(row) != len(_EVIDENCE_ROW_TYPES):
+            raise ValueError("evidence row has the wrong field count")
+        for index, (value, expected_type) in enumerate(
+            zip(row, _EVIDENCE_ROW_TYPES, strict=True)
+        ):
+            if type(value) is not expected_type:
+                raise TypeError(
+                    f"evidence row field {index} has the wrong storage class"
+                )
         (
             stored_evidence_id,
-            _canonical,
+            canonical,
             content_hash,
             created_at_text,
-            _storage_hash,
+            storage_hash,
             session_id,
             run_id,
             sequence_no,
@@ -96,6 +134,8 @@ def _load_evidence(
             observed_at_text,
             idempotency_key,
         ) = row
+        if stored_evidence_id != evidence_id:
+            raise ValueError("loaded evidence ID differs from requested ID")
         event = EvidenceEvent(
             scope=scope,
             session_id=session_id,
@@ -106,12 +146,36 @@ def _load_evidence(
             observed_at=datetime.fromisoformat(observed_at_text),
             idempotency_key=idempotency_key,
         )
-        return EvidenceRecord(
+        record = EvidenceRecord(
             evidence_id=stored_evidence_id,
             event=event,
             content_hash=content_hash,
             created_at=datetime.fromisoformat(created_at_text),
         )
+        if event.observed_at.isoformat() != observed_at_text:
+            raise ValueError("observed_at is not exact UTC isoformat text")
+        if record.created_at.isoformat() != created_at_text:
+            raise ValueError("created_at is not exact UTC isoformat text")
+        if event.canonical_bytes() != canonical:
+            raise ValueError("canonical evidence bytes disagree with projections")
+        calculated_hash = sha256(canonical).hexdigest()
+        if content_hash != calculated_hash:
+            raise ValueError("evidence content hash disagrees with canonical bytes")
+        calculated_id = f"evd_{calculated_hash[:24]}"
+        if stored_evidence_id != calculated_id:
+            raise ValueError("evidence ID disagrees with its content hash")
+        calculated_storage_hash = _record_storage_hash(
+            record_kind="evidence",
+            scope=scope,
+            record_id=stored_evidence_id,
+            content_hash=content_hash,
+            created_at_text=created_at_text,
+        )
+        if storage_hash != calculated_storage_hash:
+            raise ValueError("evidence storage hash disagrees with stored metadata")
+        return record
+    except MemoryPersistenceCorruptionError:
+        raise
     except (TypeError, ValueError, OverflowError) as error:
         raise MemoryPersistenceCorruptionError(
             "stored evidence row failed integrity validation"

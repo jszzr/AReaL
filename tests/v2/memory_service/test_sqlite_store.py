@@ -997,6 +997,390 @@ def test_sqlite_evidence_failed_scope_insert_rolls_back_and_retries(
 
 
 @pytest.mark.parametrize(
+    "column",
+    [
+        "evidence_id",
+        "canonical",
+        "content_hash",
+        "created_at",
+        "storage_hash",
+        "session_id",
+        "run_id",
+        "sequence_no",
+        "kind",
+        "payload",
+        "observed_at",
+        "idempotency_key",
+    ],
+)
+def test_sqlite_evidence_loader_rejects_each_semantic_column_drift(
+    tmp_path: Path,
+    column: str,
+) -> None:
+    database_path = str(tmp_path / f"semantic-{column}.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    changed_id = f"evd_{'0' * 24}"
+    canonical_variant = b" \n" + event.canonical_bytes()
+    assert canonical_variant != event.canonical_bytes()
+    assert json.loads(canonical_variant) == json.loads(event.canonical_bytes())
+    mutations: dict[str, tuple[str, object]] = {
+        "evidence_id": (
+            "UPDATE memory_evidence SET evidence_id = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            changed_id,
+        ),
+        "canonical": (
+            "UPDATE memory_evidence SET canonical = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            sqlite3.Binary(canonical_variant),
+        ),
+        "content_hash": (
+            "UPDATE memory_evidence SET content_hash = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "0" * 64,
+        ),
+        "created_at": (
+            "UPDATE memory_evidence SET created_at = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            record.created_at.isoformat().replace("+00:00", "Z"),
+        ),
+        "storage_hash": (
+            "UPDATE memory_evidence SET storage_hash = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "0" * 64,
+        ),
+        "session_id": (
+            "UPDATE memory_evidence SET session_id = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "changed-session",
+        ),
+        "run_id": (
+            "UPDATE memory_evidence SET run_id = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "changed-run",
+        ),
+        "sequence_no": (
+            "UPDATE memory_evidence SET sequence_no = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            event.sequence_no + 1,
+        ),
+        "kind": (
+            "UPDATE memory_evidence SET kind = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            EvidenceKind.FEEDBACK.value,
+        ),
+        "payload": (
+            "UPDATE memory_evidence SET payload = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "changed payload",
+        ),
+        "observed_at": (
+            "UPDATE memory_evidence SET observed_at = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            event.observed_at.astimezone(timezone(timedelta(hours=8))).isoformat(),
+        ),
+        "idempotency_key": (
+            "UPDATE memory_evidence SET idempotency_key = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            "changed-key",
+        ),
+    }
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (event.scope.tenant_id, event.scope.namespace, event.scope.subject_id),
+        ).fetchone()[0]
+        sql, changed_value = mutations[column]
+        connection.execute(
+            sql,
+            (changed_value, scope_id, event.idempotency_key),
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.list(event.scope)
+
+    assert str(raised.value) == "stored evidence row failed integrity validation"
+    if column == "created_at":
+        assert "created_at is not exact UTC isoformat text" in str(
+            raised.value.__cause__
+        )
+    if column == "observed_at":
+        assert "observed_at is not exact UTC isoformat text" in str(
+            raised.value.__cause__
+        )
+
+
+@pytest.mark.parametrize(
+    ("column_index", "wrong_value"),
+    [
+        (0, 7),
+        (1, "not-a-blob"),
+        (2, b"not-text"),
+        (3, b"not-text"),
+        (4, b"not-text"),
+        (5, b"not-text"),
+        (6, b"not-text"),
+        (7, "not-an-integer"),
+        (8, b"not-text"),
+        (9, b"not-text"),
+        (10, b"not-text"),
+        (11, b"not-text"),
+    ],
+)
+def test_sqlite_evidence_loader_rejects_wrong_storage_class_for_each_column(
+    tmp_path: Path,
+    column_index: int,
+    wrong_value: object,
+) -> None:
+    database_path = str(tmp_path / f"storage-{column_index}.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (event.scope.tenant_id, event.scope.namespace, event.scope.subject_id),
+        ).fetchone()[0]
+        real_row = connection.execute(
+            sqlite_store_module._EVIDENCE_SELECT,
+            (scope_id, record.evidence_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert real_row is not None
+    changed_row = list(real_row)
+    changed_row[column_index] = wrong_value
+
+    class StaticRowCursor:
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticRowCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return tuple(changed_row)
+
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="stored evidence row failed integrity validation",
+    ):
+        sqlite_store_module._load_evidence(
+            StaticRowCursor(),  # type: ignore[arg-type]
+            event.scope,
+            scope_id,
+            record.evidence_id,
+        )
+
+
+def test_sqlite_evidence_loader_binds_coherent_row_to_requested_id(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "requested-id.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (event.scope.tenant_id, event.scope.namespace, event.scope.subject_id),
+        ).fetchone()[0]
+        coherent_row = connection.execute(
+            sqlite_store_module._EVIDENCE_SELECT,
+            (scope_id, record.evidence_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert coherent_row is not None
+    different_requested_id = f"evd_{'f' * 24}"
+    assert different_requested_id != record.evidence_id
+
+    class CoherentRowCursor:
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> CoherentRowCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return coherent_row
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        sqlite_store_module._load_evidence(
+            CoherentRowCursor(),  # type: ignore[arg-type]
+            event.scope,
+            scope_id,
+            different_requested_id,
+        )
+
+    assert str(raised.value) == "stored evidence row failed integrity validation"
+    assert str(raised.value.__cause__) == (
+        "loaded evidence ID differs from requested ID"
+    )
+
+
+def test_sqlite_evidence_scope_lookup_requires_positive_signed_64_bit_id() -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "scope-user")
+
+    class ScopeCursor:
+        def __init__(self, stored_scope_id: object) -> None:
+            self._stored_scope_id = stored_scope_id
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> ScopeCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return (self._stored_scope_id,)
+
+    for invalid_scope_id in ("7", True, 0, -1, 2**63):
+        with pytest.raises(
+            MemoryPersistenceCorruptionError,
+            match="positive signed 64-bit",
+        ):
+            sqlite_store_module._find_scope_id(
+                ScopeCursor(invalid_scope_id),  # type: ignore[arg-type]
+                scope,
+            )
+    for valid_scope_id in (1, 2**63 - 1):
+        assert (
+            sqlite_store_module._find_scope_id(
+                ScopeCursor(valid_scope_id),  # type: ignore[arg-type]
+                scope,
+            )
+            == valid_scope_id
+        )
+
+
+@pytest.mark.parametrize(
+    ("lastrowid", "persisted_scope_id", "message"),
+    [
+        ("7", None, "did not return"),
+        (True, None, "did not return"),
+        (0, 0, "did not return"),
+        (-1, -1, "did not return"),
+        (2**63, 2**63, "did not return"),
+        (7, 8, "did not round-trip"),
+    ],
+)
+def test_sqlite_evidence_scope_insert_validates_lastrowid_and_requery(
+    lastrowid: object,
+    persisted_scope_id: int | None,
+    message: str,
+) -> None:
+    rows = [None]
+    if persisted_scope_id is not None:
+        rows.append((persisted_scope_id,))
+
+    class ScopeCursor:
+        def __init__(self) -> None:
+            self.lastrowid = lastrowid
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> ScopeCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return rows.pop(0)
+
+    with pytest.raises(MemoryPersistenceCorruptionError, match=message):
+        sqlite_store_module._ensure_scope_id(
+            ScopeCursor(),  # type: ignore[arg-type]
+            MemoryScope("tenant-1", "assistant-memory", "scope-user"),
+        )
+
+
+def test_sqlite_evidence_append_validates_inserted_row_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "append-readback.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    real_connect = sqlite_backend._connect
+
+    class TamperingCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> TamperingCursor:
+            self._real_cursor.execute(sql, parameters)
+            if _normalize_sql(sql).startswith("INSERT INTO MEMORY_EVIDENCE"):
+                assert isinstance(parameters, tuple)
+                self._real_cursor.execute(
+                    "UPDATE memory_evidence SET payload = ? "
+                    "WHERE scope_id = ? AND idempotency_key = ?",
+                    (
+                        "tampered after insert",
+                        parameters[0],
+                        event.idempotency_key,
+                    ),
+                )
+            return self
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class TamperingConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> TamperingCursor:
+            return TamperingCursor(self._real_connection.cursor(*args, **kwargs))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> TamperingConnection:
+        return TamperingConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="stored evidence row failed integrity validation",
+    ):
+        store.append(event)
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM memory_scopes").fetchone() == (
+            0,
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone() == (0,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
     ("value", "error_type", "message"),
     [
         (b"memory.sqlite3", TypeError, "string-valued"),
