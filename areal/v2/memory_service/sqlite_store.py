@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Durable SQLite implementation of the Memory Service contracts."""
+"""File-backed SQLite implementation of the EvidenceStore contract."""
 
 from __future__ import annotations
 
@@ -214,7 +214,7 @@ def _evidence_sort_key(
 
 
 class SQLiteMemoryStore:
-    """Local durable backend for immutable Memory Service records."""
+    """Local SQLite backend for immutable evidence records."""
 
     def __init__(self, database_path: str | os.PathLike[str]) -> None:
         self._database_path = _snapshot_database_path(database_path)

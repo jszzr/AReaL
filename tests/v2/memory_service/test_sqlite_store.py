@@ -1187,6 +1187,42 @@ def test_sqlite_evidence_loader_rejects_wrong_storage_class_for_each_column(
         )
 
 
+@pytest.mark.parametrize("operation", ["get", "list", "retry"])
+def test_sqlite_invalid_utf8_text_is_corruption_for_all_evidence_reads(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    database_path = str(tmp_path / "invalid-utf8.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE memory_evidence SET payload = CAST(X'80' AS TEXT) "
+            "WHERE evidence_id = ?",
+            (record.evidence_id,),
+        )
+        storage_class = connection.execute(
+            "SELECT typeof(payload) FROM memory_evidence WHERE evidence_id = ?",
+            (record.evidence_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert storage_class == ("text",)
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        if operation == "get":
+            store.get(event.scope, record.evidence_id)
+        elif operation == "list":
+            store.list(event.scope)
+        else:
+            store.append(event)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert isinstance(raised.value.__cause__, UnicodeDecodeError)
+
+
 def test_sqlite_evidence_loader_binds_coherent_row_to_requested_id(
     tmp_path: Path,
 ) -> None:

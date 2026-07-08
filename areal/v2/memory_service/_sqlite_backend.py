@@ -294,6 +294,15 @@ def _configure_connection(cursor: sqlite3.Cursor) -> None:
     _require_pragma_value(cursor, "synchronous", 2)
 
 
+def _strict_text_factory(value: bytes) -> str:
+    try:
+        return value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise MemoryPersistenceCorruptionError(
+            "SQLite TEXT contains invalid UTF-8"
+        ) from error
+
+
 def _connect(path: str) -> sqlite3.Connection:
     """Open and fully configure one per-operation SQLite connection."""
 
@@ -307,6 +316,7 @@ def _connect(path: str) -> sqlite3.Connection:
     except sqlite3.Error as error:
         raise _map_sqlite_error(error) from error
     try:
+        connection.text_factory = _strict_text_factory
         cursor = connection.cursor()
         _require_delete_journal(cursor)
         _configure_connection(cursor)
