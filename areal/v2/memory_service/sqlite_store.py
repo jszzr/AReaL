@@ -354,15 +354,10 @@ class SQLiteMemoryStore:
             scope_id = _find_scope_id(cursor, scope)
             if scope_id is None:
                 return ()
-            sql = "SELECT evidence_id FROM memory_evidence WHERE scope_id = ?"
-            parameters: list[object] = [scope_id]
-            if session_id is not None:
-                sql += " AND session_id = ?"
-                parameters.append(session_id)
-            if run_id is not None:
-                sql += " AND run_id = ?"
-                parameters.append(run_id)
-            rows = cursor.execute(sql, parameters).fetchall()
+            rows = cursor.execute(
+                "SELECT evidence_id FROM memory_evidence WHERE scope_id = ?",
+                (scope_id,),
+            ).fetchall()
             records: list[EvidenceRecord] = []
             for row in rows:
                 if len(row) != 1 or type(row[0]) is not str:
@@ -374,5 +369,8 @@ class SQLiteMemoryStore:
                     raise MemoryPersistenceCorruptionError(
                         "evidence listing refers to a missing row"
                     )
-                records.append(record)
+                if (session_id is None or record.event.session_id == session_id) and (
+                    run_id is None or record.event.run_id == run_id
+                ):
+                    records.append(record)
             return tuple(sorted(records, key=_evidence_sort_key))

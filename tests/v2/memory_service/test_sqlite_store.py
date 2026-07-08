@@ -1102,8 +1102,13 @@ def test_sqlite_evidence_loader_rejects_each_semantic_column_drift(
     finally:
         connection.close()
 
+    filters: dict[str, str] = {}
+    if column == "session_id":
+        filters["session_id"] = event.session_id
+    elif column == "run_id":
+        filters["run_id"] = event.run_id
     with pytest.raises(MemoryPersistenceCorruptionError) as raised:
-        store.list(event.scope)
+        store.list(event.scope, **filters)
 
     assert str(raised.value) == "stored evidence row failed integrity validation"
     if column == "created_at":
