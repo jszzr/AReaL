@@ -10,9 +10,12 @@ import multiprocessing
 import os
 import sqlite3
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -425,6 +428,35 @@ def _append_sqlite_revision_candidate(
         )
     )
     return candidate, evidence
+
+
+_SQLITE_REVISION_RACE_SIZE = 6
+_SQLITE_REVISION_RACE_TIMEOUT_SECONDS = 30.0
+
+
+def _run_sqlite_revision_race(
+    database_path: str | Path,
+    proposals: tuple[RevisionProposal, ...],
+) -> tuple[MemoryRevision | MemoryServiceError, ...]:
+    stores = tuple(SQLiteMemoryStore(database_path) for _proposal in proposals)
+    barrier = Barrier(len(proposals), timeout=10.0)
+
+    def worker(index: int) -> MemoryRevision | MemoryServiceError:
+        barrier.wait()
+        try:
+            return stores[index].append_revision(proposals[index])
+        except MemoryServiceError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=len(proposals)) as executor:
+        futures = tuple(
+            executor.submit(worker, index) for index in range(len(proposals))
+        )
+        deadline = monotonic() + _SQLITE_REVISION_RACE_TIMEOUT_SECONDS
+        return tuple(
+            future.result(timeout=max(0.0, deadline - monotonic()))
+            for future in futures
+        )
 
 
 def _memory_graph_state(
@@ -6123,3 +6155,349 @@ def test_sqlite_revision_overflow_precedes_insert_and_leaves_candidate_reusable(
     assert recovered.proposal.idempotency_key == overflow_attempt.idempotency_key
     assert recovered.generation == 0
     assert _revision_graph_state(database_path) == ((1, 2, 2, 2, 2), [])
+
+
+def test_sqlite_concurrent_identical_revision_requests_converge(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-concurrent-identical.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-concurrent-identical",
+    )
+    candidate, _evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=0,
+        key="concurrent-identical",
+    )
+    proposals = tuple(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            idempotency_key="concurrent-identical-revision",
+        )
+        for _index in range(_SQLITE_REVISION_RACE_SIZE)
+    )
+
+    outcomes = _run_sqlite_revision_race(database_path, proposals)
+
+    assert not any(isinstance(item, MemoryPersistenceError) for item in outcomes)
+    assert all(type(item) is MemoryRevision for item in outcomes)
+    revisions = tuple(item for item in outcomes if type(item) is MemoryRevision)
+    assert len(revisions) == _SQLITE_REVISION_RACE_SIZE
+    first = revisions[0]
+    assert all(revision == first for revision in revisions)
+    assert {revision.revision_id for revision in revisions} == {first.revision_id}
+    assert {revision.content_hash for revision in revisions} == {first.content_hash}
+    assert {revision.memory_id for revision in revisions} == {first.memory_id}
+    assert {revision.generation for revision in revisions} == {0}
+    assert {revision.created_at for revision in revisions} == {first.created_at}
+    assert all(revision.proposal == proposals[0] for revision in revisions)
+    assert _revision_graph_state(database_path) == ((1, 1, 1, 1, 1), [])
+
+    fresh = SQLiteMemoryStore(database_path)
+    persisted = fresh.get_revision(scope, first.revision_id)
+    assert persisted == first
+    assert persisted is not first
+    assert fresh.list_revisions(scope) == (persisted,)
+
+
+def test_sqlite_concurrent_revision_idempotency_conflicts_leave_loser_candidates_reusable(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-concurrent-idempotency.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-concurrent-idempotency",
+    )
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"concurrent-idempotency-{index}",
+        )[0]
+        for index in range(_SQLITE_REVISION_RACE_SIZE)
+    )
+    proposals = tuple(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            idempotency_key="concurrent-shared-revision-key",
+        )
+        for candidate in candidates
+    )
+    derived_revision_ids = {
+        f"rev_{hashlib.sha256(proposal.canonical_bytes()).hexdigest()[:24]}"
+        for proposal in proposals
+    }
+    assert len(derived_revision_ids) == _SQLITE_REVISION_RACE_SIZE
+
+    outcomes = _run_sqlite_revision_race(database_path, proposals)
+
+    persistence_errors = tuple(
+        item for item in outcomes if isinstance(item, MemoryPersistenceError)
+    )
+    winners = tuple(item for item in outcomes if type(item) is MemoryRevision)
+    conflicts = tuple(item for item in outcomes if type(item) is RevisionConflictError)
+    unexpected = tuple(
+        item
+        for item in outcomes
+        if type(item) not in {MemoryRevision, RevisionConflictError}
+    )
+    assert persistence_errors == ()
+    assert unexpected == ()
+    assert len(winners) == 1
+    assert len(conflicts) == _SQLITE_REVISION_RACE_SIZE - 1
+    assert all(
+        str(conflict)
+        == "scoped revision idempotency key already refers to different content"
+        for conflict in conflicts
+    )
+    winner = winners[0]
+    assert _revision_graph_state(database_path) == (
+        (
+            1,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            1,
+        ),
+        [],
+    )
+
+    loser_candidates = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.candidate_id != winner.proposal.candidate_id
+    )
+    recovery_store = SQLiteMemoryStore(database_path)
+    recovered = tuple(
+        recovery_store.append_revision(
+            _make_sqlite_revision(
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                idempotency_key=f"concurrent-recovered-candidate-{index}",
+            )
+        )
+        for index, candidate in enumerate(loser_candidates)
+    )
+    assert len(recovered) == _SQLITE_REVISION_RACE_SIZE - 1
+    stored = recovery_store.list_revisions(scope)
+    assert len(stored) == _SQLITE_REVISION_RACE_SIZE
+    assert {revision.proposal.candidate_id for revision in stored} == {
+        candidate.candidate_id for candidate in candidates
+    }
+    assert _revision_graph_state(database_path) == (
+        (
+            1,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+        ),
+        [],
+    )
+
+
+def test_sqlite_concurrent_different_transitions_using_one_candidate_have_one_winner(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-concurrent-candidate.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-concurrent-candidate",
+    )
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"concurrent-candidate-{index}",
+        )[0]
+        for index in range(_SQLITE_REVISION_RACE_SIZE)
+    )
+    contested_candidate = candidates[0]
+    recovery_candidates = candidates[1:]
+    proposals = tuple(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=contested_candidate.candidate_id,
+            idempotency_key=f"concurrent-candidate-key-{index}",
+        )
+        for index in range(_SQLITE_REVISION_RACE_SIZE)
+    )
+    derived_revision_ids = {
+        f"rev_{hashlib.sha256(proposal.canonical_bytes()).hexdigest()[:24]}"
+        for proposal in proposals
+    }
+    assert len(derived_revision_ids) == _SQLITE_REVISION_RACE_SIZE
+
+    outcomes = _run_sqlite_revision_race(database_path, proposals)
+
+    persistence_errors = tuple(
+        item for item in outcomes if isinstance(item, MemoryPersistenceError)
+    )
+    winners = tuple(item for item in outcomes if type(item) is MemoryRevision)
+    conflicts = tuple(item for item in outcomes if type(item) is RevisionConflictError)
+    unexpected = tuple(
+        item
+        for item in outcomes
+        if type(item) not in {MemoryRevision, RevisionConflictError}
+    )
+    assert persistence_errors == ()
+    assert unexpected == ()
+    assert len(winners) == 1
+    assert len(conflicts) == _SQLITE_REVISION_RACE_SIZE - 1
+    assert all(
+        str(conflict)
+        == f"candidate {contested_candidate.candidate_id!r} already backs a revision"
+        for conflict in conflicts
+    )
+    winner = winners[0]
+    assert _revision_graph_state(database_path) == (
+        (
+            1,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            1,
+        ),
+        [],
+    )
+
+    loser_keys = tuple(
+        proposal.idempotency_key
+        for proposal in proposals
+        if proposal.idempotency_key != winner.proposal.idempotency_key
+    )
+    recovery_store = SQLiteMemoryStore(database_path)
+    recovered = tuple(
+        recovery_store.append_revision(
+            _make_sqlite_revision(
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                idempotency_key=loser_key,
+            )
+        )
+        for candidate, loser_key in zip(
+            recovery_candidates,
+            loser_keys,
+            strict=True,
+        )
+    )
+    assert len(recovered) == _SQLITE_REVISION_RACE_SIZE - 1
+    stored = recovery_store.list_revisions(scope)
+    assert len(stored) == _SQLITE_REVISION_RACE_SIZE
+    assert {revision.proposal.candidate_id for revision in stored} == {
+        candidate.candidate_id for candidate in candidates
+    }
+    assert {revision.proposal.idempotency_key for revision in recovered} == set(
+        loser_keys
+    )
+    assert _revision_graph_state(database_path) == (
+        (
+            1,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+            _SQLITE_REVISION_RACE_SIZE,
+        ),
+        [],
+    )
+
+
+def test_sqlite_concurrent_sibling_revisions_all_survive(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-concurrent-siblings.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-concurrent-siblings",
+    )
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"concurrent-sibling-{index}",
+        )[0]
+        for index in range(_SQLITE_REVISION_RACE_SIZE + 1)
+    )
+    parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[0].candidate_id,
+            idempotency_key="concurrent-sibling-parent",
+        )
+    )
+    operations = (
+        RevisionOperation.REFINE,
+        RevisionOperation.SUPERSEDE,
+        RevisionOperation.CONTRADICT,
+    )
+    proposals = tuple(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=operations[index % len(operations)],
+            parent_revision_id=parent.revision_id,
+            idempotency_key=f"concurrent-sibling-key-{index}",
+        )
+        for index, candidate in enumerate(candidates[1:])
+    )
+
+    outcomes = _run_sqlite_revision_race(database_path, proposals)
+
+    assert not any(isinstance(item, MemoryPersistenceError) for item in outcomes)
+    assert all(type(item) is MemoryRevision for item in outcomes)
+    siblings = tuple(item for item in outcomes if type(item) is MemoryRevision)
+    assert len(siblings) == _SQLITE_REVISION_RACE_SIZE
+    assert len({revision.revision_id for revision in siblings}) == (
+        _SQLITE_REVISION_RACE_SIZE
+    )
+    assert {revision.proposal.candidate_id for revision in siblings} == {
+        candidate.candidate_id for candidate in candidates[1:]
+    }
+    assert {revision.proposal.parent_revision_id for revision in siblings} == {
+        parent.revision_id
+    }
+    assert {revision.memory_id for revision in siblings} == {parent.memory_id}
+    assert {revision.generation for revision in siblings} == {parent.generation + 1}
+
+    fresh = SQLiteMemoryStore(database_path)
+    stored = fresh.list_revisions(scope)
+    assert len(stored) == _SQLITE_REVISION_RACE_SIZE + 1
+    assert {revision.revision_id for revision in stored} == {
+        parent.revision_id,
+        *(revision.revision_id for revision in siblings),
+    }
+    assert stored == tuple(
+        sorted(
+            (parent, *siblings),
+            key=lambda revision: (
+                revision.memory_id,
+                revision.generation,
+                revision.revision_id,
+            ),
+        )
+    )
+    assert _revision_graph_state(database_path) == (
+        (
+            1,
+            _SQLITE_REVISION_RACE_SIZE + 1,
+            _SQLITE_REVISION_RACE_SIZE + 1,
+            _SQLITE_REVISION_RACE_SIZE + 1,
+            _SQLITE_REVISION_RACE_SIZE + 1,
+        ),
+        [],
+    )
