@@ -1272,12 +1272,125 @@ def test_sqlite_evidence_loader_binds_coherent_row_to_requested_id(
     )
 
 
-def test_sqlite_evidence_scope_lookup_requires_positive_signed_64_bit_id() -> None:
+@pytest.mark.parametrize("scope_column", ["tenant_id", "namespace", "subject_id"])
+@pytest.mark.parametrize("operation", ["get", "list", "retry"])
+def test_sqlite_scope_lookup_rejects_invalid_utf8_identity_before_absence(
+    tmp_path: Path,
+    scope_column: str,
+    operation: str,
+) -> None:
+    database_path = str(tmp_path / "invalid-scope-utf8.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    mutation_by_column = {
+        "tenant_id": ("UPDATE memory_scopes SET tenant_id = CAST(X'80' AS TEXT)"),
+        "namespace": ("UPDATE memory_scopes SET namespace = CAST(X'80' AS TEXT)"),
+        "subject_id": ("UPDATE memory_scopes SET subject_id = CAST(X'80' AS TEXT)"),
+    }
+    inspection_by_column = {
+        "tenant_id": "SELECT typeof(tenant_id), hex(tenant_id) FROM memory_scopes",
+        "namespace": "SELECT typeof(namespace), hex(namespace) FROM memory_scopes",
+        "subject_id": "SELECT typeof(subject_id), hex(subject_id) FROM memory_scopes",
+    }
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(mutation_by_column[scope_column])
+        identity_state = connection.execute(
+            inspection_by_column[scope_column]
+        ).fetchone()
+    finally:
+        connection.close()
+    assert identity_state == ("text", "80")
+
+    operation_error: Exception | None = None
+    try:
+        if operation == "get":
+            store.get(event.scope, record.evidence_id)
+        elif operation == "list":
+            store.list(event.scope)
+        else:
+            store.append(event)
+    except Exception as error:
+        operation_error = error
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_count = connection.execute(
+            "SELECT COUNT(*) FROM memory_scopes"
+        ).fetchone()
+        evidence_count = connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone()
+        foreign_key_violations = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert type(operation_error) is MemoryPersistenceCorruptionError, (
+        f"operation error was {type(operation_error).__name__}; "
+        f"scope rows={scope_count}; evidence rows={evidence_count}"
+    )
+    assert isinstance(operation_error.__cause__, UnicodeDecodeError)
+    assert scope_count == (1,)
+    assert evidence_count == (1,)
+    assert foreign_key_violations == []
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (((1, "tenant-1", "assistant-memory"),), "exactly four values"),
+        (((1, b"tenant-1", "assistant-memory", "scope-user"),), "text"),
+        (((1, "tenant-1", b"assistant-memory", "scope-user"),), "text"),
+        (((1, "tenant-1", "assistant-memory", b"scope-user"),), "text"),
+        (
+            (
+                (1, "tenant-1", "assistant-memory", "scope-user"),
+                (2, "tenant-1", "assistant-memory", "scope-user"),
+            ),
+            "multiple rows",
+        ),
+        (
+            (
+                (1, "tenant-1", "assistant-memory", "scope-user"),
+                (2, "other", "assistant-memory", b"damaged"),
+            ),
+            "text",
+        ),
+    ],
+)
+def test_sqlite_scope_lookup_validates_every_identity_row(
+    rows: tuple[tuple[object, ...], ...],
+    message: str,
+) -> None:
     scope = MemoryScope("tenant-1", "assistant-memory", "scope-user")
 
     class ScopeCursor:
-        def __init__(self, stored_scope_id: object) -> None:
-            self._stored_scope_id = stored_scope_id
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> ScopeCursor:
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return list(rows)
+
+    with pytest.raises(MemoryPersistenceCorruptionError, match=message):
+        sqlite_store_module._find_scope_id(
+            ScopeCursor(),  # type: ignore[arg-type]
+            scope,
+        )
+
+
+def test_sqlite_scope_lookup_matches_exact_identity_or_returns_none() -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "scope-user")
+
+    class ScopeCursor:
+        def __init__(self, rows: tuple[tuple[object, ...], ...]) -> None:
+            self._rows = rows
 
         def execute(
             self,
@@ -1286,8 +1399,50 @@ def test_sqlite_evidence_scope_lookup_requires_positive_signed_64_bit_id() -> No
         ) -> ScopeCursor:
             return self
 
-        def fetchone(self) -> tuple[object, ...]:
-            return (self._stored_scope_id,)
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return list(self._rows)
+
+    target_rows = (
+        (1, "other", "assistant-memory", "scope-user"),
+        (2, "tenant-1", "assistant-memory", "scope-user"),
+    )
+    assert (
+        sqlite_store_module._find_scope_id(
+            ScopeCursor(target_rows),  # type: ignore[arg-type]
+            scope,
+        )
+        == 2
+    )
+    assert (
+        sqlite_store_module._find_scope_id(
+            ScopeCursor(target_rows[:1]),  # type: ignore[arg-type]
+            scope,
+        )
+        is None
+    )
+
+
+def test_sqlite_evidence_scope_lookup_requires_positive_signed_64_bit_id() -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "scope-user")
+
+    class ScopeCursor:
+        def __init__(self, stored_scope_id: object) -> None:
+            self._row = (
+                stored_scope_id,
+                scope.tenant_id,
+                scope.namespace,
+                scope.subject_id,
+            )
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> ScopeCursor:
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return [self._row]
 
     for invalid_scope_id in ("7", True, 0, -1, 2**63):
         with pytest.raises(
@@ -1324,9 +1479,10 @@ def test_sqlite_evidence_scope_insert_validates_lastrowid_and_requery(
     persisted_scope_id: int | None,
     message: str,
 ) -> None:
-    rows = [None]
+    identity = ("tenant-1", "assistant-memory", "scope-user")
+    rows: list[list[tuple[object, ...]]] = [[]]
     if persisted_scope_id is not None:
-        rows.append((persisted_scope_id,))
+        rows.append([(persisted_scope_id, *identity)])
 
     class ScopeCursor:
         def __init__(self) -> None:
@@ -1339,7 +1495,7 @@ def test_sqlite_evidence_scope_insert_validates_lastrowid_and_requery(
         ) -> ScopeCursor:
             return self
 
-        def fetchone(self) -> tuple[object, ...] | None:
+        def fetchall(self) -> list[tuple[object, ...]]:
             return rows.pop(0)
 
     with pytest.raises(MemoryPersistenceCorruptionError, match=message):

@@ -60,21 +60,32 @@ def _require_scope_id(value: object, message: str) -> int:
 
 
 def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
-    row = cursor.execute(
-        "SELECT scope_id FROM memory_scopes "
-        "WHERE tenant_id = ? AND namespace = ? AND subject_id = ?",
-        (scope.tenant_id, scope.namespace, scope.subject_id),
-    ).fetchone()
-    if row is None:
-        return None
-    if len(row) != 1:
-        raise MemoryPersistenceCorruptionError(
-            "memory scope row does not contain exactly one identifier"
+    rows = cursor.execute(
+        "SELECT scope_id, tenant_id, namespace, subject_id FROM memory_scopes"
+    ).fetchall()
+    requested_identity = (scope.tenant_id, scope.namespace, scope.subject_id)
+    matched_scope_id: int | None = None
+    for row in rows:
+        if len(row) != 4:
+            raise MemoryPersistenceCorruptionError(
+                "memory scope row does not contain exactly four values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "memory scope identifier is not a positive signed 64-bit integer",
         )
-    return _require_scope_id(
-        row[0],
-        "memory scope identifier is not a positive signed 64-bit integer",
-    )
+        stored_identity = row[1:]
+        if not all(type(value) is str for value in stored_identity):
+            raise MemoryPersistenceCorruptionError(
+                "memory scope identity values must be text"
+            )
+        if stored_identity == requested_identity:
+            if matched_scope_id is not None:
+                raise MemoryPersistenceCorruptionError(
+                    "memory scope identity matches multiple rows"
+                )
+            matched_scope_id = scope_id
+    return matched_scope_id
 
 
 def _ensure_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int:
