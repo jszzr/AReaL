@@ -233,6 +233,7 @@ def _load_scope_evidence(
         "SELECT scope_id, evidence_id FROM memory_evidence",
     ).fetchall()
     records: list[EvidenceRecord] = []
+    seen_addresses: set[tuple[int, str]] = set()
     for row in rows:
         if len(row) != 2:
             raise MemoryPersistenceCorruptionError(
@@ -247,6 +248,12 @@ def _load_scope_evidence(
             raise MemoryPersistenceCorruptionError(
                 "evidence address contains a non-text identifier"
             )
+        address = (stored_scope_id, evidence_id)
+        if address in seen_addresses:
+            raise MemoryPersistenceCorruptionError(
+                "evidence address appears multiple times"
+            )
+        seen_addresses.add(address)
         stored_scope = scope_by_id.get(stored_scope_id)
         if stored_scope is None:
             raise MemoryPersistenceCorruptionError(

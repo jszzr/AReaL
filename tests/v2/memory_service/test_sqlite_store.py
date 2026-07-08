@@ -1201,6 +1201,80 @@ def test_sqlite_operations_validate_evidence_before_rewritten_scope_absence(
         connection.close()
 
 
+def test_sqlite_list_rejects_duplicate_physical_evidence_addresses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "duplicate-address.sqlite3")
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+
+    class DuplicateAddressCursor:
+        def __init__(self) -> None:
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            _parameters: object = (),
+        ) -> DuplicateAddressCursor:
+            self._last_sql = _normalize_sql(sql)
+            return self
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            if self._last_sql.startswith("SELECT SCOPE_ID FROM MEMORY_SCOPES"):
+                return (1,)
+            return None
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            if self._last_sql.startswith(
+                "SELECT SCOPE_ID, TENANT_ID, NAMESPACE, SUBJECT_ID FROM MEMORY_SCOPES"
+            ):
+                return [
+                    (
+                        1,
+                        event.scope.tenant_id,
+                        event.scope.namespace,
+                        event.scope.subject_id,
+                    )
+                ]
+            if self._last_sql.startswith(
+                "SELECT SCOPE_ID, EVIDENCE_ID FROM MEMORY_EVIDENCE"
+            ):
+                address = (1, record.evidence_id)
+                return [address, address]
+            if self._last_sql.startswith(
+                "SELECT EVIDENCE_ID FROM MEMORY_EVIDENCE WHERE SCOPE_ID = ?"
+            ):
+                address = (record.evidence_id,)
+                return [address, address]
+            raise AssertionError(f"unexpected fetchall SQL: {self._last_sql}")
+
+    class DuplicateAddressTransaction:
+        def __enter__(self) -> DuplicateAddressCursor:
+            return DuplicateAddressCursor()
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_read_transaction",
+        lambda _path: DuplicateAddressTransaction(),
+    )
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_load_evidence",
+        lambda *_args: record,
+    )
+
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="evidence address appears multiple times",
+    ):
+        store.list(event.scope)
+
+
 @pytest.mark.parametrize(
     "column",
     [
