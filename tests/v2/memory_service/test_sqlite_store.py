@@ -35,6 +35,7 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceError,
     MemoryPersistenceSchemaError,
     MemoryServiceError,
+    ReleaseConflictError,
     ReleaseNotFoundError,
     RevisionConflictError,
     RevisionNotFoundError,
@@ -609,6 +610,68 @@ def _release_graph_state(
         counts[6],
         counts[7],
     ), foreign_key_violations
+
+
+def _release_graph_rows(
+    database_path: str | Path,
+) -> tuple[
+    tuple[tuple[tuple[object, ...], ...], ...],
+    tuple[tuple[object, ...], ...],
+]:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.text_factory = bytes
+    try:
+        rows = tuple(
+            tuple(
+                tuple(row)
+                for row in connection.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+            )
+            for table in (
+                "memory_scopes",
+                "memory_evidence",
+                "memory_candidates",
+                "memory_candidate_evidence",
+                "memory_revisions",
+                "memory_releases",
+                "memory_release_aliases",
+                "memory_release_revisions",
+            )
+        )
+        foreign_key_violations = tuple(
+            tuple(row)
+            for row in connection.execute("PRAGMA foreign_key_check").fetchall()
+        )
+    finally:
+        connection.close()
+    return rows, foreign_key_violations
+
+
+def _assert_sqlite_release_append_failure_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    store: SQLiteMemoryStore,
+    database_path: str | Path,
+    manifest: ReleaseManifest,
+    *,
+    idempotency_key: str,
+    error_type: type[MemoryServiceError],
+    message: str,
+) -> MemoryServiceError:
+    before = _release_graph_rows(database_path)
+    assert before[1] == ()
+    plan = _SQLiteFailurePlan()
+    with monkeypatch.context() as guarded:
+        _install_sqlite_failure_proxy(guarded, plan)
+        with pytest.raises(error_type) as raised:
+            store.append_release(manifest, idempotency_key=idempotency_key)
+    assert type(raised.value) is error_type
+    assert str(raised.value) == message
+    assert _release_graph_rows(database_path) == before
+    assert not any(
+        event.startswith("attempt:INSERT INTO MEMORY_") for event in plan.events
+    )
+    return raised.value
 
 
 class _StableDigest:
@@ -8551,5 +8614,344 @@ def test_sqlite_release_append_rejects_invalid_inputs_before_io(
     assert alias_row == ("text", "release-input-valid", release.release_id)
     assert _release_graph_state(database_path) == (
         (1, 0, 0, 0, 0, 1, 1, 0),
+        [],
+    )
+
+
+def test_sqlite_release_error_precedence_and_failures_leave_keys_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-precedence.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "release-precedence")
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-precedence-foreign",
+    )
+    hidden_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-precedence-hidden",
+    )
+    winner, _winner_candidate, _winner_evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="precedence-winner",
+    )
+    sibling_sources = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"precedence-sibling-{index}",
+        )
+        for index in range(1, 4)
+    )
+    sibling_parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=sibling_sources[0][0].candidate_id,
+            idempotency_key="precedence-sibling-parent",
+        )
+    )
+    left_sibling = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=sibling_sources[1][0].candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id=sibling_parent.revision_id,
+            idempotency_key="precedence-sibling-left",
+        )
+    )
+    right_sibling = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=sibling_sources[2][0].candidate_id,
+            operation=RevisionOperation.CONTRADICT,
+            parent_revision_id=sibling_parent.revision_id,
+            idempotency_key="precedence-sibling-right",
+        )
+    )
+    foreign_revision, _foreign_candidate, _foreign_evidence = (
+        _append_sqlite_release_root(
+            store,
+            foreign_scope,
+            index=0,
+            key="precedence-foreign",
+        )
+    )
+    assert left_sibling.memory_id == right_sibling.memory_id
+    assert left_sibling.revision_id != right_sibling.revision_id
+
+    owner_manifest = ReleaseManifest(scope, (winner.revision_id,))
+    owner_key = "release-precedence-owner"
+    owner = store.append_release(owner_manifest, idempotency_key=owner_key)
+    assert _release_graph_state(database_path) == (
+        (2, 5, 5, 5, 5, 1, 1, 1),
+        [],
+    )
+
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        ReleaseManifest(scope, ("rev_missing_same_key",)),
+        idempotency_key=owner_key,
+        error_type=ReleaseConflictError,
+        message=("scoped release idempotency key already refers to different content"),
+    )
+
+    missing_after_duplicate_key = "release-missing-after-duplicate"
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        ReleaseManifest(
+            scope,
+            (
+                left_sibling.revision_id,
+                right_sibling.revision_id,
+                "rev_missing_after_duplicate",
+            ),
+        ),
+        idempotency_key=missing_after_duplicate_key,
+        error_type=RevisionNotFoundError,
+        message="revision 'rev_missing_after_duplicate' was not found",
+    )
+
+    duplicate_manifest = ReleaseManifest(
+        scope,
+        (left_sibling.revision_id, right_sibling.revision_id),
+    )
+    collision_manifest = ReleaseManifest(scope, (left_sibling.revision_id,))
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(
+            {
+                duplicate_manifest.canonical_bytes(): owner.content_hash,
+                collision_manifest.canonical_bytes(): owner.content_hash,
+            }
+        ),
+    )
+    duplicate_key = "release-duplicate-before-collision"
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        duplicate_manifest,
+        idempotency_key=duplicate_key,
+        error_type=ReleaseConflictError,
+        message=(
+            "release contains more than one revision for memory_id "
+            f"{left_sibling.memory_id!r}"
+        ),
+    )
+    collision_key = "release-plain-collision"
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        collision_manifest,
+        idempotency_key=collision_key,
+        error_type=ReleaseConflictError,
+        message=f"release ID collision for {owner.release_id!r}",
+    )
+
+    foreign_key = "release-foreign-hidden"
+    foreign_manifest = ReleaseManifest(
+        scope,
+        (foreign_revision.revision_id,),
+    )
+    foreign_error = _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        foreign_manifest,
+        idempotency_key=foreign_key,
+        error_type=RevisionNotFoundError,
+        message=f"revision {foreign_revision.revision_id!r} was not found",
+    )
+    missing_database_path = tmp_path / "release-genuinely-missing.sqlite3"
+    missing_store = SQLiteMemoryStore(missing_database_path)
+    missing_owner = missing_store.append_release(
+        ReleaseManifest(scope, ()),
+        idempotency_key="release-missing-baseline",
+    )
+    missing_error = _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        missing_store,
+        missing_database_path,
+        foreign_manifest,
+        idempotency_key=foreign_key,
+        error_type=RevisionNotFoundError,
+        message=f"revision {foreign_revision.revision_id!r} was not found",
+    )
+    assert type(foreign_error) is RevisionNotFoundError
+    assert type(missing_error) is RevisionNotFoundError
+    assert str(foreign_error).encode("utf-8") == str(missing_error).encode("utf-8")
+    assert _release_graph_state(missing_database_path) == (
+        (1, 0, 0, 0, 0, 1, 1, 0),
+        [],
+    )
+
+    new_scope_key = "release-new-scope-missing"
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        ReleaseManifest(hidden_scope, ("rev_missing_new_scope",)),
+        idempotency_key=new_scope_key,
+        error_type=RevisionNotFoundError,
+        message="revision 'rev_missing_new_scope' was not found",
+    )
+
+    assert store.append_release(owner_manifest, idempotency_key=owner_key) == owner
+    for recovered_key in (
+        missing_after_duplicate_key,
+        duplicate_key,
+        collision_key,
+    ):
+        assert (
+            store.append_release(owner_manifest, idempotency_key=recovered_key) == owner
+        )
+    assert store.append_release(owner_manifest, idempotency_key=foreign_key) == owner
+    recovered_hidden = store.append_release(
+        ReleaseManifest(hidden_scope, ()),
+        idempotency_key=new_scope_key,
+    )
+    recovered_missing = missing_store.append_release(
+        ReleaseManifest(scope, ()),
+        idempotency_key=foreign_key,
+    )
+
+    assert recovered_hidden.manifest.revision_ids == ()
+    assert recovered_missing == missing_owner
+    assert store.list_releases(scope) == (owner,)
+    assert store.list_releases(hidden_scope) == (recovered_hidden,)
+    assert _release_graph_state(database_path) == (
+        (3, 5, 5, 5, 5, 2, 6, 1),
+        [],
+    )
+    assert _release_graph_state(missing_database_path) == (
+        (1, 0, 0, 0, 0, 1, 2, 0),
+        [],
+    )
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+def test_sqlite_release_id_collision_is_scoped_atomic_and_loser_key_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+) -> None:
+    database_path = tmp_path / f"release-{collision_kind}-collision.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    first_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"release-{collision_kind}-first",
+    )
+    second_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"release-{collision_kind}-second",
+    )
+    winner_revision, _winner_candidate, _winner_evidence = _append_sqlite_release_root(
+        store,
+        first_scope,
+        index=0,
+        key=f"{collision_kind}-winner",
+    )
+    loser_revision, _loser_candidate, _loser_evidence = _append_sqlite_release_root(
+        store,
+        first_scope,
+        index=1,
+        key=f"{collision_kind}-loser",
+    )
+    cross_revision, _cross_candidate, _cross_evidence = _append_sqlite_release_root(
+        store,
+        second_scope,
+        index=0,
+        key=f"{collision_kind}-cross-scope",
+    )
+    winner_manifest = ReleaseManifest(first_scope, (winner_revision.revision_id,))
+    loser_manifest = ReleaseManifest(first_scope, (loser_revision.revision_id,))
+    cross_manifest = ReleaseManifest(second_scope, (cross_revision.revision_id,))
+    shared_prefix = "e" * 24
+    winner_digest = shared_prefix + "a" * 40
+    loser_digest = (
+        winner_digest if collision_kind == "full-hash" else shared_prefix + "b" * 40
+    )
+    digest_by_canonical = {
+        winner_manifest.canonical_bytes(): winner_digest,
+        loser_manifest.canonical_bytes(): loser_digest,
+        cross_manifest.canonical_bytes(): winner_digest,
+    }
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+    shared_key = "release-shared-scoped-key"
+    loser_key = "release-collision-loser"
+
+    winner = store.append_release(winner_manifest, idempotency_key=shared_key)
+    cross_scope = store.append_release(cross_manifest, idempotency_key=shared_key)
+    assert winner.release_id == cross_scope.release_id == f"rel_{shared_prefix}"
+    assert winner.content_hash == winner_digest
+    assert cross_scope.content_hash == winner_digest
+    before_collision = _release_graph_rows(database_path)
+    assert _release_graph_state(database_path) == (
+        (2, 3, 3, 3, 3, 2, 2, 2),
+        [],
+    )
+
+    _assert_sqlite_release_append_failure_is_read_only(
+        monkeypatch,
+        store,
+        database_path,
+        loser_manifest,
+        idempotency_key=loser_key,
+        error_type=ReleaseConflictError,
+        message=f"release ID collision for {winner.release_id!r}",
+    )
+    assert _release_graph_rows(database_path) == before_collision
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        loser_aliases = connection.execute(
+            "SELECT scope_id, release_id FROM memory_release_aliases "
+            "WHERE idempotency_key = ?",
+            (loser_key,),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert loser_aliases == []
+
+    loser_canonical = loser_manifest.canonical_bytes()
+    real_loser_digest = hashlib.sha256(loser_canonical).hexdigest()
+    assert real_loser_digest[:24] != shared_prefix
+    assert digest_by_canonical.pop(loser_canonical) == loser_digest
+    assert digest_by_canonical == {
+        winner_manifest.canonical_bytes(): winner_digest,
+        cross_manifest.canonical_bytes(): winner_digest,
+    }
+    recovered = store.append_release(loser_manifest, idempotency_key=loser_key)
+
+    assert recovered.release_id == f"rel_{real_loser_digest[:24]}"
+    assert recovered.content_hash == real_loser_digest
+    assert recovered.manifest == loser_manifest
+    assert store.append_release(loser_manifest, idempotency_key=loser_key) == recovered
+    assert store.get_release(first_scope, winner.release_id) == winner
+    assert store.get_release(second_scope, cross_scope.release_id) == cross_scope
+    assert store.list_releases(first_scope) == tuple(
+        sorted((winner, recovered), key=lambda release: release.release_id)
+    )
+    assert store.list_releases(second_scope) == (cross_scope,)
+    assert _release_graph_state(database_path) == (
+        (2, 3, 3, 3, 3, 3, 3, 3),
         [],
     )

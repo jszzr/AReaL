@@ -23,6 +23,7 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryPersistenceCorruptionError,
+    ReleaseConflictError,
     ReleaseNotFoundError,
     RevisionConflictError,
     RevisionNotFoundError,
@@ -1729,7 +1730,11 @@ class SQLiteMemoryStore:
                 else release_by_alias.get((scope_id, idempotency_key))
             )
             if existing is not None:
-                return existing
+                if existing.manifest.canonical_bytes() == canonical:
+                    return existing
+                raise ReleaseConflictError(
+                    "scoped release idempotency key already refers to different content"
+                )
 
             revisions: list[MemoryRevision] = []
             for revision_id in manifest.revision_ids:
@@ -1745,11 +1750,25 @@ class SQLiteMemoryStore:
                 revisions.append(revision)
             ordered_revisions = tuple(revisions)
 
+            memory_ids: set[str] = set()
+            for revision in ordered_revisions:
+                if revision.memory_id in memory_ids:
+                    raise ReleaseConflictError(
+                        "release contains more than one revision for memory_id "
+                        f"{revision.memory_id!r}"
+                    )
+                memory_ids.add(revision.memory_id)
+
             existing = (
                 None
                 if scope_id is None
                 else release_by_address.get((scope_id, release_id))
             )
+            if (
+                existing is not None
+                and existing.manifest.canonical_bytes() != canonical
+            ):
+                raise ReleaseConflictError(f"release ID collision for {release_id!r}")
             if existing is None:
                 if scope_id is None:
                     scope_id = _ensure_scope_id(cursor, manifest.scope)
