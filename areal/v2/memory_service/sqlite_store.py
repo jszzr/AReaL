@@ -137,6 +137,18 @@ def _find_evidence_id_by_idempotency_key(
     return row[0]
 
 
+def _evidence_sort_key(
+    record: EvidenceRecord,
+) -> tuple[str, str, int, datetime, str]:
+    return (
+        record.event.session_id,
+        record.event.run_id,
+        record.event.sequence_no,
+        record.event.observed_at,
+        record.evidence_id,
+    )
+
+
 class SQLiteMemoryStore:
     """Local durable backend for immutable Memory Service records."""
 
@@ -286,4 +298,4 @@ class SQLiteMemoryStore:
                         "evidence listing refers to a missing row"
                     )
                 records.append(record)
-            return tuple(records)
+            return tuple(sorted(records, key=_evidence_sort_key))

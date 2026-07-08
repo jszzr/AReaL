@@ -11,7 +11,7 @@ import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -637,6 +637,162 @@ def test_sqlite_evidence_missing_loader_result_routes_by_known_context(
         match="evidence listing refers to a missing row",
     ):
         store.list(event.scope)
+
+
+def test_sqlite_evidence_list_filters_and_uses_python_contract_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope("tenant-1", "assistant-memory", "ordered-user")
+    records = (
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-b",
+                run_id="run-a",
+                sequence_no=0,
+                idempotency_key="later-session",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-b",
+                sequence_no=0,
+                idempotency_key="later-run",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-a",
+                sequence_no=3,
+                observed_at=datetime(2020, 1, 1, tzinfo=UTC),
+                idempotency_key="later-sequence",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-a",
+                sequence_no=2,
+                payload="tie-b",
+                idempotency_key="tie-b",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-a",
+                sequence_no=1,
+                observed_at=datetime(2026, 7, 8, 4, 30, tzinfo=UTC),
+                idempotency_key="later-instant",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-a",
+                sequence_no=1,
+                observed_at=datetime(
+                    2026,
+                    7,
+                    8,
+                    12,
+                    0,
+                    tzinfo=timezone(timedelta(hours=8)),
+                ),
+                idempotency_key="earlier-instant",
+            )
+        ),
+        store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                session_id="session-a",
+                run_id="run-a",
+                sequence_no=2,
+                payload="tie-a",
+                idempotency_key="tie-a",
+            )
+        ),
+    )
+
+    real_connect = sqlite_backend._connect
+
+    class ReverseEvidenceRowsCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> ReverseEvidenceRowsCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            if self._last_sql.startswith(
+                "SELECT EVIDENCE_ID FROM MEMORY_EVIDENCE WHERE SCOPE_ID = ?"
+            ):
+                rows.reverse()
+            return rows
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class ReverseEvidenceRowsConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> ReverseEvidenceRowsCursor:
+            return ReverseEvidenceRowsCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> ReverseEvidenceRowsConnection:
+        return ReverseEvidenceRowsConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    expected = tuple(
+        sorted(
+            records,
+            key=lambda record: (
+                record.event.session_id,
+                record.event.run_id,
+                record.event.sequence_no,
+                record.event.observed_at,
+                record.evidence_id,
+            ),
+        )
+    )
+
+    assert store.list(scope) == expected
+    assert store.list(scope, session_id="session-a") == expected[:-1]
+    assert store.list(scope, run_id="run-a") == tuple(
+        record for record in expected if record.event.run_id == "run-a"
+    )
+    assert store.list(
+        scope,
+        session_id="session-a",
+        run_id="run-b",
+    ) == (records[1],)
 
 
 @pytest.mark.parametrize(
