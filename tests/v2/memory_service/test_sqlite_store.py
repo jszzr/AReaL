@@ -4,6 +4,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import multiprocessing
+import os
+import sqlite3
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+import areal.v2.memory_service._sqlite_backend as sqlite_backend
 from areal.v2.memory_service.errors import (
     MemoryPersistenceBusyError,
     MemoryPersistenceCorruptionError,
@@ -11,6 +24,319 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceSchemaError,
     MemoryServiceError,
 )
+from areal.v2.memory_service.types import MemoryScope
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.split()).upper()
+
+
+@dataclass(slots=True)
+class _SQLiteFailurePlan:
+    after_statement: str | None = None
+    after_occurrence: int = 1
+    after_statement_error: BaseException | None = None
+    after_statement_exit_code: int | None = None
+    after_statement_check: Callable[[str], None] | None = None
+    before_commit_error: BaseException | None = None
+    after_commit_error: BaseException | None = None
+    rollback_error: BaseException | None = None
+    close_error: BaseException | None = None
+    events: list[str] = field(default_factory=list)
+    _after_matches: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        actions = (
+            int(self.after_statement_error is not None)
+            + int(self.after_statement_exit_code is not None)
+            + int(self.after_statement_check is not None)
+        )
+        if (self.after_statement is None and actions != 0) or (
+            self.after_statement is not None and actions != 1
+        ):
+            raise ValueError(
+                "after_statement requires exactly one error, exit, or check action"
+            )
+        if type(self.after_occurrence) is not int or self.after_occurrence < 1:
+            raise ValueError("after_occurrence must be a positive integer")
+        if self.after_statement_exit_code is not None and (
+            type(self.after_statement_exit_code) is not int
+            or not 1 <= self.after_statement_exit_code <= 255
+        ):
+            raise ValueError("after_statement_exit_code must be between 1 and 255")
+        if self.before_commit_error is not None and self.after_commit_error is not None:
+            raise ValueError(
+                "before_commit_error and after_commit_error are mutually exclusive"
+            )
+        if self.after_statement is not None:
+            normalized = _normalize_sql(self.after_statement)
+            if not normalized:
+                raise ValueError("after_statement must not be blank")
+            self.after_statement = normalized
+
+    def before_execute(self, normalized_sql: str) -> None:
+        self.events.append(f"attempt:{normalized_sql}")
+        if normalized_sql == "COMMIT" and self.before_commit_error is not None:
+            error = self.before_commit_error
+            self.before_commit_error = None
+            self.events.append("fail-before:COMMIT")
+            raise error
+        if normalized_sql == "ROLLBACK" and self.rollback_error is not None:
+            error = self.rollback_error
+            self.rollback_error = None
+            self.events.append("fail-before:ROLLBACK")
+            raise error
+
+    def after_execute(self, normalized_sql: str) -> None:
+        self.events.append(f"executed:{normalized_sql}")
+        if normalized_sql == "COMMIT" and self.after_commit_error is not None:
+            error = self.after_commit_error
+            self.after_commit_error = None
+            self.events.append("fail-after:COMMIT")
+            raise error
+        if self.after_statement is None or self.after_statement not in normalized_sql:
+            return
+        self._after_matches += 1
+        if self._after_matches < self.after_occurrence:
+            return
+        if self.after_statement_check is not None:
+            # Checks are recurring probes from the threshold onward; error and exit
+            # actions remain one-shot at the exact selected occurrence.
+            self.after_statement_check(normalized_sql)
+            return
+        if self._after_matches != self.after_occurrence:
+            return
+        if self.after_statement_exit_code is not None:
+            os._exit(self.after_statement_exit_code)
+        assert self.after_statement_error is not None
+        error = self.after_statement_error
+        self.after_statement_error = None
+        self.events.append(f"fail-after:{normalized_sql}")
+        raise error
+
+
+class _FaultInjectingCursor:
+    def __init__(
+        self,
+        real_cursor: sqlite3.Cursor,
+        plan: _SQLiteFailurePlan,
+    ) -> None:
+        self._real_cursor = real_cursor
+        self._plan = plan
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _FaultInjectingCursor:
+        normalized = _normalize_sql(sql)
+        self._plan.before_execute(normalized)
+        self._real_cursor.execute(sql, parameters)
+        self._plan.after_execute(normalized)
+        return self
+
+    def executemany(
+        self,
+        sql: str,
+        parameters: object,
+    ) -> _FaultInjectingCursor:
+        normalized = _normalize_sql(sql)
+        self._plan.before_execute(normalized)
+        self._real_cursor.executemany(sql, parameters)
+        self._plan.after_execute(normalized)
+        return self
+
+    def __iter__(self) -> Any:
+        return iter(self._real_cursor)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_cursor, name)
+
+
+class _FaultInjectingConnection:
+    def __init__(
+        self,
+        real_connection: sqlite3.Connection,
+        plan: _SQLiteFailurePlan,
+    ) -> None:
+        self._real_connection = real_connection
+        self._plan = plan
+
+    def cursor(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _FaultInjectingCursor:
+        return _FaultInjectingCursor(
+            self._real_connection.cursor(*args, **kwargs),
+            self._plan,
+        )
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _FaultInjectingCursor:
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(
+        self,
+        sql: str,
+        parameters: object,
+    ) -> _FaultInjectingCursor:
+        return self.cursor().executemany(sql, parameters)
+
+    def close(self) -> None:
+        self._plan.events.append("attempt:CLOSE")
+        self._real_connection.close()
+        self._plan.events.append("executed:CLOSE")
+        if self._plan.close_error is not None:
+            error = self._plan.close_error
+            self._plan.close_error = None
+            self._plan.events.append("fail-after:CLOSE")
+            raise error
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_connection, name)
+
+
+class _ReadbackOverrideCursor:
+    def __init__(
+        self,
+        real_cursor: sqlite3.Cursor,
+        overrides: dict[str, tuple[object, ...]],
+    ) -> None:
+        self._real_cursor = real_cursor
+        self._overrides = overrides
+        self._last_sql = ""
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _ReadbackOverrideCursor:
+        self._last_sql = _normalize_sql(sql)
+        self._real_cursor.execute(sql, parameters)
+        return self
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        if self._last_sql in self._overrides:
+            return self._overrides[self._last_sql]
+        return self._real_cursor.fetchone()
+
+    def __iter__(self) -> Any:
+        return iter(self._real_cursor)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_cursor, name)
+
+
+class _ReadbackOverrideConnection:
+    def __init__(
+        self,
+        real_connection: sqlite3.Connection,
+        overrides: dict[str, tuple[object, ...]],
+    ) -> None:
+        self._real_connection = real_connection
+        self._overrides = overrides
+
+    def cursor(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _ReadbackOverrideCursor:
+        return _ReadbackOverrideCursor(
+            self._real_connection.cursor(*args, **kwargs),
+            self._overrides,
+        )
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _ReadbackOverrideCursor:
+        return self.cursor().execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_connection, name)
+
+
+def _install_sqlite_failure_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: _SQLiteFailurePlan,
+) -> None:
+    real_connect = sqlite_backend._connect
+
+    def connect(path: str) -> _FaultInjectingConnection:
+        return _FaultInjectingConnection(real_connect(path), plan)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+
+
+def _spawn_initialize_database(
+    database_path: str,
+    start_event: object,
+    result_queue: object,
+) -> None:
+    if not start_event.wait(timeout=10):  # type: ignore[attr-defined]
+        result_queue.put(("timeout", "start event"))  # type: ignore[attr-defined]
+        return
+    try:
+        sqlite_backend._initialize_database(database_path)
+    except BaseException as error:
+        result_queue.put((type(error).__name__, str(error)))  # type: ignore[attr-defined]
+    else:
+        result_queue.put(("ok", ""))  # type: ignore[attr-defined]
+
+
+def _spawn_crash_during_initialize(
+    database_path: str,
+    sql_marker: str,
+) -> None:
+    import areal.v2.memory_service._sqlite_backend as backend
+
+    real_connect = backend._connect
+    plan = _SQLiteFailurePlan(
+        after_statement=sql_marker,
+        after_statement_exit_code=24,
+    )
+
+    def crashing_connect(path: str) -> _FaultInjectingConnection:
+        return _FaultInjectingConnection(real_connect(path), plan)
+
+    backend._connect = crashing_connect
+    backend._initialize_database(database_path)
+
+
+_SCOPE_INSERT_SQL = """
+INSERT INTO memory_scopes (
+    scope_id,
+    tenant_id,
+    namespace,
+    subject_id
+) VALUES (?, ?, ?, ?)
+"""
+
+
+def _insert_test_scope(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(
+        _SCOPE_INSERT_SQL,
+        (1, "tenant-1", "assistant-memory", "user-1"),
+    )
+
+
+def _read_test_scopes(database_path: str) -> list[tuple[object, ...]]:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        return [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT scope_id, tenant_id, namespace, subject_id "
+                "FROM memory_scopes ORDER BY scope_id"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
 
 
 def test_persistence_errors_have_one_narrow_hierarchy() -> None:
@@ -27,3 +353,1080 @@ def test_persistence_errors_have_one_narrow_hierarchy() -> None:
         MemoryPersistenceCorruptionError,
         MemoryPersistenceSchemaError,
     )
+
+
+def test_database_path_snapshots_one_string_valued_path_like(
+    tmp_path: Path,
+) -> None:
+    class OneShotPath:
+        calls = 0
+
+        def __fspath__(self) -> str:
+            self.calls += 1
+            if self.calls != 1:
+                raise AssertionError("path-like object was evaluated twice")
+            return str(tmp_path / "memory.sqlite3")
+
+    source = OneShotPath()
+    result = sqlite_backend._snapshot_database_path(source)
+    assert source.calls == 1
+    assert type(result) is str
+    assert result == os.path.abspath(tmp_path / "memory.sqlite3")
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type", "message"),
+    [
+        (b"memory.sqlite3", TypeError, "string-valued"),
+        ("", ValueError, "must not be blank"),
+        (" \t\n", ValueError, "must not be blank"),
+        ("bad\x00path", ValueError, "must not contain NUL"),
+        ("\ud800", ValueError, "must be valid UTF-8"),
+        (":memory:", ValueError, "durable database file"),
+    ],
+)
+def test_database_path_rejects_non_durable_values(
+    value: object,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error_type, match=message):
+        sqlite_backend._snapshot_database_path(value)  # type: ignore[arg-type]
+
+
+def test_relative_path_is_bound_to_constructor_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(first)
+    path = sqlite_backend._snapshot_database_path("memory.sqlite3")
+    monkeypatch.chdir(second)
+    sqlite_backend._initialize_database(path)
+    assert (first / "memory.sqlite3").is_file()
+    assert not (second / "memory.sqlite3").exists()
+
+
+def test_runtime_floor_is_checked_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 7, 16))
+    with pytest.raises(MemoryPersistenceSchemaError, match="3[.]7[.]17"):
+        sqlite_backend._initialize_database(str(tmp_path / "memory.sqlite3"))
+    assert not (tmp_path / "memory.sqlite3").exists()
+
+
+def test_new_database_has_exact_v1_header_catalog_and_metadata(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(path)
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA application_id").fetchone() == (
+            sqlite_backend._APPLICATION_ID,
+        )
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            sqlite_backend._SCHEMA_VERSION,
+        )
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            )
+        }
+        assert len(sqlite_backend._SCHEMA_DDL) == 11
+        assert names == (
+            sqlite_backend._REQUIRED_TABLES | sqlite_backend._REQUIRED_INDEXES
+        )
+        assert connection.execute(
+            "SELECT schema_spec_hash, schema_catalog_hash "
+            "FROM memory_schema_metadata WHERE singleton = 1"
+        ).fetchone() == (
+            sqlite_backend._SCHEMA_SPEC_HASH,
+            sqlite_backend._catalog_hash(connection.cursor()),
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_schema_spec_hash_covers_ordered_exact_ddl() -> None:
+    encoded = json.dumps(
+        sqlite_backend._SCHEMA_DDL,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert hashlib.sha256(encoded).hexdigest() == sqlite_backend._SCHEMA_SPEC_HASH
+
+    reordered = list(sqlite_backend._SCHEMA_DDL)
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    reordered_hash = hashlib.sha256(
+        json.dumps(
+            reordered,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert reordered_hash != sqlite_backend._SCHEMA_SPEC_HASH
+
+
+def test_catalog_hash_excludes_autoindexes_and_detects_extra_objects(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(path)
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        cursor = connection.cursor()
+        before = sqlite_backend._catalog_hash(cursor)
+        rows = sqlite_backend._catalog_rows(cursor)
+        assert not any(row[1].startswith("sqlite_") for row in rows)
+        connection.execute(
+            "CREATE VIEW unexpected_memory_view AS SELECT scope_id FROM memory_scopes"
+        )
+        assert sqlite_backend._catalog_hash(cursor) != before
+    finally:
+        connection.close()
+
+
+def test_transaction_post_statement_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected post-statement failure")
+    plan = _SQLiteFailurePlan(
+        after_statement="INSERT INTO memory_scopes",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        with sqlite_backend._write_transaction(database_path) as cursor:
+            _insert_test_scope(cursor)
+
+    assert raised.value.__cause__ is injected
+    assert _read_test_scopes(database_path) == []
+    assert any(
+        event.startswith("executed:INSERT INTO MEMORY_SCOPES") for event in plan.events
+    )
+    assert "executed:ROLLBACK" in plan.events
+    assert "executed:CLOSE" in plan.events
+
+
+def test_write_begin_ack_failure_rolls_back_closes_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected BEGIN acknowledgement failure")
+    plan = _SQLiteFailurePlan(
+        after_statement="BEGIN IMMEDIATE",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        with sqlite_backend._write_transaction(database_path):
+            raise AssertionError("transaction body must not run")
+
+    assert raised.value.__cause__ is injected
+    assert "executed:BEGIN IMMEDIATE" in plan.events
+    assert "executed:ROLLBACK" in plan.events
+    assert "executed:CLOSE" in plan.events
+
+    with sqlite_backend._write_transaction(database_path) as cursor:
+        _insert_test_scope(cursor)
+    assert _read_test_scopes(database_path) == [
+        (1, "tenant-1", "assistant-memory", "user-1")
+    ]
+
+
+def test_initializer_begin_ack_failure_rolls_back_closes_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    injected = sqlite3.OperationalError("injected BEGIN acknowledgement failure")
+    plan = _SQLiteFailurePlan(
+        after_statement="BEGIN EXCLUSIVE",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        sqlite_backend._initialize_database(database_path)
+
+    assert raised.value.__cause__ is injected
+    assert "executed:BEGIN EXCLUSIVE" in plan.events
+    assert "executed:ROLLBACK" in plan.events
+    assert "executed:CLOSE" in plan.events
+
+    sqlite_backend._initialize_database(database_path)
+
+
+def test_initializer_real_commit_followed_by_ack_failure_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    injected = sqlite3.OperationalError("injected acknowledgement failure")
+    plan = _SQLiteFailurePlan(after_commit_error=injected)
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        sqlite_backend._initialize_database(database_path)
+
+    assert raised.value.__cause__ is injected
+    assert "executed:COMMIT" in plan.events
+    assert "fail-after:COMMIT" in plan.events
+    assert "attempt:ROLLBACK" in plan.events
+    assert "executed:ROLLBACK" not in plan.events
+    assert "executed:CLOSE" in plan.events
+
+    sqlite_backend._initialize_database(database_path)
+
+
+def test_transaction_pre_commit_failure_rolls_back_and_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected failure before real commit")
+    plan = _SQLiteFailurePlan(before_commit_error=injected)
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        with sqlite_backend._write_transaction(database_path) as cursor:
+            _insert_test_scope(cursor)
+
+    assert raised.value.__cause__ is injected
+    assert "fail-before:COMMIT" in plan.events
+    assert "executed:COMMIT" not in plan.events
+    assert "executed:ROLLBACK" in plan.events
+    assert _read_test_scopes(database_path) == []
+
+    with sqlite_backend._write_transaction(database_path) as cursor:
+        _insert_test_scope(cursor)
+
+    assert _read_test_scopes(database_path) == [
+        (1, "tenant-1", "assistant-memory", "user-1")
+    ]
+
+
+def test_transaction_real_commit_followed_by_ack_failure_preserves_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected acknowledgement failure")
+    plan = _SQLiteFailurePlan(after_commit_error=injected)
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        with sqlite_backend._write_transaction(database_path) as cursor:
+            _insert_test_scope(cursor)
+
+    assert raised.value.__cause__ is injected
+    assert "executed:COMMIT" in plan.events
+    assert "fail-after:COMMIT" in plan.events
+    assert "attempt:ROLLBACK" in plan.events
+    assert "executed:ROLLBACK" not in plan.events
+    assert "executed:CLOSE" in plan.events
+    assert _read_test_scopes(database_path) == [
+        (1, "tenant-1", "assistant-memory", "user-1")
+    ]
+
+    with sqlite_backend._write_transaction(database_path) as cursor:
+        existing = cursor.execute(
+            "SELECT scope_id FROM memory_scopes "
+            "WHERE tenant_id = ? AND namespace = ? AND subject_id = ?",
+            ("tenant-1", "assistant-memory", "user-1"),
+        ).fetchone()
+        if existing is None:
+            _insert_test_scope(cursor)
+        else:
+            assert existing == (1,)
+
+    assert _read_test_scopes(database_path) == [
+        (1, "tenant-1", "assistant-memory", "user-1")
+    ]
+
+
+def test_transaction_cleanup_failures_do_not_mask_body_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    original = RuntimeError("body failed")
+    plan = _SQLiteFailurePlan(
+        rollback_error=sqlite3.OperationalError(
+            "cannot rollback - no transaction is active"
+        ),
+        close_error=sqlite3.OperationalError("injected close failure"),
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(RuntimeError) as raised:
+        with sqlite_backend._write_transaction(database_path) as cursor:
+            _insert_test_scope(cursor)
+            raise original
+
+    assert raised.value is original
+    assert "fail-before:ROLLBACK" in plan.events
+    assert "executed:CLOSE" in plan.events
+    assert "fail-after:CLOSE" in plan.events
+    assert _read_test_scopes(database_path) == []
+    assert any("ROLLBACK cleanup failed" in note for note in original.__notes__)
+    assert any("close cleanup failed" in note for note in original.__notes__)
+
+
+def test_transaction_close_failure_after_success_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected close failure")
+    plan = _SQLiteFailurePlan(close_error=injected)
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        with sqlite_backend._write_transaction(database_path) as cursor:
+            _insert_test_scope(cursor)
+
+    assert raised.value.__cause__ is injected
+    assert "executed:COMMIT" in plan.events
+    assert "executed:CLOSE" in plan.events
+    assert _read_test_scopes(database_path) == [
+        (1, "tenant-1", "assistant-memory", "user-1")
+    ]
+
+
+def test_write_transaction_uses_begin_immediate(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    statements: list[str] = []
+    real_connect = sqlite_backend._connect
+
+    def connect(path: str) -> sqlite3.Connection:
+        connection = real_connect(path)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(sqlite_backend, "_connect", connect)
+        with sqlite_backend._write_transaction(database_path):
+            pass
+
+    normalized = [_normalize_sql(statement) for statement in statements]
+    assert normalized[0] == "BEGIN IMMEDIATE"
+    assert normalized[-1] == "COMMIT"
+
+
+def test_read_transaction_locks_catalog_before_second_journal_check(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    statements: list[str] = []
+    real_connect = sqlite_backend._connect
+
+    def connect(path: str) -> sqlite3.Connection:
+        connection = real_connect(path)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(sqlite_backend, "_connect", connect)
+        with sqlite_backend._read_transaction(database_path):
+            pass
+
+    normalized = [_normalize_sql(statement) for statement in statements]
+    begin = normalized.index("BEGIN")
+    catalog_lock = normalized.index("SELECT NAME FROM MAIN.SQLITE_MASTER LIMIT 1")
+    journal = normalized.index("PRAGMA JOURNAL_MODE")
+    schema_validation = normalized.index("PRAGMA APPLICATION_ID")
+    assert begin < catalog_lock < journal < schema_validation
+    assert normalized[-1] == "COMMIT"
+
+
+def test_initializer_uses_begin_exclusive_without_executescript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    statements: list[str] = []
+    real_sqlite_connect = sqlite3.connect
+
+    class NoScriptConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def executescript(self, _script: str) -> None:
+            raise AssertionError("executescript must not be used")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(*args: object, **kwargs: object) -> NoScriptConnection:
+        connection = real_sqlite_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return NoScriptConnection(connection)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    sqlite_backend._initialize_database(database_path)
+
+    normalized = [_normalize_sql(statement) for statement in statements]
+    assert "BEGIN EXCLUSIVE" in normalized
+    assert normalized.index("PRAGMA APPLICATION_ID = 1095912787") < normalized.index(
+        "PRAGMA USER_VERSION = 1"
+    )
+    assert normalized[-1] == "COMMIT"
+
+
+def test_interrupted_initialization_rolls_back_every_boundary(
+    tmp_path: Path,
+) -> None:
+    markers = [
+        _normalize_sql(statement).split(" (")[0]
+        for statement in sqlite_backend._SCHEMA_DDL
+    ] + [
+        "INSERT INTO memory_schema_metadata",
+        "PRAGMA application_id = 1095912787",
+        "PRAGMA user_version = 1",
+    ]
+
+    for index, marker in enumerate(markers):
+        database_path = str(tmp_path / f"interrupted-{index}.sqlite3")
+        injected = sqlite3.OperationalError(f"interrupted after {marker}")
+        plan = _SQLiteFailurePlan(
+            after_statement=marker,
+            after_statement_error=injected,
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            _install_sqlite_failure_proxy(monkeypatch, plan)
+            with pytest.raises(MemoryPersistenceError) as raised:
+                sqlite_backend._initialize_database(database_path)
+        assert raised.value.__cause__ is injected
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            assert connection.execute("PRAGMA application_id").fetchone() == (0,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+            assert (
+                connection.execute(
+                    "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+                ).fetchall()
+                == []
+            )
+        finally:
+            connection.close()
+
+        sqlite_backend._initialize_database(database_path)
+
+
+def test_two_initializers_converge(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_spawn_initialize_database,
+            args=(database_path, start_event, result_queue),
+        )
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        assert all(process.is_alive() for process in processes)
+        start_event.set()
+        results = [result_queue.get(timeout=10) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+        assert results == [("ok", ""), ("ok", "")]
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        start_event.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=2)
+            process.close()
+        result_queue.close()
+        result_queue.join_thread()
+
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA application_id").fetchone() == (
+            sqlite_backend._APPLICATION_ID,
+        )
+        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT schema_catalog_hash FROM memory_schema_metadata"
+        ).fetchone() == (sqlite_backend._catalog_hash(connection.cursor()),)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "sql_marker",
+    [
+        "CREATE TABLE memory_revisions",
+        "PRAGMA application_id = 1095912787",
+        "PRAGMA user_version = 1",
+    ],
+    ids=["ddl", "application-id", "user-version"],
+)
+def test_initializer_process_death_leaves_reinitializable_state(
+    tmp_path: Path,
+    sql_marker: str,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_spawn_crash_during_initialize,
+        args=(database_path, sql_marker),
+    )
+    try:
+        process.start()
+        process.join(timeout=10)
+        assert process.exitcode == 24
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        process.close()
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA application_id").fetchone() == (0,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert (
+            connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+    sqlite_backend._initialize_database(database_path)
+
+
+def test_configuration_queries_delete_mode_without_assigning_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    sqlite_backend._initialize_database(database_path)
+
+    normalized = [_normalize_sql(statement) for statement in statements]
+    assert normalized.count("PRAGMA JOURNAL_MODE") >= 2
+    first_journal_query = normalized.index("PRAGMA JOURNAL_MODE")
+    first_configuration_write = min(
+        normalized.index("PRAGMA FOREIGN_KEYS = ON"),
+        normalized.index("PRAGMA BUSY_TIMEOUT = 5000"),
+        normalized.index("PRAGMA SYNCHRONOUS = FULL"),
+    )
+    assert first_journal_query < first_configuration_write
+    assert not any(
+        statement.startswith("PRAGMA JOURNAL_MODE") and "=" in statement
+        for statement in normalized
+    )
+
+
+@pytest.mark.parametrize(
+    ("pragma", "bad_value", "message"),
+    [
+        ("PRAGMA JOURNAL_MODE", ("wal",), "DELETE journal"),
+        ("PRAGMA FOREIGN_KEYS", (0,), "foreign_keys"),
+        ("PRAGMA BUSY_TIMEOUT", (1,), "busy_timeout"),
+        ("PRAGMA SYNCHRONOUS", (1,), "synchronous"),
+    ],
+)
+def test_bad_pragma_readback_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pragma: str,
+    bad_value: tuple[object, ...],
+    message: str,
+) -> None:
+    database_path = str(tmp_path / f"{pragma.split()[-1].lower()}.sqlite3")
+    real_connect = sqlite3.connect
+
+    def connect(*args: object, **kwargs: object) -> _ReadbackOverrideConnection:
+        return _ReadbackOverrideConnection(
+            real_connect(*args, **kwargs),
+            {pragma: bad_value},
+        )
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    with pytest.raises(MemoryPersistenceSchemaError, match=message):
+        sqlite_backend._initialize_database(database_path)
+
+
+def test_vacuumed_empty_v0_database_is_not_adopted(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "vacuumed.sqlite3")
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute("VACUUM")
+        assert connection.execute("PRAGMA page_count").fetchone() == (1,)
+        assert connection.execute("PRAGMA application_id").fetchone() == (0,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert connection.execute("PRAGMA schema_version").fetchone() != (0,)
+        assert (
+            connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="empty v0"):
+        sqlite_backend._initialize_database(database_path)
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA page_count").fetchone() == (1,)
+        assert connection.execute("PRAGMA application_id").fetchone() == (0,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert (
+            connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+
+def test_locked_schema_version_rejects_vacuum_between_probe_and_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "raced-vacuum.sqlite3")
+    real_connect = sqlite_backend._connect
+    vacuum_calls = 0
+
+    class VacuumAfterFetchCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> VacuumAfterFetchCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            nonlocal vacuum_calls
+            row = self._real_cursor.fetchone()
+            if self._last_sql == "PRAGMA PAGE_COUNT":
+                assert self._real_cursor.fetchone() is None
+                connection = sqlite3.connect(database_path, isolation_level=None)
+                try:
+                    connection.execute("VACUUM")
+                finally:
+                    connection.close()
+                vacuum_calls += 1
+            return row
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class VacuumAfterFetchConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(self) -> VacuumAfterFetchCursor:
+            return VacuumAfterFetchCursor(self._real_connection.cursor())
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> VacuumAfterFetchConnection:
+        return VacuumAfterFetchConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="empty v0"):
+        sqlite_backend._initialize_database(database_path)
+
+    assert vacuum_calls == 1
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA page_count").fetchone() == (1,)
+        assert connection.execute("PRAGMA schema_version").fetchone() != (0,)
+        assert connection.execute("PRAGMA application_id").fetchone() == (0,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert (
+            connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+
+def test_nonempty_v0_database_is_not_adopted(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "foreign.sqlite3")
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute("CREATE TABLE unrelated(value TEXT)")
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="empty v0"):
+        sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+        ).fetchall() == [("unrelated",)]
+    finally:
+        connection.close()
+
+
+def test_wrong_application_id_is_rejected(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA application_id = 17")
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="application_id"):
+        sqlite_backend._initialize_database(database_path)
+
+
+@pytest.mark.parametrize("version", [2, 2**31 - 1])
+def test_unknown_schema_version_is_rejected(tmp_path: Path, version: int) -> None:
+    database_path = str(tmp_path / f"memory-{version}.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(f"PRAGMA user_version = {version}")
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="user_version"):
+        sqlite_backend._initialize_database(database_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "DROP TABLE memory_release_aliases",
+        "DROP INDEX idx_memory_revisions_sort",
+        "CREATE VIEW unexpected_memory_view AS SELECT scope_id FROM memory_scopes",
+    ],
+)
+def test_catalog_drift_is_rejected(tmp_path: Path, mutation: str) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(mutation)
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="catalog"):
+        sqlite_backend._initialize_database(database_path)
+
+
+def test_changed_metadata_hash_is_rejected(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE memory_schema_metadata SET schema_spec_hash = ?",
+            ("0" * 64,),
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="specification"):
+        sqlite_backend._initialize_database(database_path)
+
+
+def test_changed_metadata_table_shape_is_reported_as_schema_error(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute("DROP TABLE memory_schema_metadata")
+        connection.execute(
+            "CREATE TABLE memory_schema_metadata (singleton INTEGER PRIMARY KEY)"
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="metadata"):
+        sqlite_backend._initialize_database(database_path)
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_type"),
+    [
+        (sqlite3.SQLITE_BUSY, MemoryPersistenceBusyError),
+        (sqlite3.SQLITE_IOERR, MemoryPersistenceError),
+    ],
+)
+def test_metadata_read_sqlite_failures_keep_operational_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: int,
+    expected_type: type[MemoryPersistenceError],
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    injected = sqlite3.OperationalError("injected metadata read failure")
+    injected.sqlite_errorcode = error_code
+    plan = _SQLiteFailurePlan(
+        after_statement="SELECT * FROM memory_schema_metadata",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        sqlite_backend._initialize_database(database_path)
+
+    assert type(raised.value) is expected_type
+    assert raised.value.__cause__ is injected
+
+
+def test_foreign_key_damage_is_reported_as_corruption(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+        connection.execute(
+            "INSERT INTO memory_candidate_evidence "
+            "(scope_id, candidate_id, position, evidence_id) VALUES (?, ?, ?, ?)",
+            (1, "missing-candidate", 0, "missing-evidence"),
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceCorruptionError, match="foreign key"):
+        sqlite_backend._initialize_database(database_path)
+
+
+def test_empty_wal_database_is_rejected_without_conversion(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "empty-wal.sqlite3")
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+        connection.execute("CREATE TABLE temporary_table(value TEXT)")
+        connection.execute("DROP TABLE temporary_table")
+        assert (
+            connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="DELETE journal"):
+        sqlite_backend._initialize_database(database_path)
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    finally:
+        connection.close()
+
+
+def test_v1_switched_to_wal_is_rejected_without_conversion(tmp_path: Path) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceSchemaError, match="DELETE journal"):
+        sqlite_backend._initialize_database(database_path)
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("error_code", [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED])
+def test_sqlite_busy_and_locked_primary_codes_map_to_busy(
+    error_code: int,
+) -> None:
+    error = sqlite3.OperationalError("database unavailable")
+    error.sqlite_errorcode = error_code | (7 << 8)
+    mapped = sqlite_backend._map_sqlite_error(error)
+    assert type(mapped) is MemoryPersistenceBusyError
+
+
+def test_other_sqlite_errors_map_to_general_persistence_error() -> None:
+    error = sqlite3.OperationalError("disk I/O error")
+    error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+    mapped = sqlite_backend._map_sqlite_error(error)
+    assert type(mapped) is MemoryPersistenceError
+    assert not isinstance(mapped, MemoryPersistenceBusyError)
+
+
+def test_record_and_alias_hashes_match_golden_wire_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[bytes] = []
+    real_sha256 = hashlib.sha256
+
+    def capture(payload: bytes) -> Any:
+        seen.append(payload)
+        return real_sha256(payload)
+
+    monkeypatch.setattr(sqlite_backend, "_RECORD_SHA256", capture)
+    scope = MemoryScope("tenant-1", "assistant-memory", "user-1")
+
+    assert (
+        sqlite_backend._record_storage_hash(
+            record_kind="evidence",
+            scope=scope,
+            record_id="evd_a",
+            content_hash="a" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+        )
+        == "2b8b502e8b9ac8367f01ed63102cd9efd9d976de1494e26a1628a4dd361d08ae"
+    )
+    assert (
+        sqlite_backend._record_storage_hash(
+            record_kind="revision",
+            scope=scope,
+            record_id="rev_a",
+            content_hash="b" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+            memory_id="mem_a",
+            generation=7,
+        )
+        == "540a7bddb3093f79dd1f34782c7679942b285bece6ba32702b1c404a29a2cbac"
+    )
+    assert (
+        sqlite_backend._release_binding_hash(
+            scope=scope,
+            idempotency_key="alias-a",
+            release_id="rel_a",
+        )
+        == "f61c2a3ef34cfe876c675f843c18508e7134c64b3fed251e48ad9885459e71aa"
+    )
+
+    assert seen == [
+        b'{"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"2026-07-08T00:00:00+00:00","record_id":"evd_a","record_kind":"evidence","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"content_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created_at":"2026-07-08T00:00:00+00:00","generation":7,"memory_id":"mem_a","record_id":"rev_a","record_kind":"revision","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"idempotency_key":"alias-a","record_kind":"release_alias","release_id":"rel_a","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+    ]
+
+
+@pytest.mark.parametrize("record_kind", ["evidence", "candidate", "release"])
+def test_nonrevision_storage_hash_rejects_revision_binding_fields(
+    record_kind: str,
+) -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "user-1")
+    with pytest.raises(ValueError, match="revision"):
+        sqlite_backend._record_storage_hash(
+            record_kind=record_kind,
+            scope=scope,
+            record_id="record-a",
+            content_hash="a" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+            memory_id="mem-a",
+            generation=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("memory_id", "generation"),
+    [(None, None), ("mem-a", None), (None, 1)],
+)
+def test_revision_storage_hash_requires_both_binding_fields(
+    memory_id: str | None,
+    generation: int | None,
+) -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "user-1")
+    with pytest.raises(ValueError, match="revision"):
+        sqlite_backend._record_storage_hash(
+            record_kind="revision",
+            scope=scope,
+            record_id="rev-a",
+            content_hash="a" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+            memory_id=memory_id,
+            generation=generation,
+        )
+
+
+def test_schema_and_record_hash_injection_seams_are_separate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    sqlite_backend._initialize_database(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "user-1")
+
+    def schema_hash_must_not_run(_payload: bytes) -> Any:
+        raise AssertionError("record hashing used the schema hash seam")
+
+    monkeypatch.setattr(sqlite_backend, "_SCHEMA_SHA256", schema_hash_must_not_run)
+    sqlite_backend._record_storage_hash(
+        record_kind="evidence",
+        scope=scope,
+        record_id="evd-a",
+        content_hash="a" * 64,
+        created_at_text="2026-07-08T00:00:00+00:00",
+    )
+
+    monkeypatch.undo()
+
+    def record_hash_must_not_run(_payload: bytes) -> Any:
+        raise AssertionError("schema hashing used the record hash seam")
+
+    monkeypatch.setattr(sqlite_backend, "_RECORD_SHA256", record_hash_must_not_run)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        sqlite_backend._catalog_hash(connection.cursor())
+    finally:
+        connection.close()
