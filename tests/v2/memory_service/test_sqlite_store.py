@@ -11,13 +11,16 @@ import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import areal.v2.memory_service._sqlite_backend as sqlite_backend
+import areal.v2.memory_service.sqlite_store as sqlite_store_module
 from areal.v2.memory_service.errors import (
+    EvidenceNotFoundError,
     MemoryPersistenceBusyError,
     MemoryPersistenceCorruptionError,
     MemoryPersistenceError,
@@ -25,7 +28,11 @@ from areal.v2.memory_service.errors import (
     MemoryServiceError,
 )
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
-from areal.v2.memory_service.types import MemoryScope
+from areal.v2.memory_service.types import (
+    EvidenceEvent,
+    EvidenceKind,
+    MemoryScope,
+)
 
 
 def _normalize_sql(sql: str) -> str:
@@ -340,6 +347,59 @@ def _read_test_scopes(database_path: str) -> list[tuple[object, ...]]:
         connection.close()
 
 
+_EVIDENCE_INSTANT = datetime(2026, 7, 8, 1, 2, 3, 456000, tzinfo=UTC)
+
+
+def _make_sqlite_evidence(**overrides: object) -> EvidenceEvent:
+    values: dict[str, object] = {
+        "scope": MemoryScope("tenant-1", "assistant-memory", "user-1"),
+        "session_id": "session-1",
+        "run_id": "run-1",
+        "sequence_no": 0,
+        "kind": EvidenceKind.USER_MESSAGE,
+        "payload": "hello, 世界",
+        "observed_at": _EVIDENCE_INSTANT,
+        "idempotency_key": "evidence-request-1",
+    }
+    values.update(overrides)
+    return EvidenceEvent(**values)  # type: ignore[arg-type]
+
+
+class _SQLiteMemoryScopeSubclass(MemoryScope):
+    pass
+
+
+class _SQLiteEvidenceEventSubclass(EvidenceEvent):
+    pass
+
+
+class _SnapshotProbeStr(str):
+    override_calls: int
+
+    def __new__(cls, value: str) -> _SnapshotProbeStr:
+        instance = str.__new__(cls, value)
+        instance.override_calls = 0
+        return instance
+
+    def __str__(self) -> str:
+        self.override_calls += 1
+        return "overridden"
+
+    def strip(self, chars: str | None = None) -> str:
+        self.override_calls += 1
+        return ""
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        self.override_calls += 1
+        return b"overridden"
+
+    def __eq__(self, other: object) -> bool:
+        self.override_calls += 1
+        return False
+
+    __hash__ = str.__hash__
+
+
 def test_persistence_errors_have_one_narrow_hierarchy() -> None:
     assert MemoryPersistenceError.__bases__ == (MemoryServiceError,)
     assert MemoryPersistenceBusyError.__bases__ == (MemoryPersistenceError,)
@@ -404,6 +464,86 @@ def test_sqlite_store_constructor_snapshots_path_once_and_survives_chdir(
     assert reopened._database_path == store._database_path
     assert (first_directory / "memory.sqlite3").is_file()
     assert not (second_directory / "memory.sqlite3").exists()
+
+
+def test_sqlite_evidence_round_trip_retry_and_reopen_preserve_record(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "memory.sqlite3"
+    event = _make_sqlite_evidence()
+    first_store = SQLiteMemoryStore(database_path)
+
+    original = first_store.append(event)
+    del first_store
+    reopened = SQLiteMemoryStore(database_path)
+    loaded = reopened.get(event.scope, original.evidence_id)
+    retry = reopened.append(_make_sqlite_evidence())
+
+    expected_hash = hashlib.sha256(event.canonical_bytes()).hexdigest()
+    assert original.event == event
+    assert original.event is not event
+    assert loaded == original
+    assert retry == original
+    assert loaded is not original
+    assert retry is not original
+    assert loaded.event.canonical_bytes() == event.canonical_bytes()
+    assert original.content_hash == expected_hash
+    assert original.evidence_id == f"evd_{expected_hash[:24]}"
+    assert loaded.created_at == original.created_at == retry.created_at
+    assert original.created_at.tzinfo is UTC
+
+
+def test_sqlite_evidence_exact_input_boundaries_snapshot_before_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    event = _make_sqlite_evidence()
+    subclass_event = _SQLiteEvidenceEventSubclass(
+        scope=event.scope,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        sequence_no=event.sequence_no,
+        kind=event.kind,
+        payload=event.payload,
+        observed_at=event.observed_at,
+        idempotency_key=event.idempotency_key,
+    )
+
+    record = store.append(event)
+    query_id = _SnapshotProbeStr(record.evidence_id)
+    assert store.get(event.scope, query_id) == record
+    assert query_id.override_calls == 0
+    for missing_id in ("", " \t", "\x00"):
+        with pytest.raises(EvidenceNotFoundError) as raised:
+            store.get(event.scope, missing_id)
+        assert str(raised.value) == f"evidence {missing_id!r} was not found"
+
+    subclass_scope = _SQLiteMemoryScopeSubclass(
+        event.scope.tenant_id,
+        event.scope.namespace,
+        event.scope.subject_id,
+    )
+
+    def transaction_must_not_start(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validation reached SQLite I/O")
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_write_transaction",
+        transaction_must_not_start,
+    )
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_read_transaction",
+        transaction_must_not_start,
+    )
+    with pytest.raises(TypeError, match="event must be an EvidenceEvent"):
+        store.append(subclass_event)
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.get(subclass_scope, "\ud800")
+    with pytest.raises(ValueError, match="evidence_id must be valid UTF-8"):
+        store.get(event.scope, "\ud800")
 
 
 @pytest.mark.parametrize(
