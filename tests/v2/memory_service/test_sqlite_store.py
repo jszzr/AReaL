@@ -24,6 +24,7 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceSchemaError,
     MemoryServiceError,
 )
+from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 from areal.v2.memory_service.types import MemoryScope
 
 
@@ -372,6 +373,37 @@ def test_database_path_snapshots_one_string_valued_path_like(
     assert source.calls == 1
     assert type(result) is str
     assert result == os.path.abspath(tmp_path / "memory.sqlite3")
+
+
+def test_sqlite_store_constructor_snapshots_path_once_and_survives_chdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_directory = tmp_path / "first"
+    second_directory = tmp_path / "second"
+    first_directory.mkdir()
+    second_directory.mkdir()
+
+    class OneShotPath:
+        calls = 0
+
+        def __fspath__(self) -> str:
+            self.calls += 1
+            if self.calls != 1:
+                raise AssertionError("database path was evaluated more than once")
+            return "memory.sqlite3"
+
+    source = OneShotPath()
+    monkeypatch.chdir(first_directory)
+    store = SQLiteMemoryStore(source)
+    monkeypatch.chdir(second_directory)
+    reopened = SQLiteMemoryStore(first_directory / "memory.sqlite3")
+
+    assert source.calls == 1
+    assert store._database_path == str(first_directory / "memory.sqlite3")
+    assert reopened._database_path == store._database_path
+    assert (first_directory / "memory.sqlite3").is_file()
+    assert not (second_directory / "memory.sqlite3").exists()
 
 
 @pytest.mark.parametrize(
