@@ -869,6 +869,12 @@ def test_sqlite_evidence_collision_is_scoped_atomic_and_loser_key_reusable(
         payload="loser",
         idempotency_key="loser-key",
     )
+    replacement_event = _make_sqlite_evidence(
+        scope=first_scope,
+        payload="replacement",
+        idempotency_key="loser-key",
+    )
+    assert replacement_event.canonical_bytes() != loser_event.canonical_bytes()
     cross_scope_event = _make_sqlite_evidence(
         scope=second_scope,
         payload="cross scope",
@@ -884,6 +890,7 @@ def test_sqlite_evidence_collision_is_scoped_atomic_and_loser_key_reusable(
     digest_by_canonical = {
         first_event.canonical_bytes(): first_digest,
         loser_event.canonical_bytes(): loser_digest,
+        replacement_event.canonical_bytes(): "d" * 64,
         cross_scope_event.canonical_bytes(): first_digest,
     }
 
@@ -915,10 +922,15 @@ def test_sqlite_evidence_collision_is_scoped_atomic_and_loser_key_reusable(
 
     cross_scope = store.append(cross_scope_event)
     assert cross_scope.evidence_id == original.evidence_id
-    digest_by_canonical[loser_event.canonical_bytes()] = "d" * 64
-    recovered_loser = store.append(loser_event)
+    recovered_loser = store.append(replacement_event)
 
     assert recovered_loser.evidence_id == f"evd_{'d' * 24}"
+    assert recovered_loser.event == replacement_event
+    with pytest.raises(EvidenceConflictError) as retry_error:
+        store.append(loser_event)
+    assert str(retry_error.value) == (
+        "scoped idempotency key already refers to different evidence"
+    )
     assert store.get(first_scope, original.evidence_id) == original
     assert store.get(second_scope, cross_scope.evidence_id) == cross_scope
     assert {record.event.idempotency_key for record in store.list(first_scope)} == {
@@ -926,6 +938,7 @@ def test_sqlite_evidence_collision_is_scoped_atomic_and_loser_key_reusable(
         "loser-key",
     }
     assert store.list(second_scope) == (cross_scope,)
+    assert digest_by_canonical[loser_event.canonical_bytes()] == loser_digest
 
 
 def test_sqlite_evidence_failed_scope_insert_rolls_back_and_retries(
