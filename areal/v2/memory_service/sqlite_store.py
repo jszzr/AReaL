@@ -1777,6 +1777,7 @@ class SQLiteMemoryStore:
                 and existing.manifest.canonical_bytes() != canonical
             ):
                 raise ReleaseConflictError(f"release ID collision for {release_id!r}")
+            expected = existing
             if existing is None:
                 if scope_id is None:
                     scope_id = _ensure_scope_id(cursor, manifest.scope)
@@ -1834,15 +1835,16 @@ class SQLiteMemoryStore:
 ) VALUES (?, ?, ?, ?)""",
                 (scope_id, idempotency_key, release_id, binding_hash),
             )
-            if existing is not None:
-                return existing
-            inserted = _load_release(
-                cursor,
-                manifest.scope,
-                scope_id,
-                release_id,
-                ordered_revisions,
-            )
+            assert expected is not None
+            (
+                _readback_scope_by_id,
+                _readback_revision_by_address,
+                readback_release_by_address,
+                readback_release_by_alias,
+                readback_revisions_by_release,
+            ) = _load_release_snapshot(cursor)
+            address = (scope_id, release_id)
+            inserted = readback_release_by_address.get(address)
             if inserted is None:
                 raise MemoryPersistenceCorruptionError(
                     "inserted release row could not be reloaded"
@@ -1850,6 +1852,14 @@ class SQLiteMemoryStore:
             if inserted != expected:
                 raise MemoryPersistenceCorruptionError(
                     "inserted release did not round-trip exactly"
+                )
+            if readback_revisions_by_release.get(address) != ordered_revisions:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted release members did not round-trip exactly"
+                )
+            if readback_release_by_alias.get((scope_id, idempotency_key)) != inserted:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted release alias did not round-trip exactly"
                 )
             return inserted
 

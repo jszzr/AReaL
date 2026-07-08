@@ -48,7 +48,7 @@ from areal.v2.memory_service.history_types import (
     RevisionProposal,
 )
 from areal.v2.memory_service.release_store import MemoryReleaseStore
-from areal.v2.memory_service.release_types import ReleaseManifest
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -397,6 +397,99 @@ def _install_sqlite_read_override_proxy(
     monkeypatch.setattr(sqlite_backend, "_connect", connect)
 
 
+@dataclass(slots=True)
+class _SQLiteReleaseTamperPlan:
+    trigger_key: str
+    tamper: Callable[[sqlite3.Cursor], None]
+    observed_sql: dict[str, str]
+    events: list[str] = field(default_factory=list)
+    trigger_hits: int = 0
+    tamper_hits: int = 0
+
+
+class _SQLiteReleaseTamperCursor:
+    def __init__(
+        self,
+        real_cursor: sqlite3.Cursor,
+        plan: _SQLiteReleaseTamperPlan,
+    ) -> None:
+        self._real_cursor = real_cursor
+        self._plan = plan
+
+    def execute(
+        self,
+        sql: str,
+        parameters: object = (),
+    ) -> _SQLiteReleaseTamperCursor:
+        normalized = _normalize_sql(sql)
+        self._real_cursor.execute(sql, parameters)
+        if normalized.startswith("INSERT INTO MEMORY_RELEASE_ALIASES"):
+            assert isinstance(parameters, tuple)
+            assert len(parameters) == 4
+            if parameters[1] == self._plan.trigger_key:
+                self._plan.trigger_hits += 1
+                self._plan.events.append("alias-insert")
+                assert self._plan.trigger_hits == 1
+                self._plan.tamper(self._real_cursor)
+                self._plan.tamper_hits += 1
+                self._plan.events.append("tamper")
+        elif self._plan.tamper_hits:
+            observed = self._plan.observed_sql.get(normalized)
+            if observed is not None:
+                self._plan.events.append(observed)
+            elif normalized == "ROLLBACK":
+                self._plan.events.append("rollback")
+            elif normalized == "COMMIT":
+                self._plan.events.append("commit")
+        return self
+
+    def __iter__(self) -> Any:
+        return iter(self._real_cursor)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_cursor, name)
+
+
+class _SQLiteReleaseTamperConnection:
+    def __init__(
+        self,
+        real_connection: sqlite3.Connection,
+        plan: _SQLiteReleaseTamperPlan,
+    ) -> None:
+        self._real_connection = real_connection
+        self._plan = plan
+
+    def cursor(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> _SQLiteReleaseTamperCursor:
+        return _SQLiteReleaseTamperCursor(
+            self._real_connection.cursor(*args, **kwargs),
+            self._plan,
+        )
+
+    def close(self) -> None:
+        self._real_connection.close()
+        if self._plan.tamper_hits:
+            self._plan.events.append("close")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_connection, name)
+
+
+def _install_sqlite_release_tamper_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: _SQLiteReleaseTamperPlan,
+) -> None:
+    real_connect = sqlite_backend._connect
+
+    def connect(path: str) -> _SQLiteReleaseTamperConnection:
+        return _SQLiteReleaseTamperConnection(real_connect(path), plan)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+
+
 def _install_sqlite_failure_proxy(
     monkeypatch: pytest.MonkeyPatch,
     plan: _SQLiteFailurePlan,
@@ -588,6 +681,40 @@ def _run_sqlite_revision_race(
             executor.submit(worker, index) for index in range(len(proposals))
         )
         deadline = monotonic() + _SQLITE_REVISION_RACE_TIMEOUT_SECONDS
+        return tuple(
+            future.result(timeout=max(0.0, deadline - monotonic()))
+            for future in futures
+        )
+
+
+_SQLITE_RELEASE_RACE_SIZE = 6
+_SQLITE_RELEASE_RACE_TIMEOUT_SECONDS = 30.0
+
+
+def _run_sqlite_release_race(
+    database_path: str | Path,
+    requests: tuple[tuple[ReleaseManifest, str], ...],
+) -> tuple[MemoryRelease | MemoryServiceError, ...]:
+    assert len(requests) == _SQLITE_RELEASE_RACE_SIZE
+    stores = tuple(SQLiteMemoryStore(database_path) for _request in requests)
+    deadline = monotonic() + _SQLITE_RELEASE_RACE_TIMEOUT_SECONDS
+    barrier = Barrier(len(requests))
+
+    def worker(index: int) -> MemoryRelease | MemoryServiceError:
+        barrier.wait(timeout=max(0.0, deadline - monotonic()))
+        manifest, idempotency_key = requests[index]
+        try:
+            return stores[index].append_release(
+                manifest,
+                idempotency_key=idempotency_key,
+            )
+        except MemoryServiceError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+        futures = tuple(
+            executor.submit(worker, index) for index in range(len(requests))
+        )
         return tuple(
             future.result(timeout=max(0.0, deadline - monotonic()))
             for future in futures
@@ -10069,3 +10196,920 @@ def test_sqlite_release_snapshot_loads_each_scalar_once(
         second.release_id,
         foreign.release_id,
     }
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["core", "second-member", "first-alias", "alias-only"],
+)
+def test_sqlite_release_insert_failures_roll_back_every_stage_and_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    database_path = tmp_path / f"release-failure-{failure_stage}.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"release-failure-{failure_stage}",
+    )
+    revisions = (
+        ()
+        if failure_stage == "core"
+        else tuple(
+            _append_sqlite_release_root(
+                store,
+                scope,
+                index=index,
+                key=f"release-failure-{failure_stage}-{index}",
+            )[0]
+            for index in range(3)
+        )
+    )
+    manifest = ReleaseManifest(
+        scope,
+        tuple(revision.revision_id for revision in revisions),
+    )
+    owner = None
+    idempotency_key = f"release-failure-{failure_stage}-target"
+    if failure_stage == "alias-only":
+        owner = store.append_release(
+            manifest,
+            idempotency_key="release-failure-alias-owner",
+        )
+    baseline_rows = _release_graph_rows(database_path)
+    assert baseline_rows[1] == ()
+    if failure_stage == "core":
+        assert baseline_rows[0] == ((), (), (), (), (), (), (), ())
+    marker, occurrence = {
+        "core": ("INSERT INTO memory_releases", 1),
+        "second-member": ("INSERT INTO memory_release_revisions", 2),
+        "first-alias": ("INSERT INTO memory_release_aliases", 1),
+        "alias-only": ("INSERT INTO memory_release_aliases", 1),
+    }[failure_stage]
+    expected_insert_counts = {
+        "core": {"core": 1, "member": 0, "alias": 0},
+        "second-member": {"core": 1, "member": 2, "alias": 0},
+        "first-alias": {"core": 1, "member": 3, "alias": 1},
+        "alias-only": {"core": 0, "member": 0, "alias": 1},
+    }[failure_stage]
+    injected = sqlite3.OperationalError(
+        f"injected release failure after {failure_stage}"
+    )
+    injected.sqlite_errorcode = sqlite3.SQLITE_IOERR
+    plan = _SQLiteFailurePlan(
+        after_statement=marker,
+        after_occurrence=occurrence,
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        store.append_release(manifest, idempotency_key=idempotency_key)
+
+    assert type(raised.value) is MemoryPersistenceError
+    assert raised.value.__cause__ is injected
+    normalized_marker = _normalize_sql(marker)
+    assert plan.events[-6].startswith(f"executed:{normalized_marker}")
+    assert plan.events[-5].startswith(f"fail-after:{normalized_marker}")
+    assert plan.events[-4:] == [
+        "attempt:ROLLBACK",
+        "executed:ROLLBACK",
+        "attempt:CLOSE",
+        "executed:CLOSE",
+    ]
+    assert "attempt:COMMIT" not in plan.events
+    assert "executed:COMMIT" not in plan.events
+    insert_counts = {
+        "core": sum(
+            event.startswith("executed:INSERT INTO MEMORY_RELEASES ")
+            for event in plan.events
+        ),
+        "member": sum(
+            event.startswith("executed:INSERT INTO MEMORY_RELEASE_REVISIONS ")
+            for event in plan.events
+        ),
+        "alias": sum(
+            event.startswith("executed:INSERT INTO MEMORY_RELEASE_ALIASES ")
+            for event in plan.events
+        ),
+    }
+    assert insert_counts == expected_insert_counts
+    assert _release_graph_rows(database_path) == baseline_rows
+
+    monkeypatch.undo()
+    recovered = store.append_release(manifest, idempotency_key=idempotency_key)
+
+    if owner is not None:
+        assert recovered == owner
+        expected_aliases = 2
+    else:
+        assert recovered.manifest == manifest
+        expected_aliases = 1
+    assert store.get_release_revisions(scope, recovered.release_id) == revisions
+    assert (
+        SQLiteMemoryStore(database_path).get_release(
+            scope,
+            recovered.release_id,
+        )
+        == recovered
+    )
+    expected_state = (
+        (1, 0, 0, 0, 0, 1, 1, 0)
+        if failure_stage == "core"
+        else (1, 3, 3, 3, 3, 1, expected_aliases, 3)
+    )
+    assert _release_graph_state(database_path) == (expected_state, [])
+
+
+def test_sqlite_release_post_insert_global_readback_prevents_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-post-insert-readback.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    unrelated_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-readback-unrelated-alias",
+    )
+    target_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-readback-target-new",
+    )
+    unrelated_revision, _unrelated_candidate, _unrelated_evidence = (
+        _append_sqlite_release_root(
+            store,
+            unrelated_scope,
+            index=0,
+            key="release-readback-unrelated-alias",
+        )
+    )
+    unrelated_key = "release-readback-unrelated-owner"
+    unrelated = store.append_release(
+        ReleaseManifest(unrelated_scope, (unrelated_revision.revision_id,)),
+        idempotency_key=unrelated_key,
+    )
+    target_revisions = tuple(
+        _append_sqlite_release_root(
+            store,
+            target_scope,
+            index=index,
+            key=f"release-readback-target-new-{index}",
+        )[0]
+        for index in range(2)
+    )
+    target_manifest = ReleaseManifest(
+        target_scope,
+        tuple(revision.revision_id for revision in target_revisions),
+    )
+    target_key = "release-readback-target-new"
+    target_release_id = (
+        f"rel_{hashlib.sha256(target_manifest.canonical_bytes()).hexdigest()[:24]}"
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_rows = connection.execute(
+            "SELECT scope_id, subject_id FROM memory_scopes"
+        ).fetchall()
+        original_alias = connection.execute(
+            "SELECT release_id, binding_hash FROM memory_release_aliases "
+            "WHERE idempotency_key = ?",
+            (unrelated_key,),
+        ).fetchone()
+    finally:
+        connection.close()
+    scope_id_by_subject = {subject_id: scope_id for scope_id, subject_id in scope_rows}
+    unrelated_scope_id = scope_id_by_subject[unrelated_scope.subject_id]
+    target_scope_id = scope_id_by_subject[target_scope.subject_id]
+    assert original_alias == (
+        unrelated.release_id,
+        sqlite_store_module._release_binding_hash(
+            scope=unrelated_scope,
+            idempotency_key=unrelated_key,
+            release_id=unrelated.release_id,
+        ),
+    )
+    baseline_rows = _release_graph_rows(database_path)
+    assert baseline_rows[1] == ()
+
+    def tamper_unrelated_alias(cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            "UPDATE memory_release_aliases SET binding_hash = ? "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            ("0" * 64, unrelated_scope_id, unrelated_key),
+        )
+        assert cursor.rowcount == 1
+        cursor.execute("PRAGMA foreign_key_check")
+        assert cursor.fetchall() == []
+
+    plan = _SQLiteReleaseTamperPlan(
+        trigger_key=target_key,
+        tamper=tamper_unrelated_alias,
+        observed_sql={
+            _normalize_sql(
+                "SELECT scope_id, release_id FROM memory_releases"
+            ): "address-scan",
+            _normalize_sql(
+                "SELECT scope_id, release_id, position, revision_id, memory_id "
+                "FROM memory_release_revisions"
+            ): "member-scan",
+            _normalize_sql(sqlite_store_module._RELEASE_SELECT): "scalar",
+            _normalize_sql(
+                "SELECT scope_id, idempotency_key, release_id, binding_hash "
+                "FROM memory_release_aliases"
+            ): "alias-scan",
+        },
+    )
+    _install_sqlite_release_tamper_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.append_release(target_manifest, idempotency_key=target_key)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert str(raised.value) == (
+        "release alias binding hash disagrees with stored metadata"
+    )
+    assert raised.value.__cause__ is None
+    assert plan.trigger_hits == plan.tamper_hits == 1
+    assert plan.events[:4] == [
+        "alias-insert",
+        "tamper",
+        "address-scan",
+        "member-scan",
+    ]
+    assert plan.events.count("scalar") == 2
+    assert plan.events[-3:] == ["alias-scan", "rollback", "close"]
+    assert "commit" not in plan.events
+    assert _release_graph_rows(database_path) == baseline_rows
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        restored_alias = connection.execute(
+            "SELECT release_id, binding_hash FROM memory_release_aliases "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            (unrelated_scope_id, unrelated_key),
+        ).fetchone()
+        target_rows = connection.execute(
+            "SELECT release_id FROM memory_releases "
+            "WHERE scope_id = ? AND release_id = ?",
+            (target_scope_id, target_release_id),
+        ).fetchall()
+        target_aliases = connection.execute(
+            "SELECT release_id FROM memory_release_aliases "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            (target_scope_id, target_key),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert restored_alias == original_alias
+    assert target_rows == []
+    assert target_aliases == []
+
+    monkeypatch.undo()
+    successful_snapshots: list[Any] = []
+    real_load_release_snapshot = sqlite_store_module._load_release_snapshot
+
+    def record_successful_snapshot(cursor: sqlite3.Cursor) -> Any:
+        snapshot = real_load_release_snapshot(cursor)
+        successful_snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_load_release_snapshot",
+        record_successful_snapshot,
+    )
+    recovered = store.append_release(target_manifest, idempotency_key=target_key)
+
+    assert len(successful_snapshots) == 2
+    preflight_releases = successful_snapshots[0][2]
+    post_write_releases = successful_snapshots[1][2]
+    assert target_release_id not in {
+        release.release_id for release in preflight_releases.values()
+    }
+    post_write_release = next(
+        release
+        for release in post_write_releases.values()
+        if release.release_id == target_release_id
+    )
+    assert recovered is post_write_release
+    assert recovered.release_id == target_release_id
+    assert (
+        store.append_release(target_manifest, idempotency_key=target_key) == recovered
+    )
+    assert len(successful_snapshots) == 3
+    monkeypatch.undo()
+    assert store.get_release_revisions(target_scope, target_release_id) == (
+        target_revisions
+    )
+    assert store.get_release(unrelated_scope, unrelated.release_id) == unrelated
+    assert _release_graph_state(database_path) == (
+        (2, 3, 3, 3, 3, 2, 2, 3),
+        [],
+    )
+
+
+def test_sqlite_release_alias_only_global_readback_prevents_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "release-alias-only-readback.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    unrelated_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-readback-unrelated-member",
+    )
+    target_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-readback-target-alias",
+    )
+    unrelated_revisions = tuple(
+        _append_sqlite_release_root(
+            store,
+            unrelated_scope,
+            index=index,
+            key=f"release-readback-unrelated-member-{index}",
+        )[0]
+        for index in range(2)
+    )
+    unrelated = store.append_release(
+        ReleaseManifest(
+            unrelated_scope,
+            tuple(revision.revision_id for revision in unrelated_revisions),
+        ),
+        idempotency_key="release-readback-unrelated-member-owner",
+    )
+    target_revision, _target_candidate, _target_evidence = _append_sqlite_release_root(
+        store,
+        target_scope,
+        index=0,
+        key="release-readback-target-alias",
+    )
+    target_manifest = ReleaseManifest(target_scope, (target_revision.revision_id,))
+    target_owner_key = "release-readback-target-alias-owner"
+    target = store.append_release(
+        target_manifest,
+        idempotency_key=target_owner_key,
+    )
+    target_alias_key = "release-readback-target-alias-new"
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_rows = connection.execute(
+            "SELECT scope_id, subject_id FROM memory_scopes"
+        ).fetchall()
+        original_members = connection.execute(
+            "SELECT position, revision_id, memory_id "
+            "FROM memory_release_revisions WHERE release_id = ? "
+            "ORDER BY position",
+            (unrelated.release_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    scope_id_by_subject = {subject_id: scope_id for scope_id, subject_id in scope_rows}
+    unrelated_scope_id = scope_id_by_subject[unrelated_scope.subject_id]
+    target_scope_id = scope_id_by_subject[target_scope.subject_id]
+    assert original_members == [
+        (position, revision.revision_id, revision.memory_id)
+        for position, revision in enumerate(unrelated_revisions)
+    ]
+    baseline_rows = _release_graph_rows(database_path)
+    assert baseline_rows[1] == ()
+
+    def tamper_unrelated_member(cursor: sqlite3.Cursor) -> None:
+        cursor.execute(
+            "UPDATE memory_release_revisions SET position = 2 "
+            "WHERE scope_id = ? AND release_id = ? AND position = 0",
+            (unrelated_scope_id, unrelated.release_id),
+        )
+        assert cursor.rowcount == 1
+        cursor.execute("PRAGMA foreign_key_check")
+        assert cursor.fetchall() == []
+
+    plan = _SQLiteReleaseTamperPlan(
+        trigger_key=target_alias_key,
+        tamper=tamper_unrelated_member,
+        observed_sql={
+            _normalize_sql(
+                "SELECT scope_id, release_id FROM memory_releases"
+            ): "address-scan",
+            _normalize_sql(
+                "SELECT scope_id, release_id, position, revision_id, memory_id "
+                "FROM memory_release_revisions"
+            ): "member-scan",
+            _normalize_sql(
+                "SELECT scope_id, idempotency_key, release_id, binding_hash "
+                "FROM memory_release_aliases"
+            ): "alias-scan",
+        },
+    )
+    _install_sqlite_release_tamper_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.append_release(target_manifest, idempotency_key=target_alias_key)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert str(raised.value) == (
+        "release member positions are not contiguous from zero"
+    )
+    assert raised.value.__cause__ is None
+    assert plan.trigger_hits == plan.tamper_hits == 1
+    assert plan.events == [
+        "alias-insert",
+        "tamper",
+        "address-scan",
+        "member-scan",
+        "rollback",
+        "close",
+    ]
+    assert "alias-scan" not in plan.events
+    assert "commit" not in plan.events
+    assert _release_graph_rows(database_path) == baseline_rows
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        restored_members = connection.execute(
+            "SELECT position, revision_id, memory_id "
+            "FROM memory_release_revisions "
+            "WHERE scope_id = ? AND release_id = ? ORDER BY position",
+            (unrelated_scope_id, unrelated.release_id),
+        ).fetchall()
+        target_aliases = connection.execute(
+            "SELECT release_id FROM memory_release_aliases "
+            "WHERE scope_id = ? AND idempotency_key = ?",
+            (target_scope_id, target_alias_key),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert restored_members == original_members
+    assert target_aliases == []
+
+    monkeypatch.undo()
+    successful_snapshots: list[Any] = []
+    real_load_release_snapshot = sqlite_store_module._load_release_snapshot
+
+    def record_successful_snapshot(cursor: sqlite3.Cursor) -> Any:
+        snapshot = real_load_release_snapshot(cursor)
+        successful_snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_load_release_snapshot",
+        record_successful_snapshot,
+    )
+    recovered = store.append_release(
+        target_manifest,
+        idempotency_key=target_alias_key,
+    )
+
+    assert len(successful_snapshots) == 2
+    preflight_release = next(
+        release
+        for release in successful_snapshots[0][2].values()
+        if release.release_id == target.release_id
+    )
+    post_write_release = next(
+        release
+        for release in successful_snapshots[1][2].values()
+        if release.release_id == target.release_id
+    )
+    assert preflight_release is not post_write_release
+    assert recovered is post_write_release
+    assert recovered is not preflight_release
+    assert recovered == target
+    assert (
+        store.append_release(
+            target_manifest,
+            idempotency_key=target_alias_key,
+        )
+        == target
+    )
+    assert len(successful_snapshots) == 3
+    monkeypatch.undo()
+    assert (
+        store.get_release_revisions(
+            unrelated_scope,
+            unrelated.release_id,
+        )
+        == unrelated_revisions
+    )
+    assert _release_graph_state(database_path) == (
+        (2, 3, 3, 3, 3, 2, 3, 3),
+        [],
+    )
+
+
+def test_sqlite_concurrent_identical_release_requests_converge(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "release-concurrent-identical.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-concurrent-identical",
+    )
+    revision, _candidate, _evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="release-concurrent-identical",
+    )
+    manifest = ReleaseManifest(scope, (revision.revision_id,))
+    requests = tuple(
+        (manifest, "release-concurrent-identical-key")
+        for _index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+
+    outcomes = _run_sqlite_release_race(database_path, requests)
+
+    assert not any(isinstance(item, MemoryPersistenceError) for item in outcomes)
+    assert all(type(item) is MemoryRelease for item in outcomes)
+    releases = tuple(item for item in outcomes if type(item) is MemoryRelease)
+    assert len(releases) == _SQLITE_RELEASE_RACE_SIZE
+    winner = releases[0]
+    assert all(release == winner for release in releases)
+    assert {release.release_id for release in releases} == {winner.release_id}
+    assert {release.content_hash for release in releases} == {winner.content_hash}
+    assert {release.created_at for release in releases} == {winner.created_at}
+    assert {release.manifest for release in releases} == {manifest}
+    assert _release_graph_state(database_path) == (
+        (1, 1, 1, 1, 1, 1, 1, 1),
+        [],
+    )
+
+    fresh = SQLiteMemoryStore(database_path)
+    persisted = fresh.get_release(scope, winner.release_id)
+    assert persisted == winner
+    assert persisted is not winner
+    assert fresh.get_release_revisions(scope, winner.release_id) == (revision,)
+    assert fresh.list_releases(scope) == (persisted,)
+
+
+def test_sqlite_concurrent_alias_keys_bind_one_release(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "release-concurrent-aliases.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-concurrent-aliases",
+    )
+    revision, _candidate, _evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="release-concurrent-aliases",
+    )
+    manifest = ReleaseManifest(scope, (revision.revision_id,))
+    keys = tuple(
+        f"release-concurrent-alias-{index}"
+        for index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+    requests = tuple((manifest, key) for key in keys)
+
+    outcomes = _run_sqlite_release_race(database_path, requests)
+
+    assert not any(isinstance(item, MemoryPersistenceError) for item in outcomes)
+    assert all(type(item) is MemoryRelease for item in outcomes)
+    releases = tuple(item for item in outcomes if type(item) is MemoryRelease)
+    assert len(releases) == _SQLITE_RELEASE_RACE_SIZE
+    winner = releases[0]
+    assert all(release == winner for release in releases)
+    assert _release_graph_state(database_path) == (
+        (1, 1, 1, 1, 1, 1, _SQLITE_RELEASE_RACE_SIZE, 1),
+        [],
+    )
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        alias_rows = connection.execute(
+            "SELECT idempotency_key, release_id FROM memory_release_aliases "
+            "ORDER BY idempotency_key"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert alias_rows == [(key, winner.release_id) for key in sorted(keys)]
+
+    fresh = SQLiteMemoryStore(database_path)
+    assert fresh.list_releases(scope) == (winner,)
+    assert fresh.get_release_revisions(scope, winner.release_id) == (revision,)
+    for key in keys:
+        assert fresh.append_release(manifest, idempotency_key=key) == winner
+    assert _release_graph_state(database_path) == (
+        (1, 1, 1, 1, 1, 1, _SQLITE_RELEASE_RACE_SIZE, 1),
+        [],
+    )
+
+
+def test_sqlite_concurrent_shared_key_has_one_winner_and_losers_recover(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "release-concurrent-shared-key.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-concurrent-shared-key",
+    )
+    revisions = tuple(
+        _append_sqlite_release_root(
+            store,
+            scope,
+            index=index,
+            key=f"release-concurrent-shared-key-{index}",
+        )[0]
+        for index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+    manifests = tuple(
+        ReleaseManifest(scope, (revision.revision_id,)) for revision in revisions
+    )
+    shared_key = "release-concurrent-shared-key-owner"
+    requests = tuple((manifest, shared_key) for manifest in manifests)
+
+    outcomes = _run_sqlite_release_race(database_path, requests)
+
+    persistence_errors = tuple(
+        item for item in outcomes if isinstance(item, MemoryPersistenceError)
+    )
+    winners = tuple(item for item in outcomes if type(item) is MemoryRelease)
+    conflicts = tuple(item for item in outcomes if type(item) is ReleaseConflictError)
+    unexpected = tuple(
+        item
+        for item in outcomes
+        if type(item) not in {MemoryRelease, ReleaseConflictError}
+    )
+    assert persistence_errors == ()
+    assert unexpected == ()
+    assert len(winners) == 1
+    assert len(conflicts) == _SQLITE_RELEASE_RACE_SIZE - 1
+    assert all(
+        str(conflict)
+        == "scoped release idempotency key already refers to different content"
+        for conflict in conflicts
+    )
+    winner = winners[0]
+    assert _release_graph_state(database_path) == (
+        (1, 6, 6, 6, 6, 1, 1, 1),
+        [],
+    )
+    loser_pairs = tuple(
+        (manifest, revision)
+        for manifest, revision in zip(manifests, revisions, strict=True)
+        if manifest != winner.manifest
+    )
+    assert len(loser_pairs) == _SQLITE_RELEASE_RACE_SIZE - 1
+
+    recovery_store = SQLiteMemoryStore(database_path)
+    recovered = tuple(
+        recovery_store.append_release(
+            manifest,
+            idempotency_key=f"release-concurrent-recovered-{index}",
+        )
+        for index, (manifest, _revision) in enumerate(loser_pairs)
+    )
+
+    assert len(recovered) == _SQLITE_RELEASE_RACE_SIZE - 1
+    stored = recovery_store.list_releases(scope)
+    assert len(stored) == _SQLITE_RELEASE_RACE_SIZE
+    assert {release.manifest for release in stored} == set(manifests)
+    for manifest, revision in loser_pairs:
+        release = next(item for item in stored if item.manifest == manifest)
+        assert recovery_store.get_release_revisions(scope, release.release_id) == (
+            revision,
+        )
+    assert _release_graph_state(database_path) == (
+        (1, 6, 6, 6, 6, 6, 6, 6),
+        [],
+    )
+
+
+def test_sqlite_concurrent_sibling_revisions_survive_in_separate_releases(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "release-concurrent-siblings.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "release-concurrent-siblings",
+    )
+    parent, _parent_candidate, _parent_evidence = _append_sqlite_release_root(
+        store,
+        scope,
+        index=0,
+        key="release-concurrent-sibling-parent",
+    )
+    candidates = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index + 1,
+            key=f"release-concurrent-sibling-{index}",
+        )[0]
+        for index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+    operations = (
+        RevisionOperation.REFINE,
+        RevisionOperation.SUPERSEDE,
+        RevisionOperation.CONTRADICT,
+    )
+    siblings = tuple(
+        store.append_revision(
+            _make_sqlite_revision(
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                operation=operations[index % len(operations)],
+                parent_revision_id=parent.revision_id,
+                idempotency_key=f"release-concurrent-sibling-revision-{index}",
+            )
+        )
+        for index, candidate in enumerate(candidates)
+    )
+    assert {revision.memory_id for revision in siblings} == {parent.memory_id}
+    manifests = tuple(
+        ReleaseManifest(scope, (revision.revision_id,)) for revision in siblings
+    )
+    requests = tuple(
+        (manifest, f"release-concurrent-sibling-key-{index}")
+        for index, manifest in enumerate(manifests)
+    )
+
+    outcomes = _run_sqlite_release_race(database_path, requests)
+
+    assert not any(isinstance(item, MemoryPersistenceError) for item in outcomes)
+    assert all(type(item) is MemoryRelease for item in outcomes)
+    releases = tuple(item for item in outcomes if type(item) is MemoryRelease)
+    assert len(releases) == _SQLITE_RELEASE_RACE_SIZE
+    assert len({release.release_id for release in releases}) == (
+        _SQLITE_RELEASE_RACE_SIZE
+    )
+    assert {release.manifest for release in releases} == set(manifests)
+    assert _release_graph_state(database_path) == (
+        (1, 7, 7, 7, 7, 6, 6, 6),
+        [],
+    )
+
+    fresh = SQLiteMemoryStore(database_path)
+    stored = fresh.list_releases(scope)
+    assert len(stored) == _SQLITE_RELEASE_RACE_SIZE
+    assert {release.manifest for release in stored} == set(manifests)
+    for release in stored:
+        (revision_id,) = release.manifest.revision_ids
+        revision = next(item for item in siblings if item.revision_id == revision_id)
+        assert fresh.get_release_revisions(scope, release.release_id) == (revision,)
+    assert {revision.memory_id for revision in siblings} == {parent.memory_id}
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+def test_sqlite_concurrent_release_id_collision_is_atomic_and_loser_keys_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+) -> None:
+    database_path = tmp_path / f"release-concurrent-{collision_kind}.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"release-concurrent-{collision_kind}",
+    )
+    revisions = tuple(
+        _append_sqlite_release_root(
+            store,
+            scope,
+            index=index,
+            key=f"release-concurrent-{collision_kind}-{index}",
+        )[0]
+        for index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+    manifests = tuple(
+        ReleaseManifest(scope, (revision.revision_id,)) for revision in revisions
+    )
+    keys = tuple(
+        f"release-concurrent-{collision_kind}-key-{index}"
+        for index in range(_SQLITE_RELEASE_RACE_SIZE)
+    )
+    shared_prefix = "d" * 24
+    digest_by_canonical = {
+        manifest.canonical_bytes(): (
+            shared_prefix + "a" * 40
+            if collision_kind == "full-hash"
+            else shared_prefix + f"{index + 1:040x}"
+        )
+        for index, manifest in enumerate(manifests)
+    }
+    assert len(set(digest_by_canonical)) == _SQLITE_RELEASE_RACE_SIZE
+    if collision_kind == "full-hash":
+        assert len(set(digest_by_canonical.values())) == 1
+    else:
+        assert len(set(digest_by_canonical.values())) == _SQLITE_RELEASE_RACE_SIZE
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+    requests = tuple(zip(manifests, keys, strict=True))
+
+    outcomes = _run_sqlite_release_race(database_path, requests)
+
+    persistence_errors = tuple(
+        item for item in outcomes if isinstance(item, MemoryPersistenceError)
+    )
+    winners = tuple(item for item in outcomes if type(item) is MemoryRelease)
+    conflicts = tuple(item for item in outcomes if type(item) is ReleaseConflictError)
+    unexpected = tuple(
+        item
+        for item in outcomes
+        if type(item) not in {MemoryRelease, ReleaseConflictError}
+    )
+    assert persistence_errors == ()
+    assert unexpected == ()
+    assert len(winners) == 1
+    assert len(conflicts) == _SQLITE_RELEASE_RACE_SIZE - 1
+    winner = winners[0]
+    assert winner.release_id == f"rel_{shared_prefix}"
+    assert winner.content_hash == digest_by_canonical[winner.manifest.canonical_bytes()]
+    assert all(
+        str(conflict) == f"release ID collision for {winner.release_id!r}"
+        for conflict in conflicts
+    )
+    winner_index = manifests.index(winner.manifest)
+    winner_key = keys[winner_index]
+    assert _release_graph_state(database_path) == (
+        (1, 6, 6, 6, 6, 1, 1, 1),
+        [],
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        alias_rows = connection.execute(
+            "SELECT idempotency_key, release_id FROM memory_release_aliases"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert alias_rows == [(winner_key, winner.release_id)]
+
+    winner_canonical = winner.manifest.canonical_bytes()
+    loser_requests = tuple(
+        (manifest, key) for manifest, key in requests if manifest != winner.manifest
+    )
+    for manifest, _key in loser_requests:
+        forced_digest = digest_by_canonical.pop(manifest.canonical_bytes())
+        assert forced_digest.startswith(shared_prefix)
+        assert (
+            not hashlib.sha256(manifest.canonical_bytes())
+            .hexdigest()
+            .startswith(shared_prefix)
+        )
+    assert digest_by_canonical == {
+        winner_canonical: winner.content_hash,
+    }
+    recovery_store = SQLiteMemoryStore(database_path)
+    recovered = tuple(
+        recovery_store.append_release(manifest, idempotency_key=key)
+        for manifest, key in loser_requests
+    )
+
+    assert len(recovered) == _SQLITE_RELEASE_RACE_SIZE - 1
+    assert len({release.release_id for release in recovered}) == (
+        _SQLITE_RELEASE_RACE_SIZE - 1
+    )
+    assert all(release.release_id != winner.release_id for release in recovered)
+    stored = recovery_store.list_releases(scope)
+    assert len(stored) == _SQLITE_RELEASE_RACE_SIZE
+    assert {release.manifest for release in stored} == set(manifests)
+    for manifest, key in requests:
+        expected = next(item for item in stored if item.manifest == manifest)
+        assert (
+            recovery_store.append_release(
+                manifest,
+                idempotency_key=key,
+            )
+            == expected
+        )
+    assert _release_graph_state(database_path) == (
+        (1, 6, 6, 6, 6, 6, 6, 6),
+        [],
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        alias_rows = connection.execute(
+            "SELECT idempotency_key, release_id FROM memory_release_aliases "
+            "ORDER BY idempotency_key"
+        ).fetchall()
+    finally:
+        connection.close()
+    expected_alias_rows = sorted(
+        (
+            key,
+            next(
+                release.release_id for release in stored if release.manifest == manifest
+            ),
+        )
+        for manifest, key in requests
+    )
+    assert alias_rows == expected_alias_rows
