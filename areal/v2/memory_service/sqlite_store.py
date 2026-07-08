@@ -240,3 +240,50 @@ class SQLiteMemoryStore:
             if record is None:
                 raise EvidenceNotFoundError(f"evidence {evidence_id!r} was not found")
             return record
+
+    def list(
+        self,
+        scope: MemoryScope,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Load one scoped snapshot, optionally narrowed by session and run."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        if session_id is not None:
+            session_id = _validate_string(
+                session_id,
+                "session_id",
+                allow_blank=True,
+            )
+        if run_id is not None:
+            run_id = _validate_string(run_id, "run_id", allow_blank=True)
+
+        with _read_transaction(self._database_path) as cursor:
+            scope_id = _find_scope_id(cursor, scope)
+            if scope_id is None:
+                return ()
+            sql = "SELECT evidence_id FROM memory_evidence WHERE scope_id = ?"
+            parameters: list[object] = [scope_id]
+            if session_id is not None:
+                sql += " AND session_id = ?"
+                parameters.append(session_id)
+            if run_id is not None:
+                sql += " AND run_id = ?"
+                parameters.append(run_id)
+            rows = cursor.execute(sql, parameters).fetchall()
+            records: list[EvidenceRecord] = []
+            for row in rows:
+                if len(row) != 1 or type(row[0]) is not str:
+                    raise MemoryPersistenceCorruptionError(
+                        "evidence listing contains an invalid identifier"
+                    )
+                record = _load_evidence(cursor, scope, scope_id, row[0])
+                if record is None:
+                    raise MemoryPersistenceCorruptionError(
+                        "evidence listing refers to a missing row"
+                    )
+                records.append(record)
+            return tuple(records)

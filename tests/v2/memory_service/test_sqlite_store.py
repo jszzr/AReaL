@@ -546,6 +546,99 @@ def test_sqlite_evidence_exact_input_boundaries_snapshot_before_sql(
         store.get(event.scope, "\ud800")
 
 
+def test_sqlite_evidence_queries_hide_foreign_scope_and_snapshot_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    first_scope = MemoryScope("tenant-1", "assistant-memory", "user-1")
+    second_scope = MemoryScope("tenant-1", "assistant-memory", "user-2")
+    missing_scope = MemoryScope("tenant-1", "assistant-memory", "user-3")
+    first = store.append(_make_sqlite_evidence(scope=first_scope, payload="first"))
+    second = store.append(_make_sqlite_evidence(scope=second_scope, payload="second"))
+
+    assert first.evidence_id != second.evidence_id
+    assert store.list(first_scope) == (first,)
+    assert store.list(second_scope) == (second,)
+    assert store.list(missing_scope) == ()
+    with pytest.raises(EvidenceNotFoundError) as missing_error:
+        store.get(first_scope, "evd_missing")
+    with pytest.raises(EvidenceNotFoundError) as foreign_error:
+        store.get(second_scope, first.evidence_id)
+    assert str(missing_error.value) == "evidence 'evd_missing' was not found"
+    assert str(foreign_error.value) == (f"evidence {first.evidence_id!r} was not found")
+
+    session_probe = _SnapshotProbeStr("missing-session")
+    run_probe = _SnapshotProbeStr("missing-run")
+    assert store.list(first_scope, session_id=session_probe) == ()
+    assert store.list(first_scope, run_id=run_probe) == ()
+    assert session_probe.override_calls == 0
+    assert run_probe.override_calls == 0
+    for missing_filter in ("", " \t", "\x00"):
+        assert store.list(first_scope, session_id=missing_filter) == ()
+        assert store.list(first_scope, run_id=missing_filter) == ()
+
+    subclass_scope = _SQLiteMemoryScopeSubclass(
+        first_scope.tenant_id,
+        first_scope.namespace,
+        first_scope.subject_id,
+    )
+
+    def transaction_must_not_start(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validation reached SQLite I/O")
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_read_transaction",
+        transaction_must_not_start,
+    )
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.list(
+            subclass_scope,
+            session_id="\ud800",
+            run_id=object(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="session_id must be valid UTF-8"):
+        store.list(
+            first_scope,
+            session_id="\ud800",
+            run_id=object(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="run_id must be valid UTF-8"):
+        store.list(first_scope, session_id="", run_id="\ud800")
+
+
+def test_sqlite_evidence_missing_loader_result_routes_by_known_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+
+    def missing_loader(
+        _cursor: sqlite3.Cursor,
+        _scope: MemoryScope,
+        _scope_id: int,
+        _evidence_id: str,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(sqlite_store_module, "_load_evidence", missing_loader)
+    with pytest.raises(EvidenceNotFoundError, match=record.evidence_id):
+        store.get(event.scope, record.evidence_id)
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="idempotency index refers to a missing row",
+    ):
+        store.append(event)
+    with pytest.raises(
+        MemoryPersistenceCorruptionError,
+        match="evidence listing refers to a missing row",
+    ):
+        store.list(event.scope)
+
+
 @pytest.mark.parametrize(
     ("value", "error_type", "message"),
     [
