@@ -4435,3 +4435,433 @@ def test_sqlite_candidate_loader_rejects_malformed_scalar_and_relation_rows(
         assert str(raised.value) == expected_message, case
         assert raised.value.__cause__ is None, case
     assert _memory_graph_state(database_path) == ((1, 1, 1, 1), [])
+
+
+def test_sqlite_candidate_snapshot_validates_unrelated_evidence_before_any_candidate_outcome(
+    tmp_path: Path,
+) -> None:
+    for operation in ("missing-get", "list", "get-evidence", "exact-retry"):
+        database_path = tmp_path / f"candidate-unrelated-evidence-{operation}.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        candidate_scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-unrelated-{operation}",
+        )
+        unrelated_scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-unrelated-{operation}-foreign",
+        )
+        candidate_evidence = store.append(
+            _make_sqlite_evidence(
+                scope=candidate_scope,
+                idempotency_key=f"candidate-unrelated-{operation}-evidence",
+            )
+        )
+        unrelated_evidence = store.append(
+            _make_sqlite_evidence(
+                scope=unrelated_scope,
+                payload="unrelated evidence-only scope",
+                idempotency_key=f"candidate-unrelated-{operation}-foreign-evidence",
+            )
+        )
+        proposal = _make_sqlite_candidate(
+            scope=candidate_scope,
+            evidence_ids=(candidate_evidence.evidence_id,),
+            idempotency_key=f"candidate-unrelated-{operation}-request",
+        )
+        candidate = store.append_candidate(proposal)
+        moved_evidence_id = (
+            f"evd_{'0' * 24}"
+            if unrelated_evidence.evidence_id != f"evd_{'0' * 24}"
+            else f"evd_{'1' * 24}"
+        )
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
+            unrelated_scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (
+                    unrelated_scope.tenant_id,
+                    unrelated_scope.namespace,
+                    unrelated_scope.subject_id,
+                ),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE memory_evidence SET evidence_id = ? "
+                "WHERE scope_id = ? AND evidence_id = ?",
+                (
+                    moved_evidence_id,
+                    unrelated_scope_id,
+                    unrelated_evidence.evidence_id,
+                ),
+            )
+            changed_row = connection.execute(
+                "SELECT evidence_id, canonical, content_hash "
+                "FROM memory_evidence WHERE scope_id = ?",
+                (unrelated_scope_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert changed_row == (
+            moved_evidence_id,
+            unrelated_evidence.event.canonical_bytes(),
+            unrelated_evidence.content_hash,
+        )
+
+        corrupted_state = _memory_graph_state(database_path)
+        assert corrupted_state == ((2, 2, 1, 1), [])
+        exact_retry = CandidateProposal(
+            scope=proposal.scope,
+            content=proposal.content,
+            evidence_ids=proposal.evidence_ids,
+            idempotency_key=proposal.idempotency_key,
+        )
+        assert exact_retry == proposal
+        assert exact_retry is not proposal
+
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            if operation == "missing-get":
+                store.get_candidate(candidate_scope, "cand_missing")
+            elif operation == "list":
+                store.list_candidates(candidate_scope)
+            elif operation == "get-evidence":
+                store.get_candidate_evidence(
+                    candidate_scope,
+                    candidate.candidate_id,
+                )
+            else:
+                store.append_candidate(exact_retry)
+
+        assert type(raised.value) is MemoryPersistenceCorruptionError
+        assert str(raised.value) == ("stored evidence row failed integrity validation")
+        assert type(raised.value.__cause__) is ValueError
+        assert str(raised.value.__cause__) == (
+            "evidence ID disagrees with its content hash"
+        )
+        assert _memory_graph_state(database_path) == corrupted_state
+
+
+def test_sqlite_candidate_snapshot_rejects_duplicate_addresses_edges_and_idempotency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_address_sql = _normalize_sql(
+        "SELECT scope_id, candidate_id FROM memory_candidates"
+    )
+    candidate_edge_sql = _normalize_sql(
+        "SELECT scope_id, candidate_id, position, evidence_id "
+        "FROM memory_candidate_evidence"
+    )
+    candidate_scalar_sql = _normalize_sql(sqlite_store_module._CANDIDATE_SELECT)
+
+    @dataclass(slots=True)
+    class CandidateSnapshotInjection:
+        case: str
+        scope_id: int
+        candidate_id: str
+        first_evidence_id: str
+        second_evidence_id: str
+        virtual_candidate_id: str | None = None
+        virtual_candidate_row: tuple[object, ...] | None = None
+        hits: dict[str, int] = field(
+            default_factory=lambda: {
+                "candidate-address": 0,
+                "candidate-edge": 0,
+                "candidate-scalar": 0,
+            }
+        )
+
+        def project_rows(
+            self,
+            normalized_sql: str,
+            rows: list[tuple[object, ...]],
+        ) -> list[tuple[object, ...]]:
+            if normalized_sql == candidate_address_sql:
+                if self.case == "candidate-address":
+                    self.hits["candidate-address"] += 1
+                    return [*rows, (self.scope_id, self.candidate_id)]
+                if self.case == "scoped-idempotency":
+                    assert self.virtual_candidate_id is not None
+                    self.hits["candidate-address"] += 1
+                    return [
+                        *rows,
+                        (self.scope_id, self.virtual_candidate_id),
+                    ]
+            if normalized_sql == candidate_edge_sql:
+                if self.case == "edge-position":
+                    self.hits["candidate-edge"] += 1
+                    return [
+                        *rows,
+                        (
+                            self.scope_id,
+                            self.candidate_id,
+                            0,
+                            self.second_evidence_id,
+                        ),
+                    ]
+                if self.case == "edge-evidence":
+                    self.hits["candidate-edge"] += 1
+                    return [
+                        *rows,
+                        (
+                            self.scope_id,
+                            self.candidate_id,
+                            1,
+                            self.first_evidence_id,
+                        ),
+                    ]
+                if self.case == "scoped-idempotency":
+                    assert self.virtual_candidate_id is not None
+                    self.hits["candidate-edge"] += 1
+                    return [
+                        *rows,
+                        (
+                            self.scope_id,
+                            self.virtual_candidate_id,
+                            0,
+                            self.second_evidence_id,
+                        ),
+                    ]
+            return rows
+
+        def project_row(
+            self,
+            normalized_sql: str,
+            parameters: object,
+            row: tuple[object, ...] | None,
+        ) -> tuple[object, ...] | None:
+            if (
+                self.case == "scoped-idempotency"
+                and normalized_sql == candidate_scalar_sql
+                and parameters == (self.scope_id, self.virtual_candidate_id)
+            ):
+                assert row is None
+                assert self.virtual_candidate_row is not None
+                self.hits["candidate-scalar"] += 1
+                return self.virtual_candidate_row
+            return row
+
+    class CandidateSnapshotCursor:
+        def __init__(
+            self,
+            real_cursor: sqlite3.Cursor,
+            injection: CandidateSnapshotInjection,
+        ) -> None:
+            self._real_cursor = real_cursor
+            self._injection = injection
+            self._normalized_sql = ""
+            self._parameters: object = ()
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> CandidateSnapshotCursor:
+            self._normalized_sql = _normalize_sql(sql)
+            self._parameters = parameters
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            return self._injection.project_rows(self._normalized_sql, rows)
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            row = self._real_cursor.fetchone()
+            return self._injection.project_row(
+                self._normalized_sql,
+                self._parameters,
+                None if row is None else tuple(row),
+            )
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class CandidateSnapshotConnection:
+        def __init__(
+            self,
+            real_connection: sqlite3.Connection,
+            injection: CandidateSnapshotInjection,
+        ) -> None:
+            self._real_connection = real_connection
+            self._injection = injection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> CandidateSnapshotCursor:
+            return CandidateSnapshotCursor(
+                self._real_connection.cursor(*args, **kwargs),
+                self._injection,
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    real_connect = sqlite_backend._connect
+    for case in (
+        "candidate-address",
+        "edge-position",
+        "edge-evidence",
+        "scoped-idempotency",
+    ):
+        database_path = tmp_path / f"candidate-duplicate-{case}.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-duplicate-{case}",
+        )
+        first_evidence = store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                sequence_no=0,
+                payload=f"first evidence for {case}",
+                idempotency_key=f"candidate-duplicate-{case}-evidence-1",
+            )
+        )
+        second_evidence = store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                sequence_no=1,
+                payload=f"second evidence for {case}",
+                idempotency_key=f"candidate-duplicate-{case}-evidence-2",
+            )
+        )
+        proposal = _make_sqlite_candidate(
+            scope=scope,
+            content=f"candidate duplicate owner for {case}",
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key=f"candidate-duplicate-{case}-request",
+        )
+        candidate = store.append_candidate(proposal)
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (scope.tenant_id, scope.namespace, scope.subject_id),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        injection = CandidateSnapshotInjection(
+            case=case,
+            scope_id=scope_id,
+            candidate_id=candidate.candidate_id,
+            first_evidence_id=first_evidence.evidence_id,
+            second_evidence_id=second_evidence.evidence_id,
+        )
+        if case == "scoped-idempotency":
+            virtual_proposal = _make_sqlite_candidate(
+                scope=scope,
+                content="fully coherent virtual duplicate idempotency candidate",
+                evidence_ids=(second_evidence.evidence_id,),
+                idempotency_key=proposal.idempotency_key,
+            )
+            virtual_canonical = virtual_proposal.canonical_bytes()
+            virtual_content_hash = hashlib.sha256(virtual_canonical).hexdigest()
+            virtual_candidate_id = f"cand_{virtual_content_hash[:24]}"
+            assert virtual_candidate_id != candidate.candidate_id
+            virtual_created_at = datetime(
+                2026,
+                7,
+                8,
+                3,
+                4,
+                5,
+                678000,
+                tzinfo=UTC,
+            ).isoformat()
+            virtual_storage_hash = sqlite_store_module._record_storage_hash(
+                record_kind="candidate",
+                scope=scope,
+                record_id=virtual_candidate_id,
+                content_hash=virtual_content_hash,
+                created_at_text=virtual_created_at,
+            )
+            injection.virtual_candidate_id = virtual_candidate_id
+            injection.virtual_candidate_row = (
+                virtual_candidate_id,
+                virtual_canonical,
+                virtual_content_hash,
+                virtual_created_at,
+                virtual_storage_hash,
+                virtual_proposal.content,
+                virtual_proposal.idempotency_key,
+            )
+
+        baseline_state = _memory_graph_state(database_path)
+        assert baseline_state == ((1, 2, 1, 1), [])
+
+        def connect(
+            path: str,
+            selected_injection: CandidateSnapshotInjection = injection,
+        ) -> CandidateSnapshotConnection:
+            return CandidateSnapshotConnection(
+                real_connect(path),
+                selected_injection,
+            )
+
+        monkeypatch.setattr(sqlite_backend, "_connect", connect)
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            if case == "candidate-address":
+                store.get_candidate(scope, "cand_missing")
+            elif case in {"edge-position", "edge-evidence"}:
+                store.list_candidates(scope)
+            else:
+                store.append_candidate(
+                    CandidateProposal(
+                        scope=proposal.scope,
+                        content=proposal.content,
+                        evidence_ids=proposal.evidence_ids,
+                        idempotency_key=proposal.idempotency_key,
+                    )
+                )
+        monkeypatch.undo()
+
+        expected_messages = {
+            "candidate-address": "candidate address appears multiple times",
+            "edge-position": "candidate evidence position appears multiple times",
+            "edge-evidence": "candidate contains the same evidence multiple times",
+            "scoped-idempotency": (
+                "candidate idempotency key appears multiple times in one scope"
+            ),
+        }
+        expected_hits = {
+            "candidate-address": {
+                "candidate-address": 1,
+                "candidate-edge": 0,
+                "candidate-scalar": 0,
+            },
+            "edge-position": {
+                "candidate-address": 0,
+                "candidate-edge": 1,
+                "candidate-scalar": 0,
+            },
+            "edge-evidence": {
+                "candidate-address": 0,
+                "candidate-edge": 1,
+                "candidate-scalar": 0,
+            },
+            "scoped-idempotency": {
+                "candidate-address": 1,
+                "candidate-edge": 1,
+                "candidate-scalar": 1,
+            },
+        }
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_messages[case], case
+        assert raised.value.__cause__ is None, case
+        assert injection.hits == expected_hits[case], case
+        assert _memory_graph_state(database_path) == baseline_state, case
+        assert store.list_candidates(scope) == (candidate,), case
