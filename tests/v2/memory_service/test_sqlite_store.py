@@ -1375,6 +1375,9 @@ def test_sqlite_scope_lookup_validates_every_identity_row(
         ) -> ScopeCursor:
             return self
 
+        def fetchone(self) -> tuple[object, ...] | None:
+            return None if not rows else (rows[0][0],)
+
         def fetchall(self) -> list[tuple[object, ...]]:
             return list(rows)
 
@@ -1398,6 +1401,17 @@ def test_sqlite_scope_lookup_matches_exact_identity_or_returns_none() -> None:
             _parameters: object = (),
         ) -> ScopeCursor:
             return self
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            requested_identity = (
+                scope.tenant_id,
+                scope.namespace,
+                scope.subject_id,
+            )
+            for row in self._rows:
+                if len(row) == 4 and row[1:] == requested_identity:
+                    return (row[0],)
+            return None
 
         def fetchall(self) -> list[tuple[object, ...]]:
             return list(self._rows)
@@ -1440,6 +1454,9 @@ def test_sqlite_evidence_scope_lookup_requires_positive_signed_64_bit_id() -> No
             _parameters: object = (),
         ) -> ScopeCursor:
             return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return (self._row[0],)
 
         def fetchall(self) -> list[tuple[object, ...]]:
             return [self._row]
@@ -1494,6 +1511,10 @@ def test_sqlite_evidence_scope_insert_validates_lastrowid_and_requery(
             _parameters: object = (),
         ) -> ScopeCursor:
             return self
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            batch = rows.pop(0)
+            return None if not batch else (batch[0][0],)
 
         def fetchall(self) -> list[tuple[object, ...]]:
             return rows.pop(0)
