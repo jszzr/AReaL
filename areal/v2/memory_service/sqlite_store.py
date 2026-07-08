@@ -22,8 +22,16 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryPersistenceCorruptionError,
+    RevisionConflictError,
+    RevisionNotFoundError,
 )
-from areal.v2.memory_service.history_types import CandidateProposal, MemoryCandidate
+from areal.v2.memory_service.history_types import (
+    CandidateProposal,
+    MemoryCandidate,
+    MemoryRevision,
+    RevisionOperation,
+    RevisionProposal,
+)
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -60,7 +68,28 @@ WHERE scope_id = ? AND candidate_id = ?"""
 
 _CANDIDATE_ROW_TYPES = (str, bytes, str, str, str, str, str)
 
+_REVISION_SELECT = """SELECT revision_id, canonical, content_hash,
+       created_at, storage_hash, candidate_id, memory_id, generation,
+       operation, parent_revision_id, idempotency_key
+FROM memory_revisions
+WHERE scope_id = ? AND revision_id = ?"""
+
+_REVISION_ROW_TYPES = (
+    (str,),
+    (bytes,),
+    (str,),
+    (str,),
+    (str,),
+    (str,),
+    (str,),
+    (int,),
+    (str,),
+    (str, type(None)),
+    (str,),
+)
+
 _MAX_SCOPE_ID = 2**63 - 1
+_MAX_GENERATION = 2**63 - 1
 
 
 def _require_scope_id(value: object, message: str) -> int:
@@ -545,8 +574,278 @@ def _load_candidate_snapshot(
     )
 
 
+def _load_revision_addresses(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+) -> tuple[tuple[int, str], ...]:
+    rows = cursor.execute(
+        "SELECT scope_id, revision_id FROM memory_revisions"
+    ).fetchall()
+    addresses: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if len(row) != 2:
+            raise MemoryPersistenceCorruptionError(
+                "revision address row does not contain exactly two values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "revision address contains an invalid positive signed 64-bit scope ID",
+        )
+        revision_id = row[1]
+        if type(revision_id) is not str:
+            raise MemoryPersistenceCorruptionError(
+                "revision address contains a non-text identifier"
+            )
+        if scope_id not in scope_by_id:
+            raise MemoryPersistenceCorruptionError(
+                "revision address refers to a missing scope"
+            )
+        address = (scope_id, revision_id)
+        if address in seen:
+            raise MemoryPersistenceCorruptionError(
+                "revision address appears multiple times"
+            )
+        seen.add(address)
+        addresses.append(address)
+    return tuple(addresses)
+
+
+def _load_revision(
+    cursor: sqlite3.Cursor,
+    scope: MemoryScope,
+    scope_id: int,
+    revision_id: str,
+) -> MemoryRevision | None:
+    _require_scope_id(
+        scope_id,
+        "revision lookup received an invalid positive signed 64-bit scope ID",
+    )
+    row = cursor.execute(_REVISION_SELECT, (scope_id, revision_id)).fetchone()
+    if row is None:
+        return None
+    try:
+        if len(row) != len(_REVISION_ROW_TYPES):
+            raise ValueError("revision row has the wrong field count")
+        for index, (value, expected_types) in enumerate(
+            zip(row, _REVISION_ROW_TYPES, strict=True)
+        ):
+            if not any(
+                type(value) is expected_type for expected_type in expected_types
+            ):
+                raise TypeError(
+                    f"revision row field {index} has the wrong storage class"
+                )
+        (
+            stored_revision_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            candidate_id,
+            memory_id,
+            generation,
+            operation_text,
+            parent_revision_id,
+            idempotency_key,
+        ) = row
+        if stored_revision_id != revision_id:
+            raise ValueError("loaded revision ID differs from requested ID")
+        proposal = RevisionProposal(
+            scope=scope,
+            candidate_id=candidate_id,
+            operation=RevisionOperation(operation_text),
+            parent_revision_id=parent_revision_id,
+            idempotency_key=idempotency_key,
+        )
+        revision = MemoryRevision(
+            revision_id=stored_revision_id,
+            memory_id=memory_id,
+            generation=generation,
+            proposal=proposal,
+            content_hash=content_hash,
+            created_at=datetime.fromisoformat(created_at_text),
+        )
+        if revision.created_at.isoformat() != created_at_text:
+            raise ValueError("revision created_at is not exact UTC isoformat text")
+        if proposal.canonical_bytes() != canonical:
+            raise ValueError("canonical revision bytes disagree with projections")
+        calculated_hash = sha256(canonical).hexdigest()
+        if content_hash != calculated_hash:
+            raise ValueError("revision content hash disagrees with canonical bytes")
+        calculated_id = f"rev_{calculated_hash[:24]}"
+        if stored_revision_id != calculated_id:
+            raise ValueError("revision ID disagrees with its content hash")
+        calculated_storage_hash = _record_storage_hash(
+            record_kind="revision",
+            scope=scope,
+            record_id=stored_revision_id,
+            content_hash=content_hash,
+            created_at_text=created_at_text,
+            memory_id=memory_id,
+            generation=generation,
+        )
+        if storage_hash != calculated_storage_hash:
+            raise ValueError("revision storage hash disagrees with stored metadata")
+        return revision
+    except MemoryPersistenceCorruptionError:
+        raise
+    except (TypeError, ValueError, OverflowError) as error:
+        raise MemoryPersistenceCorruptionError(
+            "stored revision row failed integrity validation"
+        ) from error
+
+
+def _validate_revision_topology(
+    revision_by_address: dict[tuple[int, str], MemoryRevision],
+    parent_by_address: dict[
+        tuple[int, str],
+        tuple[int, str] | None,
+    ],
+) -> None:
+    validated: set[tuple[int, str]] = set()
+    for start in revision_by_address:
+        if start in validated:
+            continue
+        trail: list[tuple[int, str]] = []
+        positions: dict[tuple[int, str], int] = {}
+        current = start
+        while current not in validated:
+            if current in positions:
+                raise MemoryPersistenceCorruptionError(
+                    "revision parent graph contains a cycle"
+                )
+            positions[current] = len(trail)
+            trail.append(current)
+            parent = parent_by_address[current]
+            if parent is None:
+                break
+            current = parent
+
+        for address in reversed(trail):
+            revision = revision_by_address[address]
+            parent_address = parent_by_address[address]
+            if parent_address is None:
+                if revision.generation != 0:
+                    raise MemoryPersistenceCorruptionError(
+                        "ADD revision generation is not zero"
+                    )
+                if revision.memory_id != f"mem_{revision.content_hash[:24]}":
+                    raise MemoryPersistenceCorruptionError(
+                        "ADD revision memory ID disagrees with its content hash"
+                    )
+            else:
+                parent = revision_by_address[parent_address]
+                if parent.generation == _MAX_GENERATION:
+                    raise MemoryPersistenceCorruptionError(
+                        "child revision follows a parent at maximum generation"
+                    )
+                if revision.memory_id != parent.memory_id:
+                    raise MemoryPersistenceCorruptionError(
+                        "child revision memory ID differs from parent memory ID"
+                    )
+                if revision.generation != parent.generation + 1:
+                    raise MemoryPersistenceCorruptionError(
+                        "child revision generation is not exactly parent generation plus one"
+                    )
+            validated.add(address)
+
+
+def _derive_revision_lineage(
+    proposal: RevisionProposal,
+    content_hash: str,
+    parent: MemoryRevision | None,
+) -> tuple[str, int]:
+    if proposal.operation is RevisionOperation.ADD:
+        if parent is not None:
+            raise ValueError("ADD revision lineage must not have a parent")
+        return f"mem_{content_hash[:24]}", 0
+    if parent is None:
+        raise ValueError("non-ADD revision lineage requires a parent")
+    if parent.generation == _MAX_GENERATION:
+        raise RevisionConflictError("revision generation exceeds the signed-64 range")
+    return parent.memory_id, parent.generation + 1
+
+
+def _load_revision_snapshot(
+    cursor: sqlite3.Cursor,
+) -> tuple[
+    dict[int, MemoryScope],
+    dict[tuple[int, str], MemoryCandidate],
+    dict[tuple[int, str], MemoryRevision],
+    dict[tuple[int, str], MemoryRevision],
+    dict[tuple[int, str], MemoryRevision],
+]:
+    (
+        scope_by_id,
+        _evidence_by_address,
+        candidate_by_address,
+        _candidate_by_idempotency,
+    ) = _load_candidate_snapshot(cursor)
+    addresses = _load_revision_addresses(cursor, scope_by_id)
+    revision_by_address: dict[tuple[int, str], MemoryRevision] = {}
+    for address in addresses:
+        scope_id, revision_id = address
+        revision = _load_revision(
+            cursor,
+            scope_by_id[scope_id],
+            scope_id,
+            revision_id,
+        )
+        if revision is None:
+            raise MemoryPersistenceCorruptionError(
+                "revision address refers to a missing row"
+            )
+        revision_by_address[address] = revision
+
+    revision_by_idempotency: dict[tuple[int, str], MemoryRevision] = {}
+    revision_by_candidate: dict[tuple[int, str], MemoryRevision] = {}
+    parent_by_address: dict[
+        tuple[int, str],
+        tuple[int, str] | None,
+    ] = {}
+    for address in addresses:
+        scope_id, _revision_id = address
+        revision = revision_by_address[address]
+        candidate_address = (scope_id, revision.proposal.candidate_id)
+        if candidate_address not in candidate_by_address:
+            raise MemoryPersistenceCorruptionError(
+                "revision refers to a missing same-scope candidate"
+            )
+        idempotency_address = (scope_id, revision.proposal.idempotency_key)
+        if idempotency_address in revision_by_idempotency:
+            raise MemoryPersistenceCorruptionError(
+                "revision idempotency key appears multiple times in one scope"
+            )
+        if candidate_address in revision_by_candidate:
+            raise MemoryPersistenceCorruptionError(
+                "candidate backs multiple revisions in one scope"
+            )
+        revision_by_idempotency[idempotency_address] = revision
+        revision_by_candidate[candidate_address] = revision
+
+        parent_revision_id = revision.proposal.parent_revision_id
+        parent_address = (
+            None if parent_revision_id is None else (scope_id, parent_revision_id)
+        )
+        if parent_address is not None and parent_address not in revision_by_address:
+            raise MemoryPersistenceCorruptionError(
+                "revision refers to a missing same-scope parent"
+            )
+        parent_by_address[address] = parent_address
+
+    _validate_revision_topology(revision_by_address, parent_by_address)
+    return (
+        scope_by_id,
+        candidate_by_address,
+        revision_by_address,
+        revision_by_idempotency,
+        revision_by_candidate,
+    )
+
+
 class SQLiteMemoryStore:
-    """Local SQLite backend for immutable evidence and candidate history."""
+    """Local SQLite backend for immutable evidence and memory history."""
 
     def __init__(self, database_path: str | os.PathLike[str]) -> None:
         self._database_path = _snapshot_database_path(database_path)
@@ -883,5 +1182,214 @@ class SQLiteMemoryStore:
                         if stored_scope_id == scope_id
                     ),
                     key=lambda candidate: candidate.candidate_id,
+                )
+            )
+
+    def append_revision(self, proposal: RevisionProposal) -> MemoryRevision:
+        """Persist one immutable candidate transition or return its exact retry."""
+
+        if type(proposal) is not RevisionProposal:
+            raise TypeError("proposal must be a RevisionProposal")
+        canonical = proposal.canonical_bytes()
+        content_hash = sha256(canonical).hexdigest()
+        revision_id = f"rev_{content_hash[:24]}"
+
+        with _write_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                candidate_by_address,
+                revision_by_address,
+                revision_by_idempotency,
+                revision_by_candidate,
+            ) = _load_revision_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, proposal.scope)
+            existing = (
+                None
+                if scope_id is None
+                else revision_by_idempotency.get((scope_id, proposal.idempotency_key))
+            )
+            if existing is not None:
+                if existing.proposal.canonical_bytes() == canonical:
+                    return existing
+                raise RevisionConflictError(
+                    "scoped revision idempotency key already refers to different content"
+                )
+
+            existing = (
+                None
+                if scope_id is None
+                else revision_by_address.get((scope_id, revision_id))
+            )
+            if existing is not None:
+                if existing.proposal.canonical_bytes() == canonical:
+                    return existing
+                raise RevisionConflictError(
+                    f"revision ID collision for {revision_id!r}"
+                )
+
+            candidate = (
+                None
+                if scope_id is None
+                else candidate_by_address.get((scope_id, proposal.candidate_id))
+            )
+            if candidate is None:
+                raise CandidateNotFoundError(
+                    f"candidate {proposal.candidate_id!r} was not found"
+                )
+            assert scope_id is not None
+            candidate_address = (scope_id, proposal.candidate_id)
+            if candidate_address in revision_by_candidate:
+                raise RevisionConflictError(
+                    f"candidate {proposal.candidate_id!r} already backs a revision"
+                )
+
+            parent: MemoryRevision | None = None
+            if proposal.operation is not RevisionOperation.ADD:
+                assert proposal.parent_revision_id is not None
+                parent = revision_by_address.get(
+                    (scope_id, proposal.parent_revision_id)
+                )
+                if parent is None:
+                    raise RevisionNotFoundError(
+                        f"revision {proposal.parent_revision_id!r} was not found"
+                    )
+            memory_id, generation = _derive_revision_lineage(
+                proposal,
+                content_hash,
+                parent,
+            )
+            created_at = datetime.now(UTC)
+            created_at_text = created_at.isoformat()
+            storage_hash = _record_storage_hash(
+                record_kind="revision",
+                scope=proposal.scope,
+                record_id=revision_id,
+                content_hash=content_hash,
+                created_at_text=created_at_text,
+                memory_id=memory_id,
+                generation=generation,
+            )
+            expected = MemoryRevision(
+                revision_id=revision_id,
+                memory_id=memory_id,
+                generation=generation,
+                proposal=proposal,
+                content_hash=content_hash,
+                created_at=created_at,
+            )
+            cursor.execute(
+                """INSERT INTO memory_revisions (
+    scope_id, revision_id, canonical, content_hash, created_at,
+    storage_hash, candidate_id, memory_id, generation, operation,
+    parent_revision_id, idempotency_key
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    scope_id,
+                    revision_id,
+                    canonical,
+                    content_hash,
+                    created_at_text,
+                    storage_hash,
+                    proposal.candidate_id,
+                    memory_id,
+                    generation,
+                    proposal.operation.value,
+                    proposal.parent_revision_id,
+                    proposal.idempotency_key,
+                ),
+            )
+            (
+                _scope_by_id,
+                _candidate_by_address,
+                inserted_revisions,
+                _revision_by_idempotency,
+                _revision_by_candidate,
+            ) = _load_revision_snapshot(cursor)
+            inserted = inserted_revisions.get((scope_id, revision_id))
+            if inserted is None:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted revision graph could not be reloaded"
+                )
+            if inserted != expected:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted revision did not round-trip exactly"
+                )
+            return inserted
+
+    def get_revision(
+        self,
+        scope: MemoryScope,
+        revision_id: str,
+    ) -> MemoryRevision:
+        """Load one revision only from its exact public scope."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        revision_id = _validate_string(
+            revision_id,
+            "revision_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _candidate_by_address,
+                revision_by_address,
+                _revision_by_idempotency,
+                _revision_by_candidate,
+            ) = _load_revision_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            revision = (
+                None
+                if scope_id is None
+                else revision_by_address.get((scope_id, revision_id))
+            )
+            if revision is None:
+                raise RevisionNotFoundError(f"revision {revision_id!r} was not found")
+            return revision
+
+    def list_revisions(
+        self,
+        scope: MemoryScope,
+        *,
+        memory_id: str | None = None,
+    ) -> tuple[MemoryRevision, ...]:
+        """Return a trusted parent-before-child revision snapshot."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        if memory_id is not None:
+            memory_id = _validate_string(
+                memory_id,
+                "memory_id",
+                allow_blank=True,
+            )
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _candidate_by_address,
+                revision_by_address,
+                _revision_by_idempotency,
+                _revision_by_candidate,
+            ) = _load_revision_snapshot(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            if scope_id is None:
+                return ()
+            revisions = (
+                revision
+                for (stored_scope_id, _revision_id), revision in (
+                    revision_by_address.items()
+                )
+                if stored_scope_id == scope_id
+                and (memory_id is None or revision.memory_id == memory_id)
+            )
+            return tuple(
+                sorted(
+                    revisions,
+                    key=lambda revision: (
+                        revision.memory_id,
+                        revision.generation,
+                        revision.revision_id,
+                    ),
                 )
             )

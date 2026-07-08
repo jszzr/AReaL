@@ -29,12 +29,19 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceError,
     MemoryPersistenceSchemaError,
     MemoryServiceError,
+    RevisionNotFoundError,
 )
-from areal.v2.memory_service.history_types import CandidateProposal
+from areal.v2.memory_service.history_types import (
+    CandidateProposal,
+    MemoryCandidate,
+    RevisionOperation,
+    RevisionProposal,
+)
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
+    EvidenceRecord,
     MemoryScope,
 )
 
@@ -380,6 +387,44 @@ def _make_sqlite_candidate(**overrides: object) -> CandidateProposal:
     return CandidateProposal(**values)  # type: ignore[arg-type]
 
 
+def _make_sqlite_revision(**overrides: object) -> RevisionProposal:
+    values: dict[str, object] = {
+        "scope": MemoryScope("tenant-1", "assistant-memory", "user-1"),
+        "candidate_id": "cand_missing",
+        "operation": RevisionOperation.ADD,
+        "parent_revision_id": None,
+        "idempotency_key": "revision-request-1",
+    }
+    values.update(overrides)
+    return RevisionProposal(**values)  # type: ignore[arg-type]
+
+
+def _append_sqlite_revision_candidate(
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    *,
+    index: int,
+    key: str,
+) -> tuple[MemoryCandidate, EvidenceRecord]:
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            sequence_no=index,
+            payload=f"revision evidence {key}",
+            idempotency_key=f"revision-evidence-{key}",
+        )
+    )
+    candidate = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=scope,
+            content=f"revision candidate {key}",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=f"revision-candidate-{key}",
+        )
+    )
+    return candidate, evidence
+
+
 def _memory_graph_state(
     database_path: str | Path,
 ) -> tuple[tuple[int, int, int, int], list[tuple[object, ...]]]:
@@ -403,6 +448,38 @@ def _memory_graph_state(
     assert len(counts) == 4
     assert all(type(count) is int for count in counts)
     return (counts[0], counts[1], counts[2], counts[3]), foreign_key_violations
+
+
+def _revision_graph_state(
+    database_path: str | Path,
+) -> tuple[tuple[int, int, int, int, int], list[tuple[object, ...]]]:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        counts = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "memory_scopes",
+                "memory_evidence",
+                "memory_candidates",
+                "memory_candidate_evidence",
+                "memory_revisions",
+            )
+        )
+        foreign_key_violations = [
+            tuple(row)
+            for row in connection.execute("PRAGMA foreign_key_check").fetchall()
+        ]
+    finally:
+        connection.close()
+    assert len(counts) == 5
+    assert all(type(count) is int for count in counts)
+    return (
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+    ), foreign_key_violations
 
 
 class _StableDigest:
@@ -436,6 +513,10 @@ class _SQLiteEvidenceEventSubclass(EvidenceEvent):
 
 
 class _SQLiteCandidateProposalSubclass(CandidateProposal):
+    pass
+
+
+class _SQLiteRevisionProposalSubclass(RevisionProposal):
     pass
 
 
@@ -5088,3 +5169,458 @@ def test_sqlite_candidate_post_insert_graph_readback_prevents_commit(
         recovered.candidate_id,
     )
     assert _memory_graph_state(database_path) == ((1, 4, 1, 3), [])
+
+
+def test_sqlite_revision_reopen_retry_preserves_root_child_and_sibling_topology(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "revision-topology.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-topology")
+    candidate_evidence = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"topology-{index}",
+        )
+        for index in range(4)
+    )
+    candidates = tuple(item[0] for item in candidate_evidence)
+    evidence = tuple(item[1] for item in candidate_evidence)
+    root_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[0].candidate_id,
+        idempotency_key="topology-root",
+    )
+    root = store.append_revision(root_proposal)
+    refine_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[1].candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=root.revision_id,
+        idempotency_key="topology-refine",
+    )
+    contradict_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[2].candidate_id,
+        operation=RevisionOperation.CONTRADICT,
+        parent_revision_id=root.revision_id,
+        idempotency_key="topology-contradict",
+    )
+    refine = store.append_revision(refine_proposal)
+    contradict = store.append_revision(contradict_proposal)
+    supersede_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[3].candidate_id,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=refine.revision_id,
+        idempotency_key="topology-supersede",
+    )
+    supersede = store.append_revision(supersede_proposal)
+    originals = (root, refine, contradict, supersede)
+    proposals = (
+        root_proposal,
+        refine_proposal,
+        contradict_proposal,
+        supersede_proposal,
+    )
+
+    for revision, proposal in zip(originals, proposals, strict=True):
+        expected_hash = hashlib.sha256(proposal.canonical_bytes()).hexdigest()
+        assert revision.revision_id == f"rev_{expected_hash[:24]}"
+        assert revision.content_hash == expected_hash
+        assert revision.proposal == proposal
+        assert revision.proposal is not proposal
+        assert revision.created_at.tzinfo is UTC
+    assert root.memory_id == f"mem_{root.content_hash[:24]}"
+    assert root.generation == 0
+    assert root.proposal.operation is RevisionOperation.ADD
+    assert root.proposal.parent_revision_id is None
+    assert (
+        refine.memory_id
+        == contradict.memory_id
+        == supersede.memory_id
+        == (root.memory_id)
+    )
+    assert refine.generation == contradict.generation == 1
+    assert supersede.generation == 2
+    assert refine.proposal.parent_revision_id == root.revision_id
+    assert contradict.proposal.parent_revision_id == root.revision_id
+    assert supersede.proposal.parent_revision_id == refine.revision_id
+    assert _revision_graph_state(database_path) == ((1, 4, 4, 4, 4), [])
+
+    del store
+    reopened = SQLiteMemoryStore(database_path)
+    loaded = tuple(
+        reopened.get_revision(scope, revision.revision_id) for revision in originals
+    )
+    retries = tuple(
+        reopened.append_revision(
+            RevisionProposal(
+                scope=proposal.scope,
+                candidate_id=proposal.candidate_id,
+                operation=proposal.operation,
+                parent_revision_id=proposal.parent_revision_id,
+                idempotency_key=proposal.idempotency_key,
+            )
+        )
+        for proposal in proposals
+    )
+
+    assert loaded == retries == originals
+    for original, persisted, retry in zip(originals, loaded, retries, strict=True):
+        assert persisted is not original
+        assert retry is not original
+        assert persisted.revision_id == retry.revision_id == original.revision_id
+        assert persisted.memory_id == retry.memory_id == original.memory_id
+        assert persisted.generation == retry.generation == original.generation
+        assert persisted.proposal == retry.proposal == original.proposal
+        assert persisted.content_hash == retry.content_hash == original.content_hash
+        assert persisted.created_at == retry.created_at == original.created_at
+    assert reopened.list_revisions(scope) == tuple(
+        sorted(
+            originals,
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    assert reopened.list_revisions(scope, memory_id=root.memory_id) == tuple(
+        sorted(
+            originals,
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    for index, revision in enumerate(originals):
+        candidate = reopened.get_candidate(scope, revision.proposal.candidate_id)
+        assert candidate == candidates[index]
+        assert reopened.get_candidate_evidence(scope, candidate.candidate_id) == (
+            evidence[index],
+        )
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        rows = connection.execute(
+            "SELECT revision_id, candidate_id, memory_id, generation, operation, "
+            "parent_revision_id, idempotency_key FROM memory_revisions"
+        ).fetchall()
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        connection.close()
+    assert len(rows) == 4
+    assert len({row[0] for row in rows}) == 4
+    assert len({row[1] for row in rows}) == 4
+    assert foreign_keys == []
+    assert _revision_graph_state(database_path) == ((1, 4, 4, 4, 4), [])
+
+
+def test_sqlite_revision_queries_sort_filter_and_snapshot_public_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-queries.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-query-user")
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-query-foreign-user",
+    )
+    candidate_evidence = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"query-{index}",
+        )
+        for index in range(6)
+    )
+    candidates = tuple(item[0] for item in candidate_evidence)
+    first_root_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[0].candidate_id,
+        idempotency_key="query-root-1",
+    )
+    second_root_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[1].candidate_id,
+        idempotency_key="query-root-2",
+    )
+
+    def proposal_hash(proposal: RevisionProposal) -> str:
+        return hashlib.sha256(proposal.canonical_bytes()).hexdigest()
+
+    root_proposals = tuple(
+        sorted(
+            (first_root_proposal, second_root_proposal),
+            key=proposal_hash,
+        )
+    )
+    lower_root_proposal, higher_root_proposal = root_proposals
+    higher_root = store.append_revision(higher_root_proposal)
+    lower_root = store.append_revision(lower_root_proposal)
+    assert lower_root.memory_id < higher_root.memory_id
+    refine_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[2].candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=lower_root.revision_id,
+        idempotency_key="query-refine",
+    )
+    contradict_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[3].candidate_id,
+        operation=RevisionOperation.CONTRADICT,
+        parent_revision_id=lower_root.revision_id,
+        idempotency_key="query-contradict",
+    )
+    sibling_proposals = tuple(
+        sorted(
+            (refine_proposal, contradict_proposal),
+            key=proposal_hash,
+            reverse=True,
+        )
+    )
+    sibling_by_operation = {
+        proposal.operation: store.append_revision(proposal)
+        for proposal in sibling_proposals
+    }
+    refine = sibling_by_operation[RevisionOperation.REFINE]
+    contradict = sibling_by_operation[RevisionOperation.CONTRADICT]
+    grandchild_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[4].candidate_id,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=refine.revision_id,
+        idempotency_key="query-grandchild",
+    )
+    grandchild = store.append_revision(grandchild_proposal)
+    initial_scope_revisions = (
+        higher_root,
+        lower_root,
+        refine,
+        contradict,
+        grandchild,
+    )
+    expected = tuple(
+        sorted(
+            initial_scope_revisions,
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    expected_revision_ids = tuple(item.revision_id for item in expected)
+    assert tuple(item.revision_id for item in initial_scope_revisions) != tuple(
+        expected_revision_ids
+    )
+
+    foreign_candidate, _foreign_evidence = _append_sqlite_revision_candidate(
+        store,
+        foreign_scope,
+        index=0,
+        key="query-foreign",
+    )
+    foreign = store.append_revision(
+        _make_sqlite_revision(
+            scope=foreign_scope,
+            candidate_id=foreign_candidate.candidate_id,
+            idempotency_key="query-foreign-revision",
+        )
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    revision_address_sql = _normalize_sql(
+        "SELECT scope_id, revision_id FROM memory_revisions"
+    )
+    presented_revision_addresses: list[tuple[tuple[object, ...], ...]] = []
+    real_connect = sqlite_backend._connect
+
+    class ReverseRevisionAddressCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> ReverseRevisionAddressCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            if self._last_sql == revision_address_sql:
+                rows_by_revision_id = {
+                    row[1]: row for row in rows if row[0] == scope_id
+                }
+                foreign_rows = [row for row in rows if row[0] != scope_id]
+                later_scope_rows = [
+                    row
+                    for row in rows
+                    if row[0] == scope_id and row[1] not in expected_revision_ids
+                ]
+                rows = [
+                    *foreign_rows,
+                    *(
+                        rows_by_revision_id[revision_id]
+                        for revision_id in reversed(expected_revision_ids)
+                    ),
+                    *later_scope_rows,
+                ]
+                presented_revision_addresses.append(tuple(rows))
+            return rows
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class ReverseRevisionAddressConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> ReverseRevisionAddressCursor:
+            return ReverseRevisionAddressCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> ReverseRevisionAddressConnection:
+        return ReverseRevisionAddressConnection(real_connect(path))
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    listed = store.list_revisions(scope)
+
+    assert listed == expected
+    assert len(presented_revision_addresses) == 1
+    presented_scope_ids = tuple(
+        row[1] for row in presented_revision_addresses[0] if row[0] == scope_id
+    )
+    assert presented_scope_ids == tuple(reversed(expected_revision_ids))
+    revision_id_probe = _SnapshotProbeStr(lower_root.revision_id)
+    memory_id_probe = _SnapshotProbeStr(lower_root.memory_id)
+    assert store.get_revision(scope, revision_id_probe) == lower_root
+    lower_memory = tuple(
+        item for item in expected if item.memory_id == lower_root.memory_id
+    )
+    assert store.list_revisions(scope, memory_id=memory_id_probe) == lower_memory
+    assert revision_id_probe.override_calls == 0
+    assert memory_id_probe.override_calls == 0
+    assert lower_memory == tuple(
+        sorted(
+            (lower_root, refine, contradict, grandchild),
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    assert store.list_revisions(scope, memory_id="mem_missing") == ()
+    for blank in ("", " \t", "\x00"):
+        with pytest.raises(RevisionNotFoundError) as raised:
+            store.get_revision(scope, blank)
+        assert type(raised.value) is RevisionNotFoundError
+        assert str(raised.value) == (f"revision {str.__str__(blank)!r} was not found")
+        assert store.list_revisions(scope, memory_id=blank) == ()
+
+    with pytest.raises(RevisionNotFoundError) as foreign_error:
+        store.get_revision(foreign_scope, lower_root.revision_id)
+    with pytest.raises(RevisionNotFoundError) as missing_error:
+        store.get_revision(
+            MemoryScope("tenant-1", "assistant-memory", "missing-revision-user"),
+            lower_root.revision_id,
+        )
+    assert type(foreign_error.value) is RevisionNotFoundError
+    assert str(foreign_error.value) == str(missing_error.value)
+    assert store.list_revisions(foreign_scope) == (foreign,)
+    assert (
+        store.list_revisions(
+            foreign_scope,
+            memory_id=lower_root.memory_id,
+        )
+        == ()
+    )
+    assert (
+        store.list_revisions(
+            MemoryScope("tenant-1", "assistant-memory", "missing-revision-user"),
+            memory_id=lower_root.memory_id,
+        )
+        == ()
+    )
+
+    snapshot = listed
+    later_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[5].candidate_id,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=contradict.revision_id,
+        idempotency_key="query-later",
+    )
+    later = store.append_revision(later_proposal)
+    assert snapshot == expected
+    assert store.list_revisions(scope) == tuple(
+        sorted(
+            (*expected, later),
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    assert _revision_graph_state(database_path) == ((2, 7, 7, 7, 7), [])
+
+    monkeypatch.undo()
+
+    def transaction_must_not_start(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validation reached SQLite I/O")
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_read_transaction",
+        transaction_must_not_start,
+    )
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_write_transaction",
+        transaction_must_not_start,
+    )
+    proposal_subclass = _SQLiteRevisionProposalSubclass(
+        lower_root_proposal.scope,
+        lower_root_proposal.candidate_id,
+        lower_root_proposal.operation,
+        lower_root_proposal.parent_revision_id,
+        lower_root_proposal.idempotency_key,
+    )
+    scope_subclass = _SQLiteMemoryScopeSubclass(
+        scope.tenant_id,
+        scope.namespace,
+        scope.subject_id,
+    )
+
+    with pytest.raises(TypeError, match="proposal must be a RevisionProposal"):
+        store.append_revision(proposal_subclass)
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.get_revision(scope_subclass, lower_root.revision_id)
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.list_revisions(scope_subclass)
+    for invalid_id in (None, 7):
+        with pytest.raises(TypeError, match="revision_id must be a string"):
+            store.get_revision(scope, invalid_id)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="revision_id must be valid UTF-8"):
+        store.get_revision(scope, "\ud800")
+    for invalid_memory_id in (7, b"memory"):
+        with pytest.raises(TypeError, match="memory_id must be a string"):
+            store.list_revisions(  # type: ignore[arg-type]
+                scope,
+                memory_id=invalid_memory_id,
+            )
+    with pytest.raises(ValueError, match="memory_id must be valid UTF-8"):
+        store.list_revisions(scope, memory_id="\ud800")
