@@ -20,6 +20,7 @@ import pytest
 import areal.v2.memory_service._sqlite_backend as sqlite_backend
 import areal.v2.memory_service.sqlite_store as sqlite_store_module
 from areal.v2.memory_service.errors import (
+    EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryPersistenceBusyError,
     MemoryPersistenceCorruptionError,
@@ -793,6 +794,193 @@ def test_sqlite_evidence_list_filters_and_uses_python_contract_order(
         session_id="session-a",
         run_id="run-b",
     ) == (records[1],)
+
+
+def test_sqlite_evidence_idempotency_precedes_true_id_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    scope = MemoryScope("tenant-1", "assistant-memory", "precedence-user")
+    idempotency_owner = _make_sqlite_evidence(
+        scope=scope,
+        payload="idempotency owner",
+        idempotency_key="shared-key",
+    )
+    id_owner = _make_sqlite_evidence(
+        scope=scope,
+        payload="ID owner",
+        idempotency_key="id-owner-key",
+    )
+    challenger = _make_sqlite_evidence(
+        scope=scope,
+        payload="conflicts with two different rows",
+        idempotency_key="shared-key",
+    )
+    digest_by_canonical = {
+        idempotency_owner.canonical_bytes(): "a" * 64,
+        id_owner.canonical_bytes(): "b" * 64,
+        challenger.canonical_bytes(): "b" * 64,
+    }
+
+    class StableDigest:
+        def __init__(self, digest: str) -> None:
+            self._digest = digest
+
+        def hexdigest(self) -> str:
+            return self._digest
+
+    def collision_sha256(canonical: bytes) -> StableDigest:
+        return StableDigest(digest_by_canonical[canonical])
+
+    monkeypatch.setattr(sqlite_store_module, "sha256", collision_sha256)
+    first = store.append(idempotency_owner)
+    second = store.append(id_owner)
+    assert first.evidence_id != second.evidence_id
+
+    with pytest.raises(EvidenceConflictError) as raised:
+        store.append(challenger)
+
+    assert str(raised.value) == (
+        "scoped idempotency key already refers to different evidence"
+    )
+    assert store.list(scope) == tuple(
+        sorted((first, second), key=sqlite_store_module._evidence_sort_key)
+    )
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+def test_sqlite_evidence_collision_is_scoped_atomic_and_loser_key_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+) -> None:
+    database_path = tmp_path / f"{collision_kind}.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    first_scope = MemoryScope("tenant-1", "assistant-memory", "collision-user-1")
+    second_scope = MemoryScope("tenant-1", "assistant-memory", "collision-user-2")
+    first_event = _make_sqlite_evidence(
+        scope=first_scope,
+        payload="first",
+        idempotency_key="first-key",
+    )
+    loser_event = _make_sqlite_evidence(
+        scope=first_scope,
+        payload="loser",
+        idempotency_key="loser-key",
+    )
+    cross_scope_event = _make_sqlite_evidence(
+        scope=second_scope,
+        payload="cross scope",
+        idempotency_key="first-key",
+    )
+    shared_prefix = "a" * 24
+    first_digest = (
+        "a" * 64 if collision_kind == "full-hash" else shared_prefix + "b" * 40
+    )
+    loser_digest = (
+        first_digest if collision_kind == "full-hash" else shared_prefix + "c" * 40
+    )
+    digest_by_canonical = {
+        first_event.canonical_bytes(): first_digest,
+        loser_event.canonical_bytes(): loser_digest,
+        cross_scope_event.canonical_bytes(): first_digest,
+    }
+
+    class StableDigest:
+        def __init__(self, digest: str) -> None:
+            self._digest = digest
+
+        def hexdigest(self) -> str:
+            return self._digest
+
+    def collision_sha256(canonical: bytes) -> StableDigest:
+        return StableDigest(digest_by_canonical[canonical])
+
+    monkeypatch.setattr(sqlite_store_module, "sha256", collision_sha256)
+    original = store.append(first_event)
+
+    with pytest.raises(EvidenceConflictError) as raised:
+        store.append(loser_event)
+
+    assert str(raised.value) == f"evidence ID collision for {original.evidence_id!r}"
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT idempotency_key FROM memory_evidence"
+        ).fetchall() == [("first-key",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+    cross_scope = store.append(cross_scope_event)
+    assert cross_scope.evidence_id == original.evidence_id
+    digest_by_canonical[loser_event.canonical_bytes()] = "d" * 64
+    recovered_loser = store.append(loser_event)
+
+    assert recovered_loser.evidence_id == f"evd_{'d' * 24}"
+    assert store.get(first_scope, original.evidence_id) == original
+    assert store.get(second_scope, cross_scope.evidence_id) == cross_scope
+    assert {record.event.idempotency_key for record in store.list(first_scope)} == {
+        "first-key",
+        "loser-key",
+    }
+    assert store.list(second_scope) == (cross_scope,)
+
+
+def test_sqlite_evidence_failed_scope_insert_rolls_back_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "memory.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "rollback-user")
+    event = _make_sqlite_evidence(scope=scope, idempotency_key="rollback-key")
+    injected = sqlite3.IntegrityError("injected after real scope insert")
+    plan = _SQLiteFailurePlan(
+        after_statement="INSERT INTO memory_scopes",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        store.append(event)
+
+    assert type(raised.value) is MemoryPersistenceError
+    assert not isinstance(raised.value, EvidenceConflictError)
+    assert raised.value.__cause__ is injected
+    assert any(
+        entry.startswith("executed:INSERT INTO MEMORY_SCOPES") for entry in plan.events
+    )
+    assert "executed:ROLLBACK" in plan.events
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_scopes WHERE subject_id = ?",
+            (scope.subject_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone() == (0,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+    monkeypatch.undo()
+    recovered = store.append(event)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_scopes WHERE subject_id = ?",
+            (scope.subject_id,),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone() == (1,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+    assert store.get(scope, recovered.evidence_id) == recovered
 
 
 @pytest.mark.parametrize(

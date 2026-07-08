@@ -189,6 +189,19 @@ class SQLiteMemoryStore:
                     "scoped idempotency key already refers to different evidence"
                 )
 
+            existing = _load_evidence(
+                cursor,
+                event.scope,
+                scope_id,
+                evidence_id,
+            )
+            if existing is not None:
+                if existing.event.canonical_bytes() == canonical:
+                    return existing
+                raise EvidenceConflictError(
+                    f"evidence ID collision for {evidence_id!r}"
+                )
+
             created_at = datetime.now(UTC)
             created_at_text = created_at.isoformat()
             storage_hash = _record_storage_hash(
