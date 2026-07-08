@@ -5232,6 +5232,364 @@ def test_sqlite_candidate_post_insert_graph_readback_prevents_commit(
     assert _memory_graph_state(database_path) == ((1, 4, 1, 3), [])
 
 
+def test_sqlite_revision_insert_failure_rolls_back_and_candidate_is_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-insert-failure.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-insert-failure")
+    candidate, evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=0,
+        key="revision-insert-failure",
+    )
+    proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidate.candidate_id,
+        idempotency_key="revision-insert-failure-request",
+    )
+    expected_revision_id = (
+        f"rev_{hashlib.sha256(proposal.canonical_bytes()).hexdigest()[:24]}"
+    )
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((1, 1, 1, 1, 0), [])
+    injected = sqlite3.OperationalError("injected after real revision insert")
+    injected.sqlite_errorcode = sqlite3.SQLITE_IOERR
+    plan = _SQLiteFailurePlan(
+        after_statement="INSERT INTO memory_revisions",
+        after_statement_error=injected,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, plan)
+
+    with pytest.raises(MemoryPersistenceError) as raised:
+        store.append_revision(proposal)
+
+    assert type(raised.value) is MemoryPersistenceError
+    assert raised.value.__cause__ is injected
+    insert_events = [
+        index
+        for index, event in enumerate(plan.events)
+        if event.startswith("executed:INSERT INTO MEMORY_REVISIONS")
+    ]
+    assert len(insert_events) == 1
+    failure_index = next(
+        index
+        for index, event in enumerate(plan.events)
+        if event.startswith("fail-after:INSERT INTO MEMORY_REVISIONS")
+    )
+    rollback_index = plan.events.index("executed:ROLLBACK")
+    close_index = plan.events.index("executed:CLOSE")
+    assert insert_events[0] < failure_index < rollback_index < close_index
+    assert "attempt:COMMIT" not in plan.events
+    assert "executed:COMMIT" not in plan.events
+    assert _revision_graph_state(database_path) == baseline_state
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        candidate_row = connection.execute(
+            "SELECT candidate_id FROM memory_candidates WHERE candidate_id = ?",
+            (candidate.candidate_id,),
+        ).fetchone()
+        evidence_row = connection.execute(
+            "SELECT evidence_id FROM memory_evidence WHERE evidence_id = ?",
+            (evidence.evidence_id,),
+        ).fetchone()
+        revision_rows = connection.execute(
+            "SELECT revision_id FROM memory_revisions "
+            "WHERE revision_id = ? OR candidate_id = ? OR idempotency_key = ?",
+            (
+                expected_revision_id,
+                candidate.candidate_id,
+                proposal.idempotency_key,
+            ),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert candidate_row == (candidate.candidate_id,)
+    assert evidence_row == (evidence.evidence_id,)
+    assert revision_rows == []
+
+    monkeypatch.undo()
+    recovered = store.append_revision(proposal)
+
+    assert recovered.revision_id == expected_revision_id
+    assert recovered.proposal == proposal
+    assert store.get_candidate(scope, candidate.candidate_id) == candidate
+    assert store.get_candidate_evidence(scope, candidate.candidate_id) == (evidence,)
+    assert (
+        SQLiteMemoryStore(database_path).get_revision(
+            scope,
+            expected_revision_id,
+        )
+        == recovered
+    )
+    assert _revision_graph_state(database_path) == ((1, 1, 1, 1, 1), [])
+
+
+def test_sqlite_revision_post_insert_global_readback_prevents_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-post-insert-readback.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    unrelated_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-readback-unrelated",
+    )
+    target_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-readback-target",
+    )
+    unrelated_candidate, _unrelated_evidence = _append_sqlite_revision_candidate(
+        store,
+        unrelated_scope,
+        index=0,
+        key="revision-readback-unrelated",
+    )
+    unrelated_revision = store.append_revision(
+        _make_sqlite_revision(
+            scope=unrelated_scope,
+            candidate_id=unrelated_candidate.candidate_id,
+            idempotency_key="revision-readback-unrelated-root",
+        )
+    )
+    target_candidate, _target_evidence = _append_sqlite_revision_candidate(
+        store,
+        target_scope,
+        index=0,
+        key="revision-readback-target",
+    )
+    target_proposal = _make_sqlite_revision(
+        scope=target_scope,
+        candidate_id=target_candidate.candidate_id,
+        idempotency_key="revision-readback-target-root",
+    )
+    target_revision_id = (
+        f"rev_{hashlib.sha256(target_proposal.canonical_bytes()).hexdigest()[:24]}"
+    )
+    assert unrelated_revision.generation == 0
+    tampered_generation = 1
+    tampered_storage_hash = sqlite_store_module._record_storage_hash(
+        record_kind="revision",
+        scope=unrelated_scope,
+        record_id=unrelated_revision.revision_id,
+        content_hash=unrelated_revision.content_hash,
+        created_at_text=unrelated_revision.created_at.isoformat(),
+        memory_id=unrelated_revision.memory_id,
+        generation=tampered_generation,
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_rows = connection.execute(
+            "SELECT scope_id, subject_id FROM memory_scopes"
+        ).fetchall()
+        original_unrelated_row = connection.execute(
+            "SELECT generation, storage_hash FROM memory_revisions "
+            "WHERE revision_id = ?",
+            (unrelated_revision.revision_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    scope_id_by_subject = {subject_id: scope_id for scope_id, subject_id in scope_rows}
+    unrelated_scope_id = scope_id_by_subject[unrelated_scope.subject_id]
+    target_scope_id = scope_id_by_subject[target_scope.subject_id]
+    assert original_unrelated_row == (
+        unrelated_revision.generation,
+        sqlite_store_module._record_storage_hash(
+            record_kind="revision",
+            scope=unrelated_scope,
+            record_id=unrelated_revision.revision_id,
+            content_hash=unrelated_revision.content_hash,
+            created_at_text=unrelated_revision.created_at.isoformat(),
+            memory_id=unrelated_revision.memory_id,
+            generation=unrelated_revision.generation,
+        ),
+    )
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((2, 2, 2, 2, 1), [])
+    revision_address_sql = _normalize_sql(
+        "SELECT scope_id, revision_id FROM memory_revisions"
+    )
+    revision_scalar_sql = _normalize_sql(sqlite_store_module._REVISION_SELECT)
+    probe_hits = {
+        "insert": 0,
+        "tamper": 0,
+        "address-scan": 0,
+        "unrelated-scalar": 0,
+        "topology": 0,
+    }
+    events: list[str] = []
+    real_connect = sqlite_backend._connect
+    real_validate_revision_topology = sqlite_store_module._validate_revision_topology
+
+    class TamperUnrelatedRevisionCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> TamperUnrelatedRevisionCursor:
+            normalized = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            if normalized.startswith("INSERT INTO MEMORY_REVISIONS"):
+                assert isinstance(parameters, tuple)
+                assert len(parameters) == 12
+                assert parameters[0] == target_scope_id
+                assert parameters[1] == target_revision_id
+                assert parameters[6] == target_candidate.candidate_id
+                probe_hits["insert"] += 1
+                events.append("insert")
+                assert probe_hits["insert"] == 1
+                self._real_cursor.execute(
+                    "UPDATE memory_revisions "
+                    "SET generation = ?, storage_hash = ? "
+                    "WHERE scope_id = ? AND revision_id = ?",
+                    (
+                        tampered_generation,
+                        tampered_storage_hash,
+                        unrelated_scope_id,
+                        unrelated_revision.revision_id,
+                    ),
+                )
+                assert self._real_cursor.rowcount == 1
+                self._real_cursor.execute("PRAGMA foreign_key_check")
+                assert self._real_cursor.fetchall() == []
+                probe_hits["tamper"] += 1
+                events.append("tamper")
+            elif probe_hits["tamper"]:
+                if normalized == revision_address_sql:
+                    probe_hits["address-scan"] += 1
+                    events.append("address-scan")
+                elif normalized == revision_scalar_sql and parameters == (
+                    unrelated_scope_id,
+                    unrelated_revision.revision_id,
+                ):
+                    probe_hits["unrelated-scalar"] += 1
+                    events.append("unrelated-scalar")
+                elif normalized == "ROLLBACK":
+                    events.append("rollback")
+                elif normalized == "COMMIT":
+                    events.append("commit")
+            return self
+
+        def __iter__(self) -> Any:
+            return iter(self._real_cursor)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class TamperUnrelatedRevisionConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> TamperUnrelatedRevisionCursor:
+            return TamperUnrelatedRevisionCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def close(self) -> None:
+            self._real_connection.close()
+            events.append("close")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    def connect(path: str) -> TamperUnrelatedRevisionConnection:
+        return TamperUnrelatedRevisionConnection(real_connect(path))
+
+    def observe_revision_topology(
+        revision_by_address: dict[tuple[int, str], MemoryRevision],
+        parent_by_address: dict[tuple[int, str], tuple[int, str] | None],
+    ) -> None:
+        if probe_hits["tamper"]:
+            probe_hits["topology"] += 1
+            events.append("topology")
+        real_validate_revision_topology(revision_by_address, parent_by_address)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", connect)
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_validate_revision_topology",
+        observe_revision_topology,
+    )
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.append_revision(target_proposal)
+
+    assert type(raised.value) is MemoryPersistenceCorruptionError
+    assert str(raised.value) == "ADD revision generation is not zero"
+    assert raised.value.__cause__ is None
+    assert probe_hits == {
+        "insert": 1,
+        "tamper": 1,
+        "address-scan": 1,
+        "unrelated-scalar": 1,
+        "topology": 1,
+    }
+    assert events == [
+        "insert",
+        "tamper",
+        "address-scan",
+        "unrelated-scalar",
+        "topology",
+        "rollback",
+        "close",
+    ]
+    assert "commit" not in events
+    assert _revision_graph_state(database_path) == baseline_state
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        restored_unrelated_row = connection.execute(
+            "SELECT generation, storage_hash FROM memory_revisions "
+            "WHERE scope_id = ? AND revision_id = ?",
+            (unrelated_scope_id, unrelated_revision.revision_id),
+        ).fetchone()
+        target_rows = connection.execute(
+            "SELECT revision_id FROM memory_revisions "
+            "WHERE scope_id = ? AND (revision_id = ? OR candidate_id = ? "
+            "OR idempotency_key = ?)",
+            (
+                target_scope_id,
+                target_revision_id,
+                target_candidate.candidate_id,
+                target_proposal.idempotency_key,
+            ),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert restored_unrelated_row == original_unrelated_row
+    assert target_rows == []
+
+    monkeypatch.undo()
+    recovered = store.append_revision(target_proposal)
+
+    assert recovered.revision_id == target_revision_id
+    assert (
+        store.get_revision(
+            unrelated_scope,
+            unrelated_revision.revision_id,
+        )
+        == unrelated_revision
+    )
+    assert (
+        SQLiteMemoryStore(database_path).get_revision(
+            target_scope,
+            target_revision_id,
+        )
+        == recovered
+    )
+    assert _revision_graph_state(database_path) == ((2, 2, 2, 2, 2), [])
+
+
 def test_sqlite_revision_reopen_retry_preserves_root_child_and_sibling_topology(
     tmp_path: Path,
 ) -> None:
