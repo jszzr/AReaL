@@ -20,6 +20,7 @@ import pytest
 import areal.v2.memory_service._sqlite_backend as sqlite_backend
 import areal.v2.memory_service.sqlite_store as sqlite_store_module
 from areal.v2.memory_service.errors import (
+    CandidateNotFoundError,
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryPersistenceBusyError,
@@ -28,6 +29,7 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceSchemaError,
     MemoryServiceError,
 )
+from areal.v2.memory_service.history_types import CandidateProposal
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -366,11 +368,26 @@ def _make_sqlite_evidence(**overrides: object) -> EvidenceEvent:
     return EvidenceEvent(**values)  # type: ignore[arg-type]
 
 
+def _make_sqlite_candidate(**overrides: object) -> CandidateProposal:
+    values: dict[str, object] = {
+        "scope": MemoryScope("tenant-1", "assistant-memory", "user-1"),
+        "content": "remember the durable answer",
+        "evidence_ids": ("evd_missing",),
+        "idempotency_key": "candidate-request-1",
+    }
+    values.update(overrides)
+    return CandidateProposal(**values)  # type: ignore[arg-type]
+
+
 class _SQLiteMemoryScopeSubclass(MemoryScope):
     pass
 
 
 class _SQLiteEvidenceEventSubclass(EvidenceEvent):
+    pass
+
+
+class _SQLiteCandidateProposalSubclass(CandidateProposal):
     pass
 
 
@@ -398,7 +415,9 @@ class _SnapshotProbeStr(str):
         self.override_calls += 1
         return False
 
-    __hash__ = str.__hash__
+    def __hash__(self) -> int:
+        self.override_calls += 1
+        return str.__hash__(self)
 
 
 def test_persistence_errors_have_one_narrow_hierarchy() -> None:
@@ -3012,3 +3031,372 @@ def test_schema_and_record_hash_injection_seams_are_separate(
         sqlite_backend._catalog_hash(connection.cursor())
     finally:
         connection.close()
+
+
+def test_sqlite_candidate_reopen_retry_preserves_ordered_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "candidate.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+    first_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            sequence_no=0,
+            payload="first evidence",
+            idempotency_key="candidate-evidence-1",
+        )
+    )
+    second_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            sequence_no=1,
+            payload="second evidence",
+            idempotency_key="candidate-evidence-2",
+        )
+    )
+    proposal = _make_sqlite_candidate(
+        scope=scope,
+        evidence_ids=(second_evidence.evidence_id, first_evidence.evidence_id),
+    )
+
+    original = store.append_candidate(proposal)
+    del store
+    reopened = SQLiteMemoryStore(database_path)
+    real_connect = sqlite_backend._connect
+    reversed_edge_queries: list[int] = []
+
+    class ReverseCandidateEdgesCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> ReverseCandidateEdgesCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            if self._last_sql.startswith(
+                "SELECT SCOPE_ID, CANDIDATE_ID, POSITION, EVIDENCE_ID "
+                "FROM MEMORY_CANDIDATE_EVIDENCE"
+            ):
+                rows.reverse()
+                reversed_edge_queries.append(len(rows))
+            return rows
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class ReverseCandidateEdgesConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> ReverseCandidateEdgesCursor:
+            return ReverseCandidateEdgesCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    monkeypatch.setattr(
+        sqlite_backend,
+        "_connect",
+        lambda path: ReverseCandidateEdgesConnection(real_connect(path)),
+    )
+    loaded = reopened.get_candidate(scope, original.candidate_id)
+    provenance = reopened.get_candidate_evidence(scope, original.candidate_id)
+    retry = reopened.append_candidate(
+        CandidateProposal(
+            scope=proposal.scope,
+            content=proposal.content,
+            evidence_ids=proposal.evidence_ids,
+            idempotency_key=proposal.idempotency_key,
+        )
+    )
+
+    expected_hash = hashlib.sha256(proposal.canonical_bytes()).hexdigest()
+    assert original.proposal == proposal
+    assert original.proposal is not proposal
+    assert loaded == retry == original
+    assert loaded is not original
+    assert retry is not original
+    assert reopened.list_candidates(scope) == (original,)
+    assert provenance == (second_evidence, first_evidence)
+    assert reversed_edge_queries == [2, 2, 2, 2]
+    assert original.content_hash == expected_hash
+    assert original.candidate_id == f"cand_{expected_hash[:24]}"
+    assert original.created_at.tzinfo is UTC
+    assert loaded.created_at == retry.created_at == original.created_at
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_candidates"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_candidate_evidence"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT position, evidence_id FROM memory_candidate_evidence "
+            "ORDER BY position"
+        ).fetchall() == [
+            (0, second_evidence.evidence_id),
+            (1, first_evidence.evidence_id),
+        ]
+    finally:
+        connection.close()
+
+
+def test_sqlite_candidate_queries_are_scoped_sorted_and_snapshot_inputs(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "candidate-queries.sqlite3")
+    first_scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user-1")
+    second_scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user-2")
+    first_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=first_scope,
+            idempotency_key="query-evidence-1",
+        )
+    )
+    second_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=second_scope,
+            payload="foreign evidence",
+            idempotency_key="query-evidence-2",
+        )
+    )
+    right = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=first_scope,
+            content="right",
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key="right-attempt",
+        )
+    )
+    left = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=first_scope,
+            content="left",
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key="left-attempt",
+        )
+    )
+    same_content_new_attempt = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=first_scope,
+            content=left.proposal.content,
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key="new-attempt",
+        )
+    )
+    foreign = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=second_scope,
+            content="foreign",
+            evidence_ids=(second_evidence.evidence_id,),
+            idempotency_key="foreign-attempt",
+        )
+    )
+    expected = tuple(
+        sorted(
+            (right, left, same_content_new_attempt), key=lambda item: item.candidate_id
+        )
+    )
+
+    assert left.candidate_id != same_content_new_attempt.candidate_id
+    assert store.list_candidates(first_scope) == expected
+    assert store.list_candidates(second_scope) == (foreign,)
+    assert store.get_candidate(first_scope, left.candidate_id) == left
+    snapshot = store.list_candidates(first_scope)
+    store.append_candidate(
+        _make_sqlite_candidate(
+            scope=first_scope,
+            content="later",
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key="later-attempt",
+        )
+    )
+    assert snapshot == expected
+
+    with pytest.raises(CandidateNotFoundError) as foreign_error:
+        store.get_candidate(second_scope, left.candidate_id)
+    with pytest.raises(CandidateNotFoundError) as missing_error:
+        store.get_candidate(
+            MemoryScope("tenant-1", "assistant-memory", "candidate-user-3"),
+            left.candidate_id,
+        )
+    assert type(foreign_error.value) is CandidateNotFoundError
+    assert str(foreign_error.value) == str(missing_error.value)
+
+
+def test_sqlite_candidate_public_boundaries_fail_before_sql(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "candidate-boundaries.sqlite3")
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            idempotency_key="boundary-evidence",
+        )
+    )
+    candidate = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=scope,
+            evidence_ids=(evidence.evidence_id,),
+        )
+    )
+    query_id = _SnapshotProbeStr(candidate.candidate_id)
+
+    assert store.get_candidate(scope, query_id) == candidate
+    assert store.get_candidate_evidence(scope, query_id) == (evidence,)
+    assert query_id.override_calls == 0
+
+    for missing_id in ("", " \t", "\x00"):
+        with pytest.raises(CandidateNotFoundError) as get_error:
+            store.get_candidate(scope, missing_id)
+        with pytest.raises(CandidateNotFoundError) as evidence_error:
+            store.get_candidate_evidence(scope, missing_id)
+        assert (
+            str(get_error.value)
+            == f"candidate {str.__str__(missing_id)!r} was not found"
+        )
+        assert str(evidence_error.value) == str(get_error.value)
+    assert store.list_candidates(scope) == (candidate,)
+
+    def transaction_must_not_start(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validation reached SQLite I/O")
+
+    monkeypatch.setattr(
+        sqlite_store_module, "_read_transaction", transaction_must_not_start
+    )
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_write_transaction",
+        transaction_must_not_start,
+    )
+    proposal = _make_sqlite_candidate(scope=scope)
+    proposal_subclass = _SQLiteCandidateProposalSubclass(
+        proposal.scope,
+        proposal.content,
+        proposal.evidence_ids,
+        proposal.idempotency_key,
+    )
+    scope_subclass = _SQLiteMemoryScopeSubclass(
+        scope.tenant_id,
+        scope.namespace,
+        scope.subject_id,
+    )
+
+    with pytest.raises(TypeError, match="proposal must be a CandidateProposal"):
+        store.append_candidate(proposal_subclass)
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.get_candidate(scope_subclass, "cand_missing")
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.get_candidate_evidence(scope_subclass, "cand_missing")
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        store.list_candidates(scope_subclass)
+    for invalid_id in (None, 7):
+        with pytest.raises(TypeError, match="candidate_id must be a string"):
+            store.get_candidate(scope, invalid_id)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="candidate_id must be a string"):
+            store.get_candidate_evidence(scope, invalid_id)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="candidate_id must be valid UTF-8"):
+        store.get_candidate(scope, "\ud800")
+    with pytest.raises(ValueError, match="candidate_id must be valid UTF-8"):
+        store.get_candidate_evidence(scope, "\ud800")
+
+
+def test_sqlite_candidate_list_order_is_independent_of_sqlite_row_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = str(tmp_path / "candidate-order.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            idempotency_key="order-evidence",
+        )
+    )
+    candidates = tuple(
+        store.append_candidate(
+            _make_sqlite_candidate(
+                scope=scope,
+                content=f"candidate-{index}",
+                evidence_ids=(evidence.evidence_id,),
+                idempotency_key=f"candidate-order-{index}",
+            )
+        )
+        for index in range(3)
+    )
+    real_connect = sqlite_backend._connect
+    reversed_queries: list[int] = []
+
+    class ReverseCandidateRowsCursor:
+        def __init__(self, real_cursor: sqlite3.Cursor) -> None:
+            self._real_cursor = real_cursor
+            self._last_sql = ""
+
+        def execute(
+            self,
+            sql: str,
+            parameters: object = (),
+        ) -> ReverseCandidateRowsCursor:
+            self._last_sql = _normalize_sql(sql)
+            self._real_cursor.execute(sql, parameters)
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            rows = [tuple(row) for row in self._real_cursor.fetchall()]
+            if self._last_sql.startswith(
+                "SELECT SCOPE_ID, CANDIDATE_ID FROM MEMORY_CANDIDATES"
+            ):
+                rows.reverse()
+                reversed_queries.append(len(rows))
+            return rows
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_cursor, name)
+
+    class ReverseCandidateRowsConnection:
+        def __init__(self, real_connection: sqlite3.Connection) -> None:
+            self._real_connection = real_connection
+
+        def cursor(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> ReverseCandidateRowsCursor:
+            return ReverseCandidateRowsCursor(
+                self._real_connection.cursor(*args, **kwargs)
+            )
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real_connection, name)
+
+    monkeypatch.setattr(
+        sqlite_backend,
+        "_connect",
+        lambda path: ReverseCandidateRowsConnection(real_connect(path)),
+    )
+
+    assert store.list_candidates(scope) == tuple(
+        sorted(candidates, key=lambda item: item.candidate_id)
+    )
+    assert reversed_queries == [3]
