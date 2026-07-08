@@ -4067,3 +4067,371 @@ def test_sqlite_candidate_relation_gap_delete_and_substitution_are_corruption(
             counts_after, foreign_keys_after = _memory_graph_state(database_path)
             assert counts_after == counts_before
             assert foreign_keys_after == foreign_keys_before
+
+
+def test_sqlite_candidate_loader_rejects_each_scalar_integrity_drift(
+    tmp_path: Path,
+) -> None:
+    mutations = (
+        "canonical",
+        "content",
+        "content-hash-suffix",
+        "created-at-z",
+        "created-at-offset",
+        "storage-hash",
+    )
+
+    for mutation in mutations:
+        database_path = tmp_path / f"candidate-scalar-{mutation}.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-scalar-{mutation}",
+        )
+        evidence = store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                idempotency_key=f"candidate-scalar-{mutation}-evidence",
+            )
+        )
+        proposal = _make_sqlite_candidate(
+            scope=scope,
+            content=f"candidate scalar owner for {mutation}",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=f"candidate-scalar-{mutation}-request",
+        )
+        candidate = store.append_candidate(proposal)
+        canonical_variant = b" \n" + proposal.canonical_bytes()
+        assert canonical_variant != proposal.canonical_bytes()
+        assert json.loads(canonical_variant) == json.loads(proposal.canonical_bytes())
+        replacement_suffix = (
+            "0" * 40 if candidate.content_hash[24:] != "0" * 40 else "1" * 40
+        )
+        changed_content_hash = candidate.content_hash[:24] + replacement_suffix
+        assert changed_content_hash != candidate.content_hash
+        mutations_by_name: dict[str, tuple[str, object, str]] = {
+            "canonical": (
+                "UPDATE memory_candidates SET canonical = ? WHERE candidate_id = ?",
+                sqlite3.Binary(canonical_variant),
+                "canonical candidate bytes disagree with projections",
+            ),
+            "content": (
+                "UPDATE memory_candidates SET content = ? WHERE candidate_id = ?",
+                "changed candidate content",
+                "canonical candidate bytes disagree with projections",
+            ),
+            "content-hash-suffix": (
+                "UPDATE memory_candidates SET content_hash = ? WHERE candidate_id = ?",
+                changed_content_hash,
+                "candidate content hash disagrees with canonical bytes",
+            ),
+            "created-at-z": (
+                "UPDATE memory_candidates SET created_at = ? WHERE candidate_id = ?",
+                candidate.created_at.isoformat().replace("+00:00", "Z"),
+                "candidate created_at is not exact UTC isoformat text",
+            ),
+            "created-at-offset": (
+                "UPDATE memory_candidates SET created_at = ? WHERE candidate_id = ?",
+                candidate.created_at.astimezone(
+                    timezone(timedelta(hours=8))
+                ).isoformat(),
+                "candidate created_at is not exact UTC isoformat text",
+            ),
+            "storage-hash": (
+                "UPDATE memory_candidates SET storage_hash = ? WHERE candidate_id = ?",
+                "0" * 64,
+                "candidate storage hash disagrees with stored metadata",
+            ),
+        }
+        sql, changed_value, expected_cause = mutations_by_name[mutation]
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            stored_storage_hash = connection.execute(
+                "SELECT storage_hash FROM memory_candidates WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            ).fetchone()[0]
+            if mutation == "storage-hash":
+                assert changed_value != stored_storage_hash
+            connection.execute(sql, (changed_value, candidate.candidate_id))
+        finally:
+            connection.close()
+
+        corrupted_state = _memory_graph_state(database_path)
+        assert corrupted_state == ((1, 1, 1, 1), [])
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            store.get_candidate(scope, candidate.candidate_id)
+
+        assert type(raised.value) is MemoryPersistenceCorruptionError
+        assert str(raised.value) == ("stored candidate row failed integrity validation")
+        assert type(raised.value.__cause__) is ValueError
+        assert str(raised.value.__cause__) == expected_cause
+        assert _memory_graph_state(database_path) == corrupted_state
+
+
+def test_sqlite_candidate_invalid_utf8_is_corruption_for_get_list_retry(
+    tmp_path: Path,
+) -> None:
+    for operation in ("get", "list", "retry"):
+        database_path = tmp_path / f"candidate-invalid-utf8-{operation}.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-invalid-utf8-{operation}",
+        )
+        evidence = store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                idempotency_key=f"candidate-invalid-utf8-{operation}-evidence",
+            )
+        )
+        proposal = _make_sqlite_candidate(
+            scope=scope,
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=f"candidate-invalid-utf8-{operation}-request",
+        )
+        candidate = store.append_candidate(proposal)
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute(
+                "UPDATE memory_candidates SET content = CAST(X'80' AS TEXT) "
+                "WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            )
+            stored_content = connection.execute(
+                "SELECT typeof(content), hex(content) FROM memory_candidates "
+                "WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert stored_content == ("text", "80")
+
+        corrupted_state = _memory_graph_state(database_path)
+        assert corrupted_state == ((1, 1, 1, 1), [])
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            if operation == "get":
+                store.get_candidate(scope, candidate.candidate_id)
+            elif operation == "list":
+                store.list_candidates(scope)
+            else:
+                store.append_candidate(proposal)
+
+        assert type(raised.value) is MemoryPersistenceCorruptionError
+        assert str(raised.value) == "SQLite TEXT contains invalid UTF-8"
+        assert type(raised.value.__cause__) is UnicodeDecodeError
+        assert raised.value.__cause__.object == b"\x80"
+        assert raised.value.__cause__.start == 0
+        assert raised.value.__cause__.end == 1
+        assert _memory_graph_state(database_path) == corrupted_state
+
+
+def test_sqlite_candidate_loader_rejects_malformed_scalar_and_relation_rows(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "candidate-malformed-loader-rows.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-malformed")
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            idempotency_key="candidate-malformed-evidence",
+        )
+    )
+    proposal = _make_sqlite_candidate(
+        scope=scope,
+        evidence_ids=(evidence.evidence_id,),
+        idempotency_key="candidate-malformed-request",
+    )
+    candidate = store.append_candidate(proposal)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (scope.tenant_id, scope.namespace, scope.subject_id),
+        ).fetchone()[0]
+        candidate_row = connection.execute(
+            sqlite_store_module._CANDIDATE_SELECT,
+            (scope_id, candidate.candidate_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert candidate_row is not None
+
+    class StaticScalarCursor:
+        def __init__(self, row: tuple[object, ...]) -> None:
+            self._row = row
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticScalarCursor:
+            return self
+
+        def fetchone(self) -> tuple[object, ...]:
+            return self._row
+
+    scalar_cases: list[
+        tuple[str, tuple[object, ...], str, type[ValueError] | type[TypeError]]
+    ] = [
+        (
+            "wrong-arity",
+            tuple(candidate_row[:-1]),
+            "candidate row has the wrong field count",
+            ValueError,
+        )
+    ]
+    wrong_storage_values = (
+        b"candidate-id-is-not-text",
+        "canonical-is-not-a-blob",
+        b"content-hash-is-not-text",
+        b"created-at-is-not-text",
+        b"storage-hash-is-not-text",
+        b"content-is-not-text",
+        b"idempotency-key-is-not-text",
+    )
+    for index, wrong_value in enumerate(wrong_storage_values):
+        changed_row = list(candidate_row)
+        changed_row[index] = wrong_value
+        scalar_cases.append(
+            (
+                f"wrong-storage-{index}",
+                tuple(changed_row),
+                f"candidate row field {index} has the wrong storage class",
+                TypeError,
+            )
+        )
+
+    for case, row, expected_cause, cause_type in scalar_cases:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_candidate(
+                StaticScalarCursor(row),  # type: ignore[arg-type]
+                scope,
+                scope_id,
+                candidate.candidate_id,
+                proposal.evidence_ids,
+            )
+
+        assert str(raised.value) == (
+            "stored candidate row failed integrity validation"
+        ), case
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert type(raised.value.__cause__) is cause_type, case
+        assert str(raised.value.__cause__) == expected_cause, case
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as requested_id_error:
+        sqlite_store_module._load_candidate(
+            StaticScalarCursor(tuple(candidate_row)),  # type: ignore[arg-type]
+            scope,
+            scope_id,
+            "cand_requested_id_drift",
+            proposal.evidence_ids,
+        )
+    assert str(requested_id_error.value) == (
+        "stored candidate row failed integrity validation"
+    )
+    assert type(requested_id_error.value) is MemoryPersistenceCorruptionError
+    assert type(requested_id_error.value.__cause__) is ValueError
+    assert str(requested_id_error.value.__cause__) == (
+        "loaded candidate ID differs from requested ID"
+    )
+
+    class StaticRowsCursor:
+        def __init__(self, rows: tuple[tuple[object, ...], ...]) -> None:
+            self._rows = rows
+
+        def execute(
+            self,
+            _sql: str,
+            _parameters: object = (),
+        ) -> StaticRowsCursor:
+            return self
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return list(self._rows)
+
+    address_cases = (
+        (
+            "wrong-arity",
+            ((scope_id,),),
+            "candidate address row does not contain exactly two values",
+        ),
+        (
+            "boolean-scope",
+            ((True, candidate.candidate_id),),
+            "candidate address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "overflow-scope",
+            ((2**63, candidate.candidate_id),),
+            "candidate address contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "nontext-candidate",
+            ((scope_id, b"candidate-id"),),
+            "candidate address contains a non-text identifier",
+        ),
+    )
+    for case, rows, expected_message in address_cases:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_candidate_addresses(
+                StaticRowsCursor(rows),  # type: ignore[arg-type]
+                {scope_id: scope},
+            )
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_message, case
+        assert raised.value.__cause__ is None, case
+
+    edge_cases = (
+        (
+            "wrong-arity",
+            ((scope_id, candidate.candidate_id, 0),),
+            "candidate evidence row does not contain exactly four values",
+        ),
+        (
+            "boolean-scope",
+            ((True, candidate.candidate_id, 0, evidence.evidence_id),),
+            "candidate evidence contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "overflow-scope",
+            ((2**63, candidate.candidate_id, 0, evidence.evidence_id),),
+            "candidate evidence contains an invalid positive signed 64-bit scope ID",
+        ),
+        (
+            "boolean-position",
+            ((scope_id, candidate.candidate_id, True, evidence.evidence_id),),
+            "candidate evidence position is not a non-negative signed 64-bit integer",
+        ),
+        (
+            "overflow-position",
+            ((scope_id, candidate.candidate_id, 2**63, evidence.evidence_id),),
+            "candidate evidence position is not a non-negative signed 64-bit integer",
+        ),
+        (
+            "nontext-candidate",
+            ((scope_id, b"candidate-id", 0, evidence.evidence_id),),
+            "candidate evidence identifiers must be text",
+        ),
+        (
+            "nontext-evidence",
+            ((scope_id, candidate.candidate_id, 0, b"evidence-id"),),
+            "candidate evidence identifiers must be text",
+        ),
+    )
+    for case, rows, expected_message in edge_cases:
+        with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+            sqlite_store_module._load_candidate_edges(
+                StaticRowsCursor(rows),  # type: ignore[arg-type]
+                ((scope_id, candidate.candidate_id),),
+                {(scope_id, evidence.evidence_id): evidence},
+            )
+        assert type(raised.value) is MemoryPersistenceCorruptionError, case
+        assert str(raised.value) == expected_message, case
+        assert raised.value.__cause__ is None, case
+    assert _memory_graph_state(database_path) == ((1, 1, 1, 1), [])
