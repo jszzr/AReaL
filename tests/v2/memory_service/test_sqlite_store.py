@@ -3765,3 +3765,305 @@ def test_sqlite_candidate_collision_is_scoped_atomic_and_loser_key_reusable(
     )
     assert store.list_candidates(second_scope) == (cross_scope,)
     assert _memory_graph_state(database_path) == ((2, 2, 3, 3), [])
+
+
+def test_sqlite_candidate_coherent_address_drift_is_corruption_before_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest_by_canonical: dict[bytes, str] = {}
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+
+    for mutation in ("scope", "candidate-id", "idempotency"):
+        database_path = tmp_path / f"candidate-coherent-{mutation}-drift.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        source_scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-{mutation}-source",
+        )
+        foreign_scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-{mutation}-foreign",
+        )
+        source_event = _make_sqlite_evidence(
+            scope=source_scope,
+            payload=f"source evidence for {mutation}",
+            idempotency_key=f"source-evidence-{mutation}",
+        )
+        foreign_event = _make_sqlite_evidence(
+            scope=foreign_scope,
+            payload=f"foreign evidence for {mutation}",
+            idempotency_key=f"foreign-evidence-{mutation}",
+        )
+        shared_prefix = hashlib.sha256(mutation.encode()).hexdigest()[:24]
+        digest_by_canonical.update(
+            {
+                source_event.canonical_bytes(): shared_prefix + "a" * 40,
+                foreign_event.canonical_bytes(): shared_prefix + "b" * 40,
+            }
+        )
+        source_evidence = store.append(source_event)
+        foreign_evidence = store.append(foreign_event)
+        assert source_evidence.evidence_id == foreign_evidence.evidence_id
+        proposal = _make_sqlite_candidate(
+            scope=source_scope,
+            content=f"candidate before coherent {mutation} drift",
+            evidence_ids=(source_evidence.evidence_id,),
+            idempotency_key=f"candidate-{mutation}-request",
+        )
+        candidate = store.append_candidate(proposal)
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+            source_scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (
+                    source_scope.tenant_id,
+                    source_scope.namespace,
+                    source_scope.subject_id,
+                ),
+            ).fetchone()[0]
+            foreign_scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (
+                    foreign_scope.tenant_id,
+                    foreign_scope.namespace,
+                    foreign_scope.subject_id,
+                ),
+            ).fetchone()[0]
+            if mutation == "scope":
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET scope_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ?",
+                    (foreign_scope_id, source_scope_id, candidate.candidate_id),
+                )
+                connection.execute(
+                    "UPDATE memory_candidates SET scope_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ?",
+                    (foreign_scope_id, source_scope_id, candidate.candidate_id),
+                )
+                expected_cause = "canonical candidate bytes disagree with projections"
+            elif mutation == "candidate-id":
+                moved_candidate_id = f"cand_{'0' * 24}"
+                assert moved_candidate_id != candidate.candidate_id
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET candidate_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ?",
+                    (moved_candidate_id, source_scope_id, candidate.candidate_id),
+                )
+                connection.execute(
+                    "UPDATE memory_candidates SET candidate_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ?",
+                    (moved_candidate_id, source_scope_id, candidate.candidate_id),
+                )
+                expected_cause = "candidate ID disagrees with its content hash"
+            else:
+                connection.execute(
+                    "UPDATE memory_candidates SET idempotency_key = ? "
+                    "WHERE scope_id = ? AND candidate_id = ?",
+                    (
+                        f"moved-{proposal.idempotency_key}",
+                        source_scope_id,
+                        candidate.candidate_id,
+                    ),
+                )
+                expected_cause = "canonical candidate bytes disagree with projections"
+        finally:
+            connection.close()
+
+        corrupted_state = _memory_graph_state(database_path)
+        assert corrupted_state == ((2, 2, 1, 1), [])
+        for operation in ("get-missing", "list", "get-evidence", "retry"):
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                if operation == "get-missing":
+                    store.get_candidate(source_scope, "cand_missing")
+                elif operation == "list":
+                    store.list_candidates(source_scope)
+                elif operation == "get-evidence":
+                    store.get_candidate_evidence(
+                        source_scope,
+                        candidate.candidate_id,
+                    )
+                else:
+                    store.append_candidate(proposal)
+
+            assert type(raised.value) is MemoryPersistenceCorruptionError
+            assert str(raised.value) == (
+                "stored candidate row failed integrity validation"
+            )
+            assert str(raised.value.__cause__) == expected_cause
+            assert _memory_graph_state(database_path) == corrupted_state
+
+
+def test_sqlite_candidate_relation_gap_delete_and_substitution_are_corruption(
+    tmp_path: Path,
+) -> None:
+    mutations = (
+        "position-gap",
+        "deleted-edge",
+        "same-scope-substitution",
+        "edge-scope",
+        "edge-candidate",
+        "edge-evidence",
+    )
+
+    for mutation in mutations:
+        database_path = tmp_path / f"candidate-relation-{mutation}.sqlite3"
+        store = SQLiteMemoryStore(database_path)
+        scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-relation-{mutation}",
+        )
+        foreign_scope = MemoryScope(
+            "tenant-1",
+            "assistant-memory",
+            f"candidate-relation-{mutation}-foreign",
+        )
+        evidence = tuple(
+            store.append(
+                _make_sqlite_evidence(
+                    scope=scope,
+                    sequence_no=index,
+                    payload=f"candidate relation evidence {index}",
+                    idempotency_key=f"relation-{mutation}-evidence-{index}",
+                )
+            )
+            for index in range(3)
+        )
+        store.append(
+            _make_sqlite_evidence(
+                scope=foreign_scope,
+                payload="foreign relation evidence",
+                idempotency_key=f"relation-{mutation}-foreign-evidence",
+            )
+        )
+        proposal = _make_sqlite_candidate(
+            scope=scope,
+            content=f"candidate relation owner for {mutation}",
+            evidence_ids=(evidence[0].evidence_id, evidence[1].evidence_id),
+            idempotency_key=f"relation-{mutation}-candidate",
+        )
+        candidate = store.append_candidate(proposal)
+
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
+            scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (scope.tenant_id, scope.namespace, scope.subject_id),
+            ).fetchone()[0]
+            foreign_scope_id = connection.execute(
+                "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+                "AND namespace = ? AND subject_id = ?",
+                (
+                    foreign_scope.tenant_id,
+                    foreign_scope.namespace,
+                    foreign_scope.subject_id,
+                ),
+            ).fetchone()[0]
+            parameters = (scope_id, candidate.candidate_id)
+            if mutation == "position-gap":
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET position = 2 "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 1",
+                    parameters,
+                )
+                expected_message = (
+                    "candidate evidence positions are not contiguous from zero"
+                )
+                expected_cause = None
+            elif mutation == "deleted-edge":
+                connection.execute(
+                    "DELETE FROM memory_candidate_evidence "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 1",
+                    parameters,
+                )
+                expected_message = "stored candidate row failed integrity validation"
+                expected_cause = "canonical candidate bytes disagree with projections"
+            elif mutation == "same-scope-substitution":
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET evidence_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 1",
+                    (evidence[2].evidence_id, *parameters),
+                )
+                expected_message = "stored candidate row failed integrity validation"
+                expected_cause = "canonical candidate bytes disagree with projections"
+            elif mutation == "edge-scope":
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET scope_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 0",
+                    (foreign_scope_id, *parameters),
+                )
+                expected_message = (
+                    "Memory Service SQLite data failed foreign key validation"
+                )
+                expected_cause = None
+            elif mutation == "edge-candidate":
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET candidate_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 0",
+                    ("cand_edge_projection_drift", *parameters),
+                )
+                expected_message = (
+                    "Memory Service SQLite data failed foreign key validation"
+                )
+                expected_cause = None
+            else:
+                connection.execute(
+                    "UPDATE memory_candidate_evidence SET evidence_id = ? "
+                    "WHERE scope_id = ? AND candidate_id = ? AND position = 0",
+                    ("evd_edge_projection_drift", *parameters),
+                )
+                expected_message = (
+                    "Memory Service SQLite data failed foreign key validation"
+                )
+                expected_cause = None
+        finally:
+            connection.close()
+
+        corrupted_state = _memory_graph_state(database_path)
+        expected_edge_count = 1 if mutation == "deleted-edge" else 2
+        assert corrupted_state[0] == (2, 4, 1, expected_edge_count)
+        if mutation in {
+            "position-gap",
+            "deleted-edge",
+            "same-scope-substitution",
+        }:
+            assert corrupted_state[1] == []
+        else:
+            assert corrupted_state[1]
+
+        for operation in ("get-missing", "list", "get-evidence", "retry"):
+            counts_before, foreign_keys_before = _memory_graph_state(database_path)
+            with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+                if operation == "get-missing":
+                    store.get_candidate(scope, "cand_missing")
+                elif operation == "list":
+                    store.list_candidates(scope)
+                elif operation == "get-evidence":
+                    store.get_candidate_evidence(scope, candidate.candidate_id)
+                else:
+                    store.append_candidate(proposal)
+
+            assert type(raised.value) is MemoryPersistenceCorruptionError
+            assert str(raised.value) == expected_message
+            if expected_cause is None:
+                assert raised.value.__cause__ is None
+            else:
+                assert str(raised.value.__cause__) == expected_cause
+            counts_after, foreign_keys_after = _memory_graph_state(database_path)
+            assert counts_after == counts_before
+            assert foreign_keys_after == foreign_keys_before
