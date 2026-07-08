@@ -29,11 +29,13 @@ from areal.v2.memory_service.errors import (
     MemoryPersistenceError,
     MemoryPersistenceSchemaError,
     MemoryServiceError,
+    RevisionConflictError,
     RevisionNotFoundError,
 )
 from areal.v2.memory_service.history_types import (
     CandidateProposal,
     MemoryCandidate,
+    MemoryRevision,
     RevisionOperation,
     RevisionProposal,
 )
@@ -5624,3 +5626,500 @@ def test_sqlite_revision_queries_sort_filter_and_snapshot_public_inputs(
             )
     with pytest.raises(ValueError, match="memory_id must be valid UTF-8"):
         store.list_revisions(scope, memory_id="\ud800")
+
+
+def test_sqlite_revision_error_precedence_and_relationship_failures_are_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-precedence.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-precedence")
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "revision-precedence-foreign",
+    )
+    source_pairs = tuple(
+        _append_sqlite_revision_candidate(
+            store,
+            scope,
+            index=index,
+            key=f"precedence-{index}",
+        )
+        for index in range(5)
+    )
+    candidates = tuple(pair[0] for pair in source_pairs)
+    foreign_candidate, _foreign_evidence = _append_sqlite_revision_candidate(
+        store,
+        foreign_scope,
+        index=0,
+        key="precedence-foreign",
+    )
+    owner_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[0].candidate_id,
+        idempotency_key="shared-revision-key",
+    )
+    owner = store.append_revision(owner_proposal)
+    foreign_parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=foreign_scope,
+            candidate_id=foreign_candidate.candidate_id,
+            idempotency_key="foreign-parent",
+        )
+    )
+    idempotency_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id="cand_missing",
+        operation=RevisionOperation.REFINE,
+        parent_revision_id="rev_missing",
+        idempotency_key=owner.proposal.idempotency_key,
+    )
+    collision_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id="cand_missing",
+        operation=RevisionOperation.REFINE,
+        parent_revision_id="rev_missing",
+        idempotency_key="collision-before-relationships",
+    )
+    replacement_suffix = "0" * 40 if owner.content_hash[24:] != "0" * 40 else "1" * 40
+    collision_digest = owner.content_hash[:24] + replacement_suffix
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(
+            {
+                idempotency_attempt.canonical_bytes(): owner.content_hash,
+                collision_attempt.canonical_bytes(): collision_digest,
+            }
+        ),
+    )
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((2, 6, 6, 6, 2), [])
+
+    with pytest.raises(RevisionConflictError) as idempotency_error:
+        store.append_revision(idempotency_attempt)
+    assert type(idempotency_error.value) is RevisionConflictError
+    assert str(idempotency_error.value) == (
+        "scoped revision idempotency key already refers to different content"
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+
+    with pytest.raises(RevisionConflictError) as collision_error:
+        store.append_revision(collision_attempt)
+    assert type(collision_error.value) is RevisionConflictError
+    assert str(collision_error.value) == (
+        f"revision ID collision for {owner.revision_id!r}"
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+
+    missing_candidate_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id="cand_missing",
+        operation=RevisionOperation.REFINE,
+        parent_revision_id="rev_missing",
+        idempotency_key="missing-candidate-before-parent",
+    )
+    with pytest.raises(CandidateNotFoundError) as candidate_error:
+        store.append_revision(missing_candidate_attempt)
+    assert type(candidate_error.value) is CandidateNotFoundError
+    assert str(candidate_error.value) == "candidate 'cand_missing' was not found"
+    assert _revision_graph_state(database_path) == baseline_state
+
+    consumed_candidate_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=owner.proposal.candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id="rev_missing",
+        idempotency_key="consumed-candidate-before-parent",
+    )
+    with pytest.raises(RevisionConflictError) as consumed_error:
+        store.append_revision(consumed_candidate_attempt)
+    assert type(consumed_error.value) is RevisionConflictError
+    assert str(consumed_error.value) == (
+        f"candidate {owner.proposal.candidate_id!r} already backs a revision"
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+
+    missing_parent_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[1].candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id="rev_missing",
+        idempotency_key="missing-parent",
+    )
+    with pytest.raises(RevisionNotFoundError) as parent_error:
+        store.append_revision(missing_parent_attempt)
+    assert type(parent_error.value) is RevisionNotFoundError
+    assert str(parent_error.value) == "revision 'rev_missing' was not found"
+    assert _revision_graph_state(database_path) == baseline_state
+
+    foreign_parent_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=candidates[2].candidate_id,
+        operation=RevisionOperation.CONTRADICT,
+        parent_revision_id=foreign_parent.revision_id,
+        idempotency_key="foreign-parent-hidden",
+    )
+    with pytest.raises(RevisionNotFoundError) as foreign_parent_error:
+        store.append_revision(foreign_parent_attempt)
+    assert type(foreign_parent_error.value) is RevisionNotFoundError
+    assert str(foreign_parent_error.value) == (
+        f"revision {foreign_parent.revision_id!r} was not found"
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+
+    foreign_candidate_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=foreign_candidate.candidate_id,
+        idempotency_key="foreign-candidate-hidden",
+    )
+    with pytest.raises(CandidateNotFoundError) as foreign_candidate_error:
+        store.append_revision(foreign_candidate_attempt)
+    assert type(foreign_candidate_error.value) is CandidateNotFoundError
+    assert str(foreign_candidate_error.value) == (
+        f"candidate {foreign_candidate.candidate_id!r} was not found"
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+
+    recovered_missing_parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[1].candidate_id,
+            idempotency_key=missing_parent_attempt.idempotency_key,
+        )
+    )
+    recovered_foreign_parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[2].candidate_id,
+            idempotency_key=foreign_parent_attempt.idempotency_key,
+        )
+    )
+    recovered_collision = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=candidates[3].candidate_id,
+            idempotency_key=collision_attempt.idempotency_key,
+        )
+    )
+    assert recovered_missing_parent.proposal.candidate_id == candidates[1].candidate_id
+    assert recovered_foreign_parent.proposal.candidate_id == candidates[2].candidate_id
+    assert recovered_collision.proposal.candidate_id == candidates[3].candidate_id
+    assert _revision_graph_state(database_path) == ((2, 6, 6, 6, 5), [])
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+def test_sqlite_revision_collision_is_scoped_atomic_and_loser_candidate_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+) -> None:
+    database_path = tmp_path / f"revision-{collision_kind}-collision.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    first_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"revision-{collision_kind}-first",
+    )
+    second_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        f"revision-{collision_kind}-second",
+    )
+    winner_candidate, _winner_evidence = _append_sqlite_revision_candidate(
+        store,
+        first_scope,
+        index=0,
+        key=f"{collision_kind}-winner",
+    )
+    loser_candidate, _loser_evidence = _append_sqlite_revision_candidate(
+        store,
+        first_scope,
+        index=1,
+        key=f"{collision_kind}-loser",
+    )
+    cross_scope_candidate, _cross_scope_evidence = _append_sqlite_revision_candidate(
+        store,
+        second_scope,
+        index=0,
+        key=f"{collision_kind}-cross-scope",
+    )
+    winner_proposal = _make_sqlite_revision(
+        scope=first_scope,
+        candidate_id=winner_candidate.candidate_id,
+        idempotency_key="winner-revision-key",
+    )
+    loser_proposal = _make_sqlite_revision(
+        scope=first_scope,
+        candidate_id=loser_candidate.candidate_id,
+        idempotency_key="loser-revision-key",
+    )
+    replacement_proposal = _make_sqlite_revision(
+        scope=first_scope,
+        candidate_id=loser_candidate.candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=f"rev_{'a' * 24}",
+        idempotency_key=loser_proposal.idempotency_key,
+    )
+    cross_scope_proposal = _make_sqlite_revision(
+        scope=second_scope,
+        candidate_id=cross_scope_candidate.candidate_id,
+        idempotency_key=loser_proposal.idempotency_key,
+    )
+    shared_prefix = "a" * 24
+    winner_digest = (
+        "a" * 64 if collision_kind == "full-hash" else shared_prefix + "b" * 40
+    )
+    loser_digest = (
+        winner_digest if collision_kind == "full-hash" else shared_prefix + "c" * 40
+    )
+    replacement_digest = "d" * 64
+    digest_by_canonical = {
+        winner_proposal.canonical_bytes(): winner_digest,
+        loser_proposal.canonical_bytes(): loser_digest,
+        replacement_proposal.canonical_bytes(): replacement_digest,
+        cross_scope_proposal.canonical_bytes(): winner_digest,
+    }
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 0), [])
+    winner = store.append_revision(winner_proposal)
+    assert winner.content_hash == winner_digest
+    assert winner.revision_id == f"rev_{shared_prefix}"
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 1), [])
+
+    with pytest.raises(RevisionConflictError) as collision_error:
+        store.append_revision(loser_proposal)
+    assert type(collision_error.value) is RevisionConflictError
+    assert str(collision_error.value) == (
+        f"revision ID collision for {winner.revision_id!r}"
+    )
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 1), [])
+
+    cross_scope = store.append_revision(cross_scope_proposal)
+    assert cross_scope.revision_id == winner.revision_id
+    assert store.get_revision(first_scope, winner.revision_id) == winner
+    assert store.get_revision(second_scope, winner.revision_id) == cross_scope
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 2), [])
+
+    recovered_loser = store.append_revision(replacement_proposal)
+    assert recovered_loser.revision_id == f"rev_{replacement_digest[:24]}"
+    assert recovered_loser.proposal.candidate_id == loser_candidate.candidate_id
+    assert recovered_loser.proposal.idempotency_key == loser_proposal.idempotency_key
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 3), [])
+
+    with pytest.raises(RevisionConflictError) as retry_error:
+        store.append_revision(loser_proposal)
+    assert type(retry_error.value) is RevisionConflictError
+    assert str(retry_error.value) == (
+        "scoped revision idempotency key already refers to different content"
+    )
+    assert store.list_revisions(first_scope) == tuple(
+        sorted(
+            (winner, recovered_loser),
+            key=lambda item: (item.memory_id, item.generation, item.revision_id),
+        )
+    )
+    assert store.list_revisions(second_scope) == (cross_scope,)
+    assert _revision_graph_state(database_path) == ((2, 3, 3, 3, 3), [])
+
+
+def test_revision_lineage_rejects_signed64_generation_overflow() -> None:
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-overflow-helper")
+    parent_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id="cand_parent",
+        idempotency_key="overflow-parent",
+    )
+    parent = MemoryRevision(
+        revision_id="rev_parent",
+        memory_id="mem_parent",
+        generation=2**63 - 1,
+        proposal=parent_proposal,
+        content_hash="a" * 64,
+        created_at=datetime(2026, 7, 8, 4, 5, 6, tzinfo=UTC),
+    )
+    child_proposal = _make_sqlite_revision(
+        scope=scope,
+        candidate_id="cand_child",
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=parent.revision_id,
+        idempotency_key="overflow-child",
+    )
+    parent_state = (
+        parent.revision_id,
+        parent.memory_id,
+        parent.generation,
+        parent.proposal,
+        parent.content_hash,
+        parent.created_at,
+    )
+
+    with pytest.raises(RevisionConflictError) as raised:
+        sqlite_store_module._derive_revision_lineage(
+            child_proposal,
+            "b" * 64,
+            parent,
+        )
+
+    assert type(raised.value) is RevisionConflictError
+    assert str(raised.value) == "revision generation exceeds the signed-64 range"
+    assert (
+        parent.revision_id,
+        parent.memory_id,
+        parent.generation,
+        parent.proposal,
+        parent.content_hash,
+        parent.created_at,
+    ) == parent_state
+
+
+def test_sqlite_revision_overflow_precedes_insert_and_leaves_candidate_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "revision-overflow-append.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "revision-overflow-append")
+    parent_candidate, _parent_evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=0,
+        key="overflow-append-parent",
+    )
+    child_candidate, _child_evidence = _append_sqlite_revision_candidate(
+        store,
+        scope,
+        index=1,
+        key="overflow-append-child",
+    )
+    parent = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=parent_candidate.candidate_id,
+            idempotency_key="overflow-append-parent-revision",
+        )
+    )
+    with sqlite_backend._read_transaction(str(database_path)) as cursor:
+        snapshot = sqlite_store_module._load_revision_snapshot(cursor)
+    (
+        scope_by_id,
+        candidate_by_address,
+        revision_by_address,
+        revision_by_idempotency,
+        revision_by_candidate,
+    ) = snapshot
+    scope_id = next(
+        stored_scope_id
+        for stored_scope_id, stored_scope in scope_by_id.items()
+        if stored_scope == scope
+    )
+    synthetic_parent = MemoryRevision(
+        revision_id=parent.revision_id,
+        memory_id=parent.memory_id,
+        generation=2**63 - 1,
+        proposal=parent.proposal,
+        content_hash=parent.content_hash,
+        created_at=parent.created_at,
+    )
+    controlled_revision_by_address = dict(revision_by_address)
+    controlled_revision_by_address[(scope_id, parent.revision_id)] = synthetic_parent
+    controlled_revision_by_idempotency = dict(revision_by_idempotency)
+    controlled_revision_by_idempotency[(scope_id, parent.proposal.idempotency_key)] = (
+        synthetic_parent
+    )
+    controlled_revision_by_candidate = dict(revision_by_candidate)
+    controlled_revision_by_candidate[(scope_id, parent.proposal.candidate_id)] = (
+        synthetic_parent
+    )
+    snapshot_hits = 0
+    real_load_revision_snapshot = sqlite_store_module._load_revision_snapshot
+
+    def controlled_snapshot(
+        cursor: sqlite3.Cursor,
+    ) -> tuple[
+        dict[int, MemoryScope],
+        dict[tuple[int, str], MemoryCandidate],
+        dict[tuple[int, str], MemoryRevision],
+        dict[tuple[int, str], MemoryRevision],
+        dict[tuple[int, str], MemoryRevision],
+    ]:
+        nonlocal snapshot_hits
+        snapshot_hits += 1
+        assert real_load_revision_snapshot(cursor) == snapshot
+        return (
+            dict(scope_by_id),
+            dict(candidate_by_address),
+            dict(controlled_revision_by_address),
+            dict(controlled_revision_by_idempotency),
+            dict(controlled_revision_by_candidate),
+        )
+
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_load_revision_snapshot",
+        controlled_snapshot,
+    )
+    sql_plan = _SQLiteFailurePlan(
+        after_statement="INSERT INTO memory_revisions",
+        after_statement_check=lambda _normalized_sql: None,
+    )
+    _install_sqlite_failure_proxy(monkeypatch, sql_plan)
+    overflow_attempt = _make_sqlite_revision(
+        scope=scope,
+        candidate_id=child_candidate.candidate_id,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=parent.revision_id,
+        idempotency_key="overflow-append-attempt",
+    )
+    baseline_state = _revision_graph_state(database_path)
+    assert baseline_state == ((1, 2, 2, 2, 1), [])
+
+    with pytest.raises(RevisionConflictError) as raised:
+        store.append_revision(overflow_attempt)
+
+    assert type(raised.value) is RevisionConflictError
+    assert str(raised.value) == "revision generation exceeds the signed-64 range"
+    assert snapshot_hits == 1
+    assert not any(
+        event.startswith(
+            (
+                "attempt:INSERT INTO MEMORY_REVISIONS",
+                "executed:INSERT INTO MEMORY_REVISIONS",
+            )
+        )
+        for event in sql_plan.events
+    )
+    assert _revision_graph_state(database_path) == baseline_state
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        child_rows = connection.execute(
+            "SELECT revision_id FROM memory_revisions "
+            "WHERE candidate_id = ? OR idempotency_key = ?",
+            (
+                child_candidate.candidate_id,
+                overflow_attempt.idempotency_key,
+            ),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert child_rows == []
+
+    monkeypatch.undo()
+    recovered = store.append_revision(
+        _make_sqlite_revision(
+            scope=scope,
+            candidate_id=child_candidate.candidate_id,
+            idempotency_key=overflow_attempt.idempotency_key,
+        )
+    )
+    assert recovered.proposal.candidate_id == child_candidate.candidate_id
+    assert recovered.proposal.idempotency_key == overflow_attempt.idempotency_key
+    assert recovered.generation == 0
+    assert _revision_graph_state(database_path) == ((1, 2, 2, 2, 2), [])
