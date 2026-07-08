@@ -609,7 +609,7 @@ def test_sqlite_evidence_queries_hide_foreign_scope_and_snapshot_filters(
         store.list(first_scope, session_id="", run_id="\ud800")
 
 
-def test_sqlite_evidence_missing_loader_result_routes_by_known_context(
+def test_sqlite_evidence_missing_loader_result_is_address_corruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -626,18 +626,17 @@ def test_sqlite_evidence_missing_loader_result_routes_by_known_context(
         return None
 
     monkeypatch.setattr(sqlite_store_module, "_load_evidence", missing_loader)
-    with pytest.raises(EvidenceNotFoundError, match=record.evidence_id):
-        store.get(event.scope, record.evidence_id)
-    with pytest.raises(
-        MemoryPersistenceCorruptionError,
-        match="idempotency index refers to a missing row",
-    ):
-        store.append(event)
-    with pytest.raises(
-        MemoryPersistenceCorruptionError,
-        match="evidence listing refers to a missing row",
-    ):
-        store.list(event.scope)
+    for operation in ("get", "retry", "list"):
+        with pytest.raises(
+            MemoryPersistenceCorruptionError,
+            match="evidence address refers to a missing row",
+        ):
+            if operation == "get":
+                store.get(event.scope, record.evidence_id)
+            elif operation == "retry":
+                store.append(event)
+            else:
+                store.list(event.scope)
 
 
 def test_sqlite_evidence_list_filters_and_uses_python_contract_order(
@@ -743,7 +742,7 @@ def test_sqlite_evidence_list_filters_and_uses_python_contract_order(
         def fetchall(self) -> list[tuple[object, ...]]:
             rows = [tuple(row) for row in self._real_cursor.fetchall()]
             if self._last_sql.startswith(
-                "SELECT EVIDENCE_ID FROM MEMORY_EVIDENCE WHERE SCOPE_ID = ?"
+                "SELECT SCOPE_ID, EVIDENCE_ID FROM MEMORY_EVIDENCE"
             ):
                 rows.reverse()
             return rows
@@ -994,6 +993,212 @@ def test_sqlite_evidence_failed_scope_insert_rolls_back_and_retries(
     finally:
         connection.close()
     assert store.get(scope, recovered.evidence_id) == recovered
+
+
+def test_sqlite_get_validates_scope_snapshot_before_evidence_id_absence(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "moved-evidence-id.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    moved_evidence_id = f"evd_{'0' * 24}"
+    assert moved_evidence_id != record.evidence_id
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE memory_evidence SET evidence_id = ? WHERE evidence_id = ?",
+            (moved_evidence_id, record.evidence_id),
+        )
+    finally:
+        connection.close()
+
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.get(event.scope, record.evidence_id)
+
+    assert str(raised.value) == "stored evidence row failed integrity validation"
+    assert str(raised.value.__cause__) == (
+        "evidence ID disagrees with its content hash"
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT evidence_id FROM memory_evidence"
+        ).fetchall() == [(moved_evidence_id,)]
+    finally:
+        connection.close()
+
+
+def test_sqlite_append_validates_scope_snapshot_before_idempotency_absence(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "moved-idempotency-key.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    moved_idempotency_key = "moved-evidence-request"
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE memory_evidence SET idempotency_key = ? WHERE evidence_id = ?",
+            (moved_idempotency_key, record.evidence_id),
+        )
+    finally:
+        connection.close()
+
+    conflicting_event = _make_sqlite_evidence(payload="different payload")
+    with pytest.raises(MemoryPersistenceCorruptionError) as raised:
+        store.append(conflicting_event)
+
+    assert str(raised.value) == "stored evidence row failed integrity validation"
+    assert str(raised.value.__cause__) == (
+        "canonical evidence bytes disagree with projections"
+    )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT evidence_id, idempotency_key FROM memory_evidence"
+        ).fetchall() == [(record.evidence_id, moved_idempotency_key)]
+    finally:
+        connection.close()
+
+
+def test_sqlite_operations_validate_global_evidence_before_scope_absence(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "moved-evidence-scope.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    source_scope = MemoryScope("tenant-1", "assistant-memory", "source-user")
+    destination_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "destination-user",
+    )
+    source_event = _make_sqlite_evidence(
+        scope=source_scope,
+        idempotency_key="source-request",
+    )
+    destination_event = _make_sqlite_evidence(
+        scope=destination_scope,
+        payload="destination evidence",
+        idempotency_key="destination-request",
+    )
+    source_record = store.append(source_event)
+    store.append(destination_event)
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        destination_scope_id = connection.execute(
+            "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
+            "AND namespace = ? AND subject_id = ?",
+            (
+                destination_scope.tenant_id,
+                destination_scope.namespace,
+                destination_scope.subject_id,
+            ),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE memory_evidence SET scope_id = ? WHERE evidence_id = ?",
+            (destination_scope_id, source_record.evidence_id),
+        )
+    finally:
+        connection.close()
+
+    operation_errors: dict[str, Exception | None] = {}
+    for operation in ("get", "list", "retry"):
+        try:
+            if operation == "get":
+                store.get(source_scope, source_record.evidence_id)
+            elif operation == "list":
+                store.list(source_scope)
+            else:
+                store.append(source_event)
+        except Exception as error:
+            operation_errors[operation] = error
+        else:
+            operation_errors[operation] = None
+
+    assert {
+        operation: None if error is None else type(error).__name__
+        for operation, error in operation_errors.items()
+    } == {
+        "get": "MemoryPersistenceCorruptionError",
+        "list": "MemoryPersistenceCorruptionError",
+        "retry": "MemoryPersistenceCorruptionError",
+    }
+    for error in operation_errors.values():
+        assert type(error) is MemoryPersistenceCorruptionError
+        assert str(error.__cause__) == (
+            "canonical evidence bytes disagree with projections"
+        )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone() == (2,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_sqlite_operations_validate_evidence_before_rewritten_scope_absence(
+    tmp_path: Path,
+) -> None:
+    database_path = str(tmp_path / "rewritten-scope-address.sqlite3")
+    store = SQLiteMemoryStore(database_path)
+    event = _make_sqlite_evidence()
+    record = store.append(event)
+    rewritten_subject_id = "rewritten-user"
+
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        connection.execute(
+            "UPDATE memory_scopes SET subject_id = ? WHERE subject_id = ?",
+            (rewritten_subject_id, event.scope.subject_id),
+        )
+    finally:
+        connection.close()
+
+    operation_errors: dict[str, Exception | None] = {}
+    for operation in ("get", "list", "retry"):
+        try:
+            if operation == "get":
+                store.get(event.scope, record.evidence_id)
+            elif operation == "list":
+                store.list(event.scope)
+            else:
+                store.append(event)
+        except Exception as error:
+            operation_errors[operation] = error
+        else:
+            operation_errors[operation] = None
+
+    assert {
+        operation: None if error is None else type(error).__name__
+        for operation, error in operation_errors.items()
+    } == {
+        "get": "MemoryPersistenceCorruptionError",
+        "list": "MemoryPersistenceCorruptionError",
+        "retry": "MemoryPersistenceCorruptionError",
+    }
+    for error in operation_errors.values():
+        assert type(error) is MemoryPersistenceCorruptionError
+        assert str(error.__cause__) == (
+            "canonical evidence bytes disagree with projections"
+        )
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        assert connection.execute(
+            "SELECT subject_id FROM memory_scopes"
+        ).fetchall() == [(rewritten_subject_id,)]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence"
+        ).fetchone() == (1,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(

@@ -59,11 +59,12 @@ def _require_scope_id(value: object, message: str) -> int:
     return value
 
 
-def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
+def _load_scope_index(cursor: sqlite3.Cursor) -> dict[int, MemoryScope]:
     rows = cursor.execute(
         "SELECT scope_id, tenant_id, namespace, subject_id FROM memory_scopes"
     ).fetchall()
-    matched_scope_id: int | None = None
+    scope_by_id: dict[int, MemoryScope] = {}
+    scope_ids_by_identity: dict[MemoryScope, int] = {}
     for row in rows:
         if len(row) != 4:
             raise MemoryPersistenceCorruptionError(
@@ -88,13 +89,24 @@ def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
             raise MemoryPersistenceCorruptionError(
                 "stored memory scope identity failed validation"
             ) from error
+        if scope_id in scope_by_id:
+            raise MemoryPersistenceCorruptionError(
+                "memory scope identifier appears in multiple rows"
+            )
+        if stored_scope in scope_ids_by_identity:
+            raise MemoryPersistenceCorruptionError(
+                "memory scope identity matches multiple rows"
+            )
+        scope_by_id[scope_id] = stored_scope
+        scope_ids_by_identity[stored_scope] = scope_id
+    return scope_by_id
+
+
+def _find_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int | None:
+    for scope_id, stored_scope in _load_scope_index(cursor).items():
         if stored_scope == scope:
-            if matched_scope_id is not None:
-                raise MemoryPersistenceCorruptionError(
-                    "memory scope identity matches multiple rows"
-                )
-            matched_scope_id = scope_id
-    return matched_scope_id
+            return scope_id
+    return None
 
 
 def _ensure_scope_id(cursor: sqlite3.Cursor, scope: MemoryScope) -> int:
@@ -202,23 +214,57 @@ def _load_evidence(
         ) from error
 
 
-def _find_evidence_id_by_idempotency_key(
+def _load_scope_evidence(
     cursor: sqlite3.Cursor,
-    scope_id: int,
-    idempotency_key: str,
-) -> str | None:
-    row = cursor.execute(
-        "SELECT evidence_id FROM memory_evidence "
-        "WHERE scope_id = ? AND idempotency_key = ?",
-        (scope_id, idempotency_key),
-    ).fetchone()
-    if row is None:
-        return None
-    if len(row) != 1 or type(row[0]) is not str:
-        raise MemoryPersistenceCorruptionError(
-            "stored evidence idempotency index is invalid"
+    scope: MemoryScope,
+    scope_id: int | None,
+) -> tuple[EvidenceRecord, ...]:
+    if scope_id is not None:
+        _require_scope_id(
+            scope_id,
+            "evidence snapshot received an invalid positive signed 64-bit scope ID",
         )
-    return row[0]
+    scope_by_id = _load_scope_index(cursor)
+    if scope_id is not None and scope_by_id.get(scope_id) != scope:
+        raise MemoryPersistenceCorruptionError(
+            "evidence snapshot scope does not match the stored scope index"
+        )
+    rows = cursor.execute(
+        "SELECT scope_id, evidence_id FROM memory_evidence",
+    ).fetchall()
+    records: list[EvidenceRecord] = []
+    for row in rows:
+        if len(row) != 2:
+            raise MemoryPersistenceCorruptionError(
+                "evidence address row does not contain exactly two values"
+            )
+        stored_scope_id = _require_scope_id(
+            row[0],
+            "evidence address contains an invalid positive signed 64-bit scope ID",
+        )
+        evidence_id = row[1]
+        if type(evidence_id) is not str:
+            raise MemoryPersistenceCorruptionError(
+                "evidence address contains a non-text identifier"
+            )
+        stored_scope = scope_by_id.get(stored_scope_id)
+        if stored_scope is None:
+            raise MemoryPersistenceCorruptionError(
+                "evidence address refers to a missing scope"
+            )
+        record = _load_evidence(
+            cursor,
+            stored_scope,
+            stored_scope_id,
+            evidence_id,
+        )
+        if record is None:
+            raise MemoryPersistenceCorruptionError(
+                "evidence address refers to a missing row"
+            )
+        if scope_id is not None and stored_scope_id == scope_id:
+            records.append(record)
+    return tuple(records)
 
 
 def _evidence_sort_key(
@@ -251,33 +297,29 @@ class SQLiteMemoryStore:
 
         with _write_transaction(self._database_path) as cursor:
             scope_id = _ensure_scope_id(cursor, event.scope)
-            existing_id = _find_evidence_id_by_idempotency_key(
-                cursor,
-                scope_id,
-                event.idempotency_key,
+            scoped_records = _load_scope_evidence(cursor, event.scope, scope_id)
+            existing = next(
+                (
+                    record
+                    for record in scoped_records
+                    if record.event.idempotency_key == event.idempotency_key
+                ),
+                None,
             )
-            if existing_id is not None:
-                existing = _load_evidence(
-                    cursor,
-                    event.scope,
-                    scope_id,
-                    existing_id,
-                )
-                if existing is None:
-                    raise MemoryPersistenceCorruptionError(
-                        "evidence idempotency index refers to a missing row"
-                    )
+            if existing is not None:
                 if existing.event.canonical_bytes() == canonical:
                     return existing
                 raise EvidenceConflictError(
                     "scoped idempotency key already refers to different evidence"
                 )
 
-            existing = _load_evidence(
-                cursor,
-                event.scope,
-                scope_id,
-                evidence_id,
+            existing = next(
+                (
+                    record
+                    for record in scoped_records
+                    if record.evidence_id == evidence_id
+                ),
+                None,
             )
             if existing is not None:
                 if existing.event.canonical_bytes() == canonical:
@@ -341,10 +383,14 @@ class SQLiteMemoryStore:
         )
         with _read_transaction(self._database_path) as cursor:
             scope_id = _find_scope_id(cursor, scope)
-            record = (
-                None
-                if scope_id is None
-                else _load_evidence(cursor, scope, scope_id, evidence_id)
+            scoped_records = _load_scope_evidence(cursor, scope, scope_id)
+            record = next(
+                (
+                    scoped_record
+                    for scoped_record in scoped_records
+                    if scoped_record.evidence_id == evidence_id
+                ),
+                None,
             )
             if record is None:
                 raise EvidenceNotFoundError(f"evidence {evidence_id!r} was not found")
@@ -372,25 +418,10 @@ class SQLiteMemoryStore:
 
         with _read_transaction(self._database_path) as cursor:
             scope_id = _find_scope_id(cursor, scope)
-            if scope_id is None:
-                return ()
-            rows = cursor.execute(
-                "SELECT evidence_id FROM memory_evidence WHERE scope_id = ?",
-                (scope_id,),
-            ).fetchall()
-            records: list[EvidenceRecord] = []
-            for row in rows:
-                if len(row) != 1 or type(row[0]) is not str:
-                    raise MemoryPersistenceCorruptionError(
-                        "evidence listing contains an invalid identifier"
-                    )
-                record = _load_evidence(cursor, scope, scope_id, row[0])
-                if record is None:
-                    raise MemoryPersistenceCorruptionError(
-                        "evidence listing refers to a missing row"
-                    )
-                if (session_id is None or record.event.session_id == session_id) and (
-                    run_id is None or record.event.run_id == run_id
-                ):
-                    records.append(record)
+            records = (
+                record
+                for record in _load_scope_evidence(cursor, scope, scope_id)
+                if (session_id is None or record.event.session_id == session_id)
+                and (run_id is None or record.event.run_id == run_id)
+            )
             return tuple(sorted(records, key=_evidence_sort_key))
