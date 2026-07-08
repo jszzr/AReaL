@@ -20,6 +20,7 @@ import pytest
 import areal.v2.memory_service._sqlite_backend as sqlite_backend
 import areal.v2.memory_service.sqlite_store as sqlite_store_module
 from areal.v2.memory_service.errors import (
+    CandidateConflictError,
     CandidateNotFoundError,
     EvidenceConflictError,
     EvidenceNotFoundError,
@@ -377,6 +378,53 @@ def _make_sqlite_candidate(**overrides: object) -> CandidateProposal:
     }
     values.update(overrides)
     return CandidateProposal(**values)  # type: ignore[arg-type]
+
+
+def _memory_graph_state(
+    database_path: str | Path,
+) -> tuple[tuple[int, int, int, int], list[tuple[object, ...]]]:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        counts = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "memory_scopes",
+                "memory_evidence",
+                "memory_candidates",
+                "memory_candidate_evidence",
+            )
+        )
+        foreign_key_violations = [
+            tuple(row)
+            for row in connection.execute("PRAGMA foreign_key_check").fetchall()
+        ]
+    finally:
+        connection.close()
+    assert len(counts) == 4
+    assert all(type(count) is int for count in counts)
+    return (counts[0], counts[1], counts[2], counts[3]), foreign_key_violations
+
+
+class _StableDigest:
+    def __init__(self, digest: str) -> None:
+        self._digest = digest
+
+    def hexdigest(self) -> str:
+        return self._digest
+
+
+def _stable_digest_oracle(
+    digest_by_canonical: dict[bytes, str],
+) -> Callable[[bytes], Any]:
+    real_sha256 = hashlib.sha256
+
+    def stable_sha256(canonical: bytes) -> Any:
+        digest = digest_by_canonical.get(canonical)
+        if digest is None:
+            return real_sha256(canonical)
+        return _StableDigest(digest)
+
+    return stable_sha256
 
 
 class _SQLiteMemoryScopeSubclass(MemoryScope):
@@ -3400,3 +3448,320 @@ def test_sqlite_candidate_list_order_is_independent_of_sqlite_row_order(
         sorted(candidates, key=lambda item: item.candidate_id)
     )
     assert reversed_queries == [3]
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence_kind",
+    ["first-missing", "late-missing", "late-foreign"],
+)
+def test_sqlite_candidate_missing_or_foreign_evidence_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_evidence_kind: str,
+) -> None:
+    database_path = tmp_path / f"candidate-{invalid_evidence_kind}.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+
+    if invalid_evidence_kind == "first-missing":
+        missing_evidence_id = "evd_first_missing"
+        evidence_ids = (missing_evidence_id,)
+        expected_state = (0, 0, 0, 0)
+
+        def scope_creation_must_not_run(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("candidate validation attempted to create a scope")
+
+        monkeypatch.setattr(
+            sqlite_store_module,
+            "_ensure_scope_id",
+            scope_creation_must_not_run,
+        )
+    else:
+        first = store.append(
+            _make_sqlite_evidence(
+                scope=scope,
+                idempotency_key=f"{invalid_evidence_kind}-first-evidence",
+            )
+        )
+        if invalid_evidence_kind == "late-missing":
+            missing_evidence_id = "evd_late_missing"
+            expected_state = (1, 1, 0, 0)
+        else:
+            foreign = store.append(
+                _make_sqlite_evidence(
+                    scope=MemoryScope(
+                        "tenant-1",
+                        "assistant-memory",
+                        "foreign-candidate-user",
+                    ),
+                    payload="foreign candidate evidence",
+                    idempotency_key="late-foreign-evidence",
+                )
+            )
+            missing_evidence_id = foreign.evidence_id
+            expected_state = (2, 2, 0, 0)
+        evidence_ids = (first.evidence_id, missing_evidence_id)
+
+    with pytest.raises(EvidenceNotFoundError) as raised:
+        store.append_candidate(
+            _make_sqlite_candidate(
+                scope=scope,
+                evidence_ids=evidence_ids,
+                idempotency_key=f"{invalid_evidence_kind}-candidate",
+            )
+        )
+
+    assert type(raised.value) is EvidenceNotFoundError
+    assert str(raised.value) == f"evidence {missing_evidence_id!r} was not found"
+    assert store.list_candidates(scope) == ()
+    assert _memory_graph_state(database_path) == (expected_state, [])
+
+
+def test_sqlite_candidate_idempotency_conflict_precedes_missing_evidence(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "candidate-idempotency-precedence.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "foreign-candidate-user",
+    )
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            idempotency_key="idempotency-owner-evidence",
+        )
+    )
+    foreign = store.append(
+        _make_sqlite_evidence(
+            scope=foreign_scope,
+            payload="foreign candidate evidence",
+            idempotency_key="idempotency-foreign-evidence",
+        )
+    )
+    owner = store.append_candidate(
+        _make_sqlite_candidate(
+            scope=scope,
+            content="idempotency owner",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key="shared-candidate-key",
+        )
+    )
+
+    for invalid_evidence_id in ("evd_missing", foreign.evidence_id):
+        with pytest.raises(CandidateConflictError) as raised:
+            store.append_candidate(
+                _make_sqlite_candidate(
+                    scope=scope,
+                    content=f"changed for {invalid_evidence_id}",
+                    evidence_ids=(invalid_evidence_id,),
+                    idempotency_key="shared-candidate-key",
+                )
+            )
+
+        assert type(raised.value) is CandidateConflictError
+        assert str(raised.value) == (
+            "scoped candidate idempotency key already refers to different content"
+        )
+        assert store.list_candidates(scope) == (owner,)
+        assert _memory_graph_state(database_path) == ((2, 2, 1, 1), [])
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+@pytest.mark.parametrize("invalid_evidence_kind", ["missing", "foreign"])
+def test_sqlite_candidate_missing_evidence_precedes_id_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+    invalid_evidence_kind: str,
+) -> None:
+    database_path = tmp_path / (
+        f"candidate-{invalid_evidence_kind}-{collision_kind}-precedence.sqlite3"
+    )
+    store = SQLiteMemoryStore(database_path)
+    scope = MemoryScope("tenant-1", "assistant-memory", "candidate-user")
+    foreign_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "foreign-candidate-user",
+    )
+    evidence = store.append(
+        _make_sqlite_evidence(
+            scope=scope,
+            idempotency_key="collision-owner-evidence",
+        )
+    )
+    foreign = store.append(
+        _make_sqlite_evidence(
+            scope=foreign_scope,
+            payload="foreign candidate evidence",
+            idempotency_key="collision-foreign-evidence",
+        )
+    )
+    owner_proposal = _make_sqlite_candidate(
+        scope=scope,
+        content="candidate ID owner",
+        evidence_ids=(evidence.evidence_id,),
+        idempotency_key="candidate-id-owner",
+    )
+    owner = store.append_candidate(owner_proposal)
+    invalid_evidence_id = (
+        "evd_missing" if invalid_evidence_kind == "missing" else foreign.evidence_id
+    )
+    later_invalid_evidence_id = (
+        "evd_later_missing"
+        if invalid_evidence_kind == "missing"
+        else "evd_missing_after_foreign"
+    )
+    challenger = _make_sqlite_candidate(
+        scope=scope,
+        content=f"{invalid_evidence_kind} collision challenger",
+        evidence_ids=(
+            evidence.evidence_id,
+            invalid_evidence_id,
+            later_invalid_evidence_id,
+        ),
+        idempotency_key=f"{invalid_evidence_kind}-collision-challenger",
+    )
+    if collision_kind == "full-hash":
+        challenger_digest = owner.content_hash
+    else:
+        replacement_suffix = (
+            "0" * 40 if owner.content_hash[24:] != "0" * 40 else "1" * 40
+        )
+        challenger_digest = owner.content_hash[:24] + replacement_suffix
+    digest_by_canonical = {
+        owner_proposal.canonical_bytes(): owner.content_hash,
+        challenger.canonical_bytes(): challenger_digest,
+    }
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+
+    assert challenger_digest[:24] == owner.content_hash[:24]
+    assert f"cand_{challenger_digest[:24]}" == owner.candidate_id
+    with pytest.raises(EvidenceNotFoundError) as raised:
+        store.append_candidate(challenger)
+
+    assert type(raised.value) is EvidenceNotFoundError
+    assert str(raised.value) == f"evidence {invalid_evidence_id!r} was not found"
+    assert store.list_candidates(scope) == (owner,)
+    assert _memory_graph_state(database_path) == ((2, 2, 1, 1), [])
+
+
+@pytest.mark.parametrize("collision_kind", ["full-hash", "id-prefix"])
+def test_sqlite_candidate_collision_is_scoped_atomic_and_loser_key_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    collision_kind: str,
+) -> None:
+    database_path = tmp_path / f"candidate-{collision_kind}.sqlite3"
+    store = SQLiteMemoryStore(database_path)
+    first_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "candidate-collision-user-1",
+    )
+    second_scope = MemoryScope(
+        "tenant-1",
+        "assistant-memory",
+        "candidate-collision-user-2",
+    )
+    first_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=first_scope,
+            idempotency_key="first-collision-evidence",
+        )
+    )
+    second_evidence = store.append(
+        _make_sqlite_evidence(
+            scope=second_scope,
+            payload="cross-scope candidate evidence",
+            idempotency_key="second-collision-evidence",
+        )
+    )
+    winner_proposal = _make_sqlite_candidate(
+        scope=first_scope,
+        content="candidate collision winner",
+        evidence_ids=(first_evidence.evidence_id,),
+        idempotency_key="winner-key",
+    )
+    loser_proposal = _make_sqlite_candidate(
+        scope=first_scope,
+        content="candidate collision loser",
+        evidence_ids=(first_evidence.evidence_id,),
+        idempotency_key="loser-key",
+    )
+    replacement_proposal = _make_sqlite_candidate(
+        scope=first_scope,
+        content="candidate collision replacement",
+        evidence_ids=(first_evidence.evidence_id,),
+        idempotency_key="loser-key",
+    )
+    cross_scope_proposal = _make_sqlite_candidate(
+        scope=second_scope,
+        content="cross-scope candidate",
+        evidence_ids=(second_evidence.evidence_id,),
+        idempotency_key="loser-key",
+    )
+    shared_prefix = "a" * 24
+    winner_digest = (
+        "a" * 64 if collision_kind == "full-hash" else shared_prefix + "b" * 40
+    )
+    loser_digest = (
+        winner_digest if collision_kind == "full-hash" else shared_prefix + "c" * 40
+    )
+    replacement_digest = "d" * 64
+    digest_by_canonical = {
+        winner_proposal.canonical_bytes(): winner_digest,
+        loser_proposal.canonical_bytes(): loser_digest,
+        replacement_proposal.canonical_bytes(): replacement_digest,
+        cross_scope_proposal.canonical_bytes(): winner_digest,
+    }
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "sha256",
+        _stable_digest_oracle(digest_by_canonical),
+    )
+
+    assert _memory_graph_state(database_path) == ((2, 2, 0, 0), [])
+    winner = store.append_candidate(winner_proposal)
+    assert winner.content_hash == winner_digest
+    assert _memory_graph_state(database_path) == ((2, 2, 1, 1), [])
+
+    with pytest.raises(CandidateConflictError) as raised:
+        store.append_candidate(loser_proposal)
+
+    assert type(raised.value) is CandidateConflictError
+    assert str(raised.value) == (f"candidate ID collision for {winner.candidate_id!r}")
+    assert _memory_graph_state(database_path) == ((2, 2, 1, 1), [])
+
+    cross_scope = store.append_candidate(cross_scope_proposal)
+    assert cross_scope.candidate_id == winner.candidate_id
+    assert store.get_candidate(first_scope, winner.candidate_id) == winner
+    assert store.get_candidate(second_scope, winner.candidate_id) == cross_scope
+    assert _memory_graph_state(database_path) == ((2, 2, 2, 2), [])
+
+    recovered_loser_key = store.append_candidate(replacement_proposal)
+    assert recovered_loser_key.candidate_id == f"cand_{replacement_digest[:24]}"
+    assert recovered_loser_key.proposal == replacement_proposal
+    assert _memory_graph_state(database_path) == ((2, 2, 3, 3), [])
+
+    with pytest.raises(CandidateConflictError) as retry_error:
+        store.append_candidate(loser_proposal)
+    assert type(retry_error.value) is CandidateConflictError
+    assert str(retry_error.value) == (
+        "scoped candidate idempotency key already refers to different content"
+    )
+    assert store.list_candidates(first_scope) == tuple(
+        sorted(
+            (winner, recovered_loser_key),
+            key=lambda candidate: candidate.candidate_id,
+        )
+    )
+    assert store.list_candidates(second_scope) == (cross_scope,)
+    assert _memory_graph_state(database_path) == ((2, 2, 3, 3), [])
