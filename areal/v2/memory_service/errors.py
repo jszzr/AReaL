@@ -39,3 +39,19 @@ class ReleaseNotFoundError(MemoryServiceError):
 
 class ReleaseConflictError(MemoryServiceError):
     """Raised when a release write conflicts with immutable history."""
+
+
+class MemoryPersistenceError(MemoryServiceError):
+    """Base class for durable Memory Service storage failures."""
+
+
+class MemoryPersistenceBusyError(MemoryPersistenceError):
+    """Raised when SQLite cannot acquire the required local database lock."""
+
+
+class MemoryPersistenceSchemaError(MemoryPersistenceError):
+    """Raised when a database does not have the exact supported schema."""
+
+
+class MemoryPersistenceCorruptionError(MemoryPersistenceError):
+    """Raised when durable data violates its stored integrity contract."""
