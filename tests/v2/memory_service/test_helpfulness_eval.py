@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from collections import Counter
 from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime, timedelta
@@ -4372,3 +4373,997 @@ def test_fast_profile_late_strict_outcome_failure_builds_no_trace_or_artifact(
     assert error.value.reason == "strict_outcome_failure"
     assert called == Counter()
     assert artifact.read_bytes() == existing
+
+
+def _full_profile_process_response(
+    response: helpfulness.CaptureChildResponse | helpfulness.FutureBatchResponse,
+    *,
+    child_number: int,
+) -> helpfulness.CaptureChildResponse | helpfulness.FutureBatchResponse:
+    """Give an in-process test double coherent isolated-child process facts."""
+
+    child_pid = 100_000 + child_number
+    process_instance_id = str(uuid.UUID(int=child_number, version=4))
+    common = {
+        "pid": child_pid,
+        "process_instance_id": process_instance_id,
+        "isolated_mode": True,
+        "visible_forbidden_environment": (),
+        "environment_clean": True,
+    }
+    if type(response) is helpfulness.CaptureChildResponse:
+        return replace(response, **common)
+
+    identity_fields = (
+        "store_instance_id",
+        "reader_instance_id",
+        "resolver_instance_id",
+        "renderer_instance_id",
+        "consumer_instance_id",
+        "audit_instance_id",
+        "logical_session_instance_id",
+        "history_instance_id",
+    )
+    (receipt,) = response.state_receipts
+    receipt = replace(
+        receipt,
+        **{
+            field_name: sha256(
+                f"{process_instance_id}|{field_name}".encode()
+            ).hexdigest()
+            for field_name in identity_fields
+        },
+    )
+    return replace(
+        response,
+        observations=tuple(
+            replace(
+                observation,
+                future_pid=child_pid,
+                future_process_instance_id=process_instance_id,
+            )
+            for observation in response.observations
+        ),
+        foreign_probes=tuple(
+            replace(
+                probe,
+                future_pid=child_pid,
+                future_process_instance_id=process_instance_id,
+            )
+            for probe in response.foreign_probes
+        ),
+        state_receipts=(receipt,),
+        **common,
+    )
+
+
+def _guard_full_profile_derived_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Counter:
+    called = Counter()
+
+    def forbidden(stage: str):
+        def fail(*_args, **_kwargs):
+            called[stage] += 1
+            raise AssertionError(f"{stage} ran before all 64 children were valid")
+
+        return fail
+
+    monkeypatch.setattr(
+        helpfulness,
+        "parent_join_and_score",
+        forbidden("score"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_join_fast_observation",
+        forbidden("join"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_trace_from_observation",
+        forbidden("trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_strict_signatures",
+        forbidden("signature"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_leakage_traces",
+        forbidden("leakage-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_leakage_trace",
+        forbidden("single-leakage-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_write_fast_profile_artifact",
+        forbidden("artifact"),
+    )
+    return called
+
+
+@pytest.mark.slow
+def test_full_profile_runs_8_capture_and_56_future_os_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_popen = helpfulness.subprocess.Popen
+    original_run_child = helpfulness.run_isolated_child
+    launches: list[tuple[tuple[str, ...], int]] = []
+    requests: list[object] = []
+
+    def spy_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        launches.append((tuple(args[0]), process.pid))
+        return process
+
+    def spy_run_child(request, *, role, timeout_seconds):
+        requests.append(request)
+        return original_run_child(
+            request,
+            role=role,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def parent_store_access_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("the full-profile parent opened a case database")
+
+    monkeypatch.setattr(helpfulness.subprocess, "Popen", spy_popen)
+    monkeypatch.setattr(helpfulness, "run_isolated_child", spy_run_child)
+    monkeypatch.setattr(
+        helpfulness,
+        "SQLiteMemoryStore",
+        parent_store_access_is_forbidden,
+    )
+
+    execution = helpfulness._execute_full_profile_children(
+        tmp_path / "databases",
+        child_timeout_seconds=120,
+        total_timeout_seconds=900,
+    )
+    result = helpfulness._finalize_full_profile_execution(execution)
+
+    script_path = str(Path(helpfulness.__file__).resolve())
+    assert [argv for argv, _pid in launches] == (
+        [(sys.executable, "-I", script_path, "capture-child")] * 8
+        + [(sys.executable, "-I", script_path, "future-child")] * 56
+    )
+    launched_pids = tuple(pid for _argv, pid in launches)
+    assert (
+        tuple(response.pid for response in execution.capture_responses)
+        == (launched_pids[:8])
+    )
+    assert (
+        tuple(item.response.pid for item in execution.future_executions)
+        == launched_pids[8:]
+    )
+    assert len(requests) == 64
+    assert all(
+        type(request) is helpfulness.CaptureChildRequest for request in requests[:8]
+    )
+    assert tuple(request.case_index for request in requests[:8]) == tuple(range(8))
+    assert all(
+        type(request) is helpfulness.FutureBatchRequest for request in requests[8:]
+    )
+    assert all(len(request.items) == 1 for request in requests[8:])
+    wire_indexes = tuple(request.items[0].execution_index for request in requests[8:])
+    assert len(set(wire_indexes)) == 56
+    assert all(helpfulness._is_opaque_execution_token(index) for index in wire_indexes)
+    assert set(wire_indexes).isdisjoint(range(56))
+
+    traces = (*result.outcomes, *result.foreign_probes)
+    capture_instances = {trace.capture_process_instance_id for trace in traces}
+    future_instances = {trace.future_process_instance_id for trace in traces}
+    assert type(result) is helpfulness.FullProfileResult
+    assert len(result.outcomes) == 48
+    assert len(result.foreign_probes) == 8
+    assert tuple(trace.execution_index for trace in result.outcomes) == tuple(range(48))
+    assert tuple(trace.execution_index for trace in result.foreign_probes) == tuple(
+        range(48, 56)
+    )
+    assert len(capture_instances) == 8
+    assert len(future_instances) == 56
+    assert capture_instances.isdisjoint(future_instances)
+    assert len(capture_instances | future_instances) == 64
+    assert helpfulness.PROCESS_INSTANCE_ID not in capture_instances | future_instances
+    assert all(trace.capture_pid > 0 and trace.future_pid > 0 for trace in traces)
+
+    reused_pid = 999_999
+    reused_execution = replace(
+        execution,
+        capture_responses=tuple(
+            replace(response, pid=reused_pid)
+            for response in execution.capture_responses
+        ),
+        future_executions=tuple(
+            replace(
+                item,
+                response=replace(
+                    item.response,
+                    observations=tuple(
+                        replace(observation, future_pid=reused_pid)
+                        for observation in item.response.observations
+                    ),
+                    foreign_probes=tuple(
+                        replace(probe, future_pid=reused_pid)
+                        for probe in item.response.foreign_probes
+                    ),
+                    pid=reused_pid,
+                ),
+            )
+            for item in execution.future_executions
+        ),
+    )
+    reused_result = helpfulness._finalize_full_profile_execution(reused_execution)
+    reused_traces = (*reused_result.outcomes, *reused_result.foreign_probes)
+    assert {trace.capture_pid for trace in reused_traces} == {reused_pid}
+    assert {trace.future_pid for trace in reused_traces} == {reused_pid}
+    assert (
+        len(
+            {trace.capture_process_instance_id for trace in reused_traces}
+            | {trace.future_process_instance_id for trace in reused_traces}
+        )
+        == 64
+    )
+
+    first_capture_uuid = reused_execution.capture_responses[0].process_instance_id
+    last = reused_execution.future_executions[-1]
+    colliding_pid = reused_pid + 1
+    colliding_response = replace(
+        last.response,
+        observations=tuple(
+            replace(
+                observation,
+                future_pid=colliding_pid,
+                future_process_instance_id=first_capture_uuid,
+            )
+            for observation in last.response.observations
+        ),
+        foreign_probes=tuple(
+            replace(
+                probe,
+                future_pid=colliding_pid,
+                future_process_instance_id=first_capture_uuid,
+            )
+            for probe in last.response.foreign_probes
+        ),
+        pid=colliding_pid,
+        process_instance_id=first_capture_uuid,
+    )
+    collision = replace(
+        reused_execution,
+        future_executions=(
+            *reused_execution.future_executions[:-1],
+            replace(last, response=colliding_response),
+        ),
+    )
+    launches_before_collision = len(launches)
+    with monkeypatch.context() as collision_patch:
+        derived_calls = _guard_full_profile_derived_work(collision_patch)
+        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+            helpfulness._finalize_full_profile_execution(collision)
+    assert error.value.reason == "process_isolation"
+    assert derived_calls == Counter()
+    assert len(launches) == launches_before_collision == 64
+
+
+@pytest.mark.slow
+def test_full_profile_last_receipt_fails_before_any_join_or_derived_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_count = 0
+
+    def fake_success_child(request, *, role, timeout_seconds):
+        nonlocal child_count
+        child_count += 1
+        assert timeout_seconds > 0
+        if type(request) is helpfulness.CaptureChildRequest:
+            assert role == "capture-child"
+            response = helpfulness.execute_capture_child_request(request)
+        else:
+            assert role == "future-child"
+            assert type(request) is helpfulness.FutureBatchRequest
+            response = helpfulness.execute_future_batch_request(request)
+        return _full_profile_process_response(
+            response,
+            child_number=child_count,
+        )
+
+    monkeypatch.setattr(helpfulness, "run_isolated_child", fake_success_child)
+    execution = helpfulness._execute_full_profile_children(
+        tmp_path / "databases",
+        child_timeout_seconds=10,
+        total_timeout_seconds=120,
+    )
+    assert child_count == 64
+    last = next(
+        item
+        for item in execution.future_executions
+        if item.logical_execution_index == 55
+    )
+    (last_receipt,) = last.response.state_receipts
+    corrupted_last = replace(
+        last,
+        response=replace(
+            last.response,
+            state_receipts=(replace(last_receipt, history_length=1),),
+        ),
+    )
+    corrupted = replace(
+        execution,
+        future_executions=tuple(
+            corrupted_last if item.logical_execution_index == 55 else item
+            for item in execution.future_executions
+        ),
+    )
+
+    with monkeypatch.context() as barrier_patch:
+        derived_calls = _guard_full_profile_derived_work(barrier_patch)
+        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+            helpfulness._finalize_full_profile_execution(corrupted)
+
+    assert error.value.reason == "state_reuse"
+    assert derived_calls == Counter()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(10**1000, id="overflowing-positive-int"),
+    ),
+)
+def test_raw_child_rejects_nonfinite_watchdog_before_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_timeout: int | float,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "must-not-run.sqlite3"),
+    )
+    called = Counter()
+
+    def forbidden_popen(*_args, **_kwargs):
+        called["popen"] += 1
+        raise AssertionError("Popen ran before watchdog validation")
+
+    monkeypatch.setattr(helpfulness.subprocess, "Popen", forbidden_popen)
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child_raw(
+            request,
+            role="capture-child",
+            timeout_seconds=invalid_timeout,
+        )
+
+    assert error.value.reason == "closed_schema"
+    assert called == Counter()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(10**1000, id="overflowing-positive-int"),
+    ),
+)
+@pytest.mark.parametrize(
+    "timeout_field",
+    ("child_timeout_seconds", "total_timeout_seconds"),
+)
+def test_full_profile_rejects_nonfinite_watchdog_before_filesystem_or_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_timeout: int | float,
+    timeout_field: str,
+) -> None:
+    database_root = tmp_path / f"{timeout_field}-databases"
+    called = Counter()
+
+    def forbidden_launch(*_args, **_kwargs):
+        called["launch"] += 1
+        raise AssertionError("child launched before watchdog validation")
+
+    def forbidden_popen(*_args, **_kwargs):
+        called["popen"] += 1
+        raise AssertionError("Popen ran before watchdog validation")
+
+    monkeypatch.setattr(helpfulness, "run_isolated_child", forbidden_launch)
+    monkeypatch.setattr(helpfulness.subprocess, "Popen", forbidden_popen)
+    timeouts = {
+        "child_timeout_seconds": 10,
+        "total_timeout_seconds": 120,
+    }
+    timeouts[timeout_field] = invalid_timeout
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_full_profile(database_root, **timeouts)
+
+    assert error.value.reason == "closed_schema"
+    assert not database_root.exists()
+    assert called == Counter()
+
+
+@pytest.mark.slow
+def test_full_profile_timeout_retains_attrition_without_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_timeout_calls: list[tuple[object, str, float]] = []
+    timed_out_token: list[int] = []
+    now = [0.0]
+
+    def fake_child_timeout(request, *, role, timeout_seconds):
+        child_number = len(child_timeout_calls) + 1
+        child_timeout_calls.append((request, role, timeout_seconds))
+        if type(request) is helpfulness.FutureBatchRequest:
+            assert len(request.items) == 1
+            future_number = sum(
+                type(called_request) is helpfulness.FutureBatchRequest
+                for called_request, _role, _timeout in child_timeout_calls
+            )
+            if future_number == 17:
+                timed_out_token.append(request.items[0].execution_index)
+                raise helpfulness.WireProtocolError("child_timeout")
+            response = helpfulness.execute_future_batch_request(request)
+        else:
+            assert type(request) is helpfulness.CaptureChildRequest
+            response = helpfulness.execute_capture_child_request(request)
+        return _full_profile_process_response(
+            response,
+            child_number=child_number,
+        )
+
+    monkeypatch.setattr(helpfulness.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(helpfulness, "run_isolated_child", fake_child_timeout)
+    derived_calls = _guard_full_profile_derived_work(monkeypatch)
+
+    with pytest.raises(helpfulness.FullProfileAttritionError) as child_error:
+        helpfulness.run_full_profile(
+            tmp_path / "child-timeout-databases",
+            child_timeout_seconds=0.5,
+            total_timeout_seconds=10,
+        )
+
+    assert len(child_timeout_calls) == 64
+    assert (
+        tuple(role for _request, role, _timeout in child_timeout_calls[:8])
+        == ("capture-child",) * 8
+    )
+    assert (
+        tuple(role for _request, role, _timeout in child_timeout_calls[8:])
+        == ("future-child",) * 56
+    )
+    future_tokens = tuple(
+        request.items[0].execution_index
+        for request, _role, _timeout in child_timeout_calls[8:]
+    )
+    assert len(future_tokens) == len(set(future_tokens)) == 56
+    assert future_tokens.count(timed_out_token[0]) == 1
+    assert len(child_error.value.attrition) == 1
+    (loss,) = child_error.value.attrition
+    assert loss.slot_index == 8 + loss.logical_execution_index
+    assert loss.role == "future"
+    assert loss.reason == "child_timeout"
+    assert loss.attempted is True
+    assert loss.case_index is None
+    assert loss.opaque_execution_index == timed_out_token[0]
+    assert 0 <= loss.logical_execution_index < 56
+    timeout_budgets = tuple(timeout for _request, _role, timeout in child_timeout_calls)
+    assert timeout_budgets == (0.5,) * 64
+    assert child_error.value.valid_slot_indexes == tuple(
+        index for index in range(64) if index != loss.slot_index
+    )
+    assert set(child_error.value.valid_slot_indexes).isdisjoint(
+        item.slot_index for item in child_error.value.attrition
+    )
+    assert set(child_error.value.valid_slot_indexes) | {
+        item.slot_index for item in child_error.value.attrition
+    } == set(range(64))
+
+    total_timeout_calls: list[tuple[object, str, float]] = []
+
+    def fake_total_timeout(request, *, role, timeout_seconds):
+        child_number = len(total_timeout_calls) + 1
+        total_timeout_calls.append((request, role, timeout_seconds))
+        if type(request) is helpfulness.FutureBatchRequest:
+            response = helpfulness.execute_future_batch_request(request)
+        else:
+            response = helpfulness.execute_capture_child_request(request)
+        now[0] += 1.0 if child_number < 10 else 1.25
+        return _full_profile_process_response(
+            response,
+            child_number=child_number,
+        )
+
+    now[0] = 0.0
+    monkeypatch.setattr(helpfulness, "run_isolated_child", fake_total_timeout)
+    with pytest.raises(helpfulness.FullProfileAttritionError) as total_error:
+        helpfulness.run_full_profile(
+            tmp_path / "total-timeout-databases",
+            child_timeout_seconds=4,
+            total_timeout_seconds=10,
+        )
+
+    assert len(total_timeout_calls) == 10
+    assert tuple(
+        timeout for _request, _role, timeout in total_timeout_calls
+    ) == pytest.approx((4, 4, 4, 4, 4, 4, 4, 3, 2, 1))
+    assert (
+        tuple(role for _request, role, _timeout in total_timeout_calls[:8])
+        == ("capture-child",) * 8
+    )
+    assert (
+        tuple(role for _request, role, _timeout in total_timeout_calls[8:])
+        == ("future-child",) * 2
+    )
+    total_losses = total_error.value.attrition
+    assert tuple(item.slot_index for item in total_losses) == tuple(
+        sorted(item.slot_index for item in total_losses)
+    )
+    assert len({item.slot_index for item in total_losses}) == len(total_losses) == 55
+    assert all(item.role == "future" for item in total_losses)
+    assert all(item.reason == "total_timeout" for item in total_losses)
+    assert sum(item.attempted for item in total_losses) == 1
+    attempted_loss = next(item for item in total_losses if item.attempted)
+    late_request = total_timeout_calls[-1][0]
+    assert type(late_request) is helpfulness.FutureBatchRequest
+    assert (
+        attempted_loss.opaque_execution_index == late_request.items[0].execution_index
+    )
+    assert attempted_loss.slot_index == 8 + attempted_loss.logical_execution_index
+    assert total_error.value.valid_slot_indexes == tuple(
+        sorted(set(range(64)) - {item.slot_index for item in total_losses})
+    )
+    assert set(total_error.value.valid_slot_indexes).isdisjoint(
+        item.slot_index for item in total_losses
+    )
+    assert set(total_error.value.valid_slot_indexes) | {
+        item.slot_index for item in total_losses
+    } == set(range(64))
+
+    globally_limited_calls: list[tuple[object, str, float]] = []
+
+    def fake_globally_limited_timeout(request, *, role, timeout_seconds):
+        globally_limited_calls.append((request, role, timeout_seconds))
+        raise helpfulness.WireProtocolError("child_timeout")
+
+    now[0] = 0.0
+    monkeypatch.setattr(
+        helpfulness,
+        "run_isolated_child",
+        fake_globally_limited_timeout,
+    )
+    with pytest.raises(helpfulness.FullProfileAttritionError) as limited_error:
+        helpfulness.run_full_profile(
+            tmp_path / "globally-limited-timeout-databases",
+            child_timeout_seconds=1,
+            total_timeout_seconds=0.25,
+        )
+
+    assert len(globally_limited_calls) == 1
+    assert globally_limited_calls[0][1] == "capture-child"
+    assert globally_limited_calls[0][2] == pytest.approx(0.25)
+    limited_losses = limited_error.value.attrition
+    assert tuple(item.slot_index for item in limited_losses) == tuple(range(64))
+    assert limited_losses[0].role == "capture"
+    assert limited_losses[0].reason == "total_timeout"
+    assert limited_losses[0].attempted is True
+    assert all(item.reason == "total_timeout" for item in limited_losses)
+    assert all(not item.attempted for item in limited_losses[1:])
+    assert limited_error.value.valid_slot_indexes == ()
+    limited_future_losses = limited_losses[8:]
+    assert tuple(item.logical_execution_index for item in limited_future_losses) == (
+        tuple(range(56))
+    )
+    assert len({item.opaque_execution_index for item in limited_future_losses}) == 56
+    assert all(
+        helpfulness._is_opaque_execution_token(item.opaque_execution_index)
+        for item in limited_future_losses
+    )
+    assert derived_calls == Counter()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("missing_field", ("observations", "state_receipts"))
+def test_singleton_future_batch_reports_true_absence_as_missing_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+) -> None:
+    case = helpfulness.generate_case(0)
+    database_path = str(tmp_path / f"missing-{missing_field}.sqlite3")
+    references = helpfulness.build_case_database(case, database_path)
+    execution_token = (1 << 127) | 17
+    request = helpfulness.FutureBatchRequest(
+        items=(
+            helpfulness._fast_future_request(
+                execution_token=execution_token,
+                database_path=database_path,
+                case=case,
+                references=references,
+                source=helpfulness._fast_source_spec(
+                    case,
+                    references,
+                    "current_release",
+                ),
+            ),
+        )
+    )
+    response = helpfulness.execute_future_batch_request(request)
+    response = _full_profile_process_response(response, child_number=1)
+    missing = replace(response, **{missing_field: ()})
+
+    def raw_missing_child(_request, *, role, timeout_seconds):
+        assert _request == request
+        assert role == "future-child"
+        assert timeout_seconds == 10
+        return helpfulness.ChildProcessResult(
+            args=[
+                sys.executable,
+                "-I",
+                str(Path(helpfulness.__file__).resolve()),
+                role,
+            ],
+            pid=missing.pid,
+            returncode=0,
+            stdout=helpfulness.wire_dumps(missing),
+            stderr="",
+        )
+
+    monkeypatch.setattr(helpfulness, "run_isolated_child_raw", raw_missing_child)
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.run_isolated_child(
+            request,
+            role="future-child",
+            timeout_seconds=10,
+        )
+
+    assert error.value.reason == "missing_item"
+
+
+@pytest.mark.slow
+def test_child_cannot_self_report_parent_derived_missing_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "must-not-run.sqlite3"),
+    )
+    envelope = json.loads(
+        helpfulness.wire_dumps(
+            helpfulness.ChildFailureResponse(reason="assignment_mismatch")
+        )
+    )
+    envelope["payload"]["reason"] = "missing_item"
+    forged_stdout = (
+        json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    def raw_self_report(_request, *, role, timeout_seconds):
+        assert _request == request
+        assert role == "capture-child"
+        assert timeout_seconds == 10
+        return helpfulness.ChildProcessResult(
+            args=[
+                sys.executable,
+                "-I",
+                str(Path(helpfulness.__file__).resolve()),
+                role,
+            ],
+            pid=100_001,
+            returncode=0,
+            stdout=forged_stdout,
+            stderr="",
+        )
+
+    monkeypatch.setattr(helpfulness, "run_isolated_child_raw", raw_self_report)
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child(
+            request,
+            role="capture-child",
+            timeout_seconds=10,
+        )
+
+    assert error.value.reason == "closed_schema"
+
+
+@pytest.mark.slow
+def test_missing_item_attrition_requires_an_attempted_future_slot() -> None:
+    missing_slot = helpfulness.FullProfileAttrition(
+        slot_index=8,
+        role="future",
+        reason="missing_item",
+        attempted=False,
+        case_index=None,
+        logical_execution_index=0,
+        opaque_execution_index=(1 << 127) | 1,
+    )
+
+    with pytest.raises(ValueError) as error:
+        helpfulness.FullProfileAttritionError(
+            attrition=(missing_slot,),
+            valid_slot_indexes=tuple(range(8)) + tuple(range(9, 64)),
+        )
+
+    assert str(error.value) == "attrition"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong_index",
+        "duplicate_index",
+        "extra_index",
+        "swapped_observations",
+        "swapped_receipts",
+    ),
+)
+def test_future_batch_does_not_misclassify_bad_indexes_as_missing_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    case = helpfulness.generate_case(0)
+    database_path = str(tmp_path / f"malformed-{mutation}.sqlite3")
+    references = helpfulness.build_case_database(case, database_path)
+    tokens = ((1 << 127) | 21, (1 << 127) | 22)
+    request = helpfulness.FutureBatchRequest(
+        items=tuple(
+            helpfulness._fast_future_request(
+                execution_token=token,
+                database_path=database_path,
+                case=case,
+                references=references,
+                source=helpfulness._fast_source_spec(
+                    case,
+                    references,
+                    "current_release",
+                ),
+            )
+            for token in tokens
+        )
+    )
+    response = helpfulness.execute_future_batch_request(request)
+    child_pid = 100_001
+    process_instance_id = str(uuid.UUID(int=1, version=4))
+    response = replace(
+        response,
+        observations=tuple(
+            replace(
+                observation,
+                future_pid=child_pid,
+                future_process_instance_id=process_instance_id,
+            )
+            for observation in response.observations
+        ),
+        pid=child_pid,
+        process_instance_id=process_instance_id,
+        isolated_mode=True,
+        visible_forbidden_environment=(),
+        environment_clean=True,
+    )
+    first, second = response.observations
+    if mutation == "wrong_index":
+        malformed = replace(
+            response,
+            observations=(
+                replace(first, execution_index=(1 << 127) | 999),
+                second,
+            ),
+        )
+    elif mutation == "duplicate_index":
+        malformed = replace(
+            response,
+            observations=(
+                replace(first, execution_index=second.execution_index),
+                second,
+            ),
+        )
+    elif mutation == "extra_index":
+        malformed = replace(response, observations=(*response.observations, first))
+    elif mutation == "swapped_observations":
+        malformed = replace(
+            response,
+            observations=(
+                replace(first, execution_index=second.execution_index),
+                replace(second, execution_index=first.execution_index),
+            ),
+        )
+    else:
+        assert mutation == "swapped_receipts"
+        malformed = replace(
+            response,
+            state_receipts=tuple(reversed(response.state_receipts)),
+        )
+
+    def raw_malformed_child(_request, *, role, timeout_seconds):
+        assert _request == request
+        assert role == "future-child"
+        assert timeout_seconds == 10
+        return helpfulness.ChildProcessResult(
+            args=[
+                sys.executable,
+                "-I",
+                str(Path(helpfulness.__file__).resolve()),
+                role,
+            ],
+            pid=malformed.pid,
+            returncode=0,
+            stdout=helpfulness.wire_dumps(malformed),
+            stderr="",
+        )
+
+    monkeypatch.setattr(helpfulness, "run_isolated_child_raw", raw_malformed_child)
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.run_isolated_child(
+            request,
+            role="future-child",
+            timeout_seconds=10,
+        )
+
+    assert error.value.reason == "assignment_mismatch"
+
+
+@pytest.mark.slow
+def test_full_profile_retains_missing_item_without_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, str, float]] = []
+    missing_tokens: list[int] = []
+
+    def fake_missing_item(request, *, role, timeout_seconds):
+        child_number = len(calls) + 1
+        calls.append((request, role, timeout_seconds))
+        if type(request) is helpfulness.FutureBatchRequest:
+            assert len(request.items) == 1
+            future_number = sum(
+                type(called_request) is helpfulness.FutureBatchRequest
+                for called_request, _role, _timeout in calls
+            )
+            if future_number == 17:
+                missing_tokens.append(request.items[0].execution_index)
+                raise helpfulness.ChildExecutionValidationError("missing_item")
+            response = helpfulness.execute_future_batch_request(request)
+        else:
+            assert type(request) is helpfulness.CaptureChildRequest
+            response = helpfulness.execute_capture_child_request(request)
+        return _full_profile_process_response(
+            response,
+            child_number=child_number,
+        )
+
+    monkeypatch.setattr(helpfulness.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(helpfulness, "run_isolated_child", fake_missing_item)
+    derived_calls = _guard_full_profile_derived_work(monkeypatch)
+
+    with pytest.raises(helpfulness.FullProfileAttritionError) as error:
+        helpfulness.run_full_profile(
+            tmp_path / "databases",
+            child_timeout_seconds=0.5,
+            total_timeout_seconds=10,
+        )
+
+    assert len(calls) == 64
+    assert (
+        tuple(role for _request, role, _timeout in calls[:8]) == ("capture-child",) * 8
+    )
+    assert (
+        tuple(role for _request, role, _timeout in calls[8:]) == ("future-child",) * 56
+    )
+    future_tokens = tuple(
+        request.items[0].execution_index for request, _role, _timeout in calls[8:]
+    )
+    assert len(future_tokens) == len(set(future_tokens)) == 56
+    assert len(missing_tokens) == 1
+    assert future_tokens.count(missing_tokens[0]) == 1
+    assert tuple(timeout for _request, _role, timeout in calls) == (0.5,) * 64
+
+    assert len(error.value.attrition) == 1
+    (loss,) = error.value.attrition
+    assert loss.role == "future"
+    assert loss.reason == "missing_item"
+    assert loss.attempted is True
+    assert loss.case_index is None
+    assert loss.opaque_execution_index == missing_tokens[0]
+    assert loss.slot_index == 8 + loss.logical_execution_index
+    assert 0 <= loss.logical_execution_index < 56
+    assert error.value.valid_slot_indexes == tuple(
+        slot_index for slot_index in range(64) if slot_index != loss.slot_index
+    )
+    assert set(error.value.valid_slot_indexes).isdisjoint(
+        item.slot_index for item in error.value.attrition
+    )
+    assert set(error.value.valid_slot_indexes) | {
+        item.slot_index for item in error.value.attrition
+    } == set(range(64))
+    assert derived_calls == Counter()
+
+
+@pytest.mark.slow
+def test_full_profile_rejects_unknown_child_fields_before_derived_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_calls = 0
+
+    def unknown_field_child(request, *, role, timeout_seconds):
+        nonlocal raw_calls
+        raw_calls += 1
+        assert timeout_seconds > 0
+        if type(request) is helpfulness.CaptureChildRequest:
+            assert role == "capture-child"
+            response = helpfulness.execute_capture_child_request(request)
+        else:
+            assert role == "future-child"
+            assert type(request) is helpfulness.FutureBatchRequest
+            response = helpfulness.execute_future_batch_request(request)
+        response = _full_profile_process_response(response, child_number=raw_calls)
+        stdout = helpfulness.wire_dumps(response)
+        if raw_calls == 64:
+            value = json.loads(stdout)
+            value["payload"]["unknown_child_field"] = "must-be-rejected"
+            stdout = (
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        return helpfulness.ChildProcessResult(
+            args=[
+                sys.executable,
+                "-I",
+                str(Path(helpfulness.__file__).resolve()),
+                role,
+            ],
+            pid=response.pid,
+            returncode=0,
+            stdout=stdout,
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        helpfulness,
+        "run_isolated_child_raw",
+        unknown_field_child,
+    )
+    derived_calls = _guard_full_profile_derived_work(monkeypatch)
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_full_profile(
+            tmp_path / "databases",
+            child_timeout_seconds=10,
+            total_timeout_seconds=120,
+        )
+
+    assert error.value.reason == "closed_schema"
+    assert raw_calls == 64
+    assert derived_calls == Counter()

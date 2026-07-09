@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import uuid
 from collections.abc import Callable
@@ -629,6 +631,29 @@ class FastProfileResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FullProfileResult:
+    """Typed result for the 64-process scientific-isolation profile."""
+
+    outcomes: tuple[EvaluationTrace, ...]
+    foreign_probes: tuple[LeakageSentinelTrace, ...]
+    signatures: tuple[StrictSignature, ...]
+    state_receipts: tuple[ItemStateReceipt, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FullProfileAttrition:
+    """One fixed experimental slot that produced no valid child response."""
+
+    slot_index: int
+    role: str
+    reason: str
+    attempted: bool
+    case_index: int | None
+    logical_execution_index: int | None
+    opaque_execution_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ReplayHeader:
     """Self-describing first record for one canonical fast-profile artifact."""
 
@@ -668,6 +693,23 @@ class _FastProfileExecution:
 
 
 @dataclass(frozen=True, slots=True)
+class _FullFutureExecution:
+    logical_execution_index: int
+    request: FutureBatchRequest
+    response: FutureBatchResponse
+
+
+@dataclass(frozen=True, slots=True)
+class _FullProfileExecution:
+    cases: tuple[CodebookCase, ...]
+    capture_requests: tuple[CaptureChildRequest, ...]
+    capture_responses: tuple[CaptureChildResponse, ...]
+    future_executions: tuple[_FullFutureExecution, ...]
+    schedule: tuple[ParentScheduleItem, ...]
+    execution_bindings: tuple[_FastExecutionBinding, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ChildFailureResponse:
     """Expected fail-closed child outcome with a pre-registered reason."""
 
@@ -694,12 +736,83 @@ class WireProtocolError(ValueError):
         super().__init__(reason if not detail else f"{reason}: {detail}")
 
 
+def _normalize_positive_finite_seconds(value: object) -> float:
+    """Return one canonical watchdog value before any observable side effect."""
+
+    if type(value) not in {int, float}:
+        raise WireProtocolError("closed_schema")
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise WireProtocolError("closed_schema") from error
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise WireProtocolError("closed_schema")
+    return normalized
+
+
 class ChildExecutionValidationError(ValueError):
     """Stable reason for rejecting process or assignment sentinels."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class FullProfileAttritionError(RuntimeError):
+    """Fail a full run without silently replacing lost fixed sample slots."""
+
+    def __init__(
+        self,
+        attrition: tuple[FullProfileAttrition, ...],
+        valid_slot_indexes: tuple[int, ...],
+    ) -> None:
+        ordered_attrition = tuple(sorted(attrition, key=lambda item: item.slot_index))
+        ordered_valid = tuple(sorted(valid_slot_indexes))
+        attrition_slots = tuple(item.slot_index for item in ordered_attrition)
+        if (
+            not ordered_attrition
+            or any(type(item) is not FullProfileAttrition for item in ordered_attrition)
+            or any(
+                type(item.slot_index) is not int
+                or item.slot_index not in range(64)
+                or item.role not in {"capture", "future"}
+                or item.reason not in {"child_timeout", "missing_item", "total_timeout"}
+                or (item.reason == "missing_item" and item.role != "future")
+                or (item.reason == "missing_item" and item.attempted is not True)
+                or type(item.attempted) is not bool
+                or (
+                    item.role == "capture"
+                    and (
+                        item.slot_index not in range(8)
+                        or item.case_index != item.slot_index
+                        or item.logical_execution_index is not None
+                        or item.opaque_execution_index is not None
+                    )
+                )
+                or (
+                    item.role == "future"
+                    and (
+                        item.slot_index not in range(8, 64)
+                        or item.case_index is not None
+                        or item.logical_execution_index != item.slot_index - 8
+                        or not _is_opaque_execution_token(item.opaque_execution_index)
+                    )
+                )
+                for item in ordered_attrition
+            )
+            or len(set(attrition_slots)) != len(attrition_slots)
+            or any(
+                type(slot) is not int or slot not in range(64) for slot in ordered_valid
+            )
+            or len(set(ordered_valid)) != len(ordered_valid)
+            or set(attrition_slots).intersection(ordered_valid)
+            or set(attrition_slots).union(ordered_valid) != set(range(64))
+        ):
+            raise ValueError("attrition")
+        self.reason = "attrition"
+        self.attrition = ordered_attrition
+        self.valid_slot_indexes = ordered_valid
+        super().__init__(self.reason)
 
 
 def _token(
@@ -4886,11 +4999,10 @@ def run_isolated_child_raw(
 ) -> ChildProcessResult:
     """Exec the absolute example script under Python isolated mode."""
 
+    normalized_timeout_seconds = _normalize_positive_finite_seconds(timeout_seconds)
     if (
         type(role) is not str
         or role not in {"capture-child", "future-child"}
-        or type(timeout_seconds) not in {int, float}
-        or timeout_seconds <= 0
         or (
             role == "capture-child"
             and type(request) not in {CaptureBatchRequest, CaptureChildRequest}
@@ -4918,7 +5030,7 @@ def run_isolated_child_raw(
     try:
         stdout_bytes, stderr_bytes = process.communicate(
             input=payload,
-            timeout=float(timeout_seconds),
+            timeout=normalized_timeout_seconds,
         )
     except subprocess.TimeoutExpired as error:
         process.kill()
@@ -5034,15 +5146,65 @@ def run_isolated_child(
         if response.case_index != request.case_index:
             raise ChildExecutionValidationError("assignment_mismatch")
     elif type(request) is FutureBatchRequest:
-        expected_indexes = {item.execution_index for item in request.items}
-        observed_indexes = {
+        expected_index_sequence = tuple(item.execution_index for item in request.items)
+        expected_indexes = set(expected_index_sequence)
+        observation_index_sequence = tuple(
             observation.execution_index for observation in response.observations
-        } | {probe.execution_index for probe in response.foreign_probes}
+        )
+        probe_index_sequence = tuple(
+            probe.execution_index for probe in response.foreign_probes
+        )
+        observed_index_sequence = observation_index_sequence + probe_index_sequence
+        receipt_index_sequence = tuple(
+            receipt.execution_index for receipt in response.state_receipts
+        )
+        observed_indexes = set(observed_index_sequence)
+        receipt_indexes = set(receipt_index_sequence)
+        position_by_index = {
+            execution_index: position
+            for position, execution_index in enumerate(expected_index_sequence)
+        }
+
+        def indexes_preserve_request_order(indexes: tuple[int, ...]) -> bool:
+            try:
+                positions = tuple(position_by_index[index] for index in indexes)
+            except KeyError:
+                return False
+            return all(
+                left < right
+                for left, right in zip(positions, positions[1:], strict=False)
+            )
+
+        unique_expected = len(expected_indexes) == len(expected_index_sequence)
+        unique_observed = len(observed_indexes) == len(observed_index_sequence)
+        unique_receipts = len(receipt_indexes) == len(receipt_index_sequence)
+        ordered_observed = indexes_preserve_request_order(
+            observation_index_sequence
+        ) and indexes_preserve_request_order(probe_index_sequence)
+        ordered_receipts = indexes_preserve_request_order(receipt_index_sequence)
+        true_absence = (
+            unique_expected
+            and unique_observed
+            and unique_receipts
+            and ordered_observed
+            and ordered_receipts
+            and observed_indexes.issubset(expected_indexes)
+            and receipt_indexes.issubset(expected_indexes)
+            and (
+                observed_indexes != expected_indexes
+                or receipt_indexes != expected_indexes
+            )
+        )
+        if true_absence:
+            raise ChildExecutionValidationError("missing_item")
         if (
             observed_indexes != expected_indexes
-            or len(response.observations) + len(response.foreign_probes)
-            != len(request.items)
-            or len(response.state_receipts) != len(request.items)
+            or receipt_indexes != expected_indexes
+            or not unique_expected
+            or not unique_observed
+            or not unique_receipts
+            or not ordered_observed
+            or not ordered_receipts
         ):
             raise ChildExecutionValidationError("assignment_mismatch")
     else:
@@ -5343,10 +5505,337 @@ def _execute_fast_profile_children(
     )
 
 
+_FULL_PROFILE_MISSING_REASONS = frozenset({"child_timeout"})
+_FULL_PROFILE_CHILD_MISSING_REASONS = frozenset({"missing_item"})
+
+
+def _full_profile_budget(
+    *,
+    deadline: float,
+    child_timeout_seconds: float,
+) -> tuple[float, bool] | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return (
+        min(child_timeout_seconds, remaining),
+        remaining <= child_timeout_seconds,
+    )
+
+
+def _full_profile_capture_attrition(
+    request: CaptureChildRequest,
+    *,
+    reason: str,
+    attempted: bool,
+) -> FullProfileAttrition:
+    return FullProfileAttrition(
+        slot_index=request.case_index,
+        role="capture",
+        reason=reason,
+        attempted=attempted,
+        case_index=request.case_index,
+        logical_execution_index=None,
+        opaque_execution_index=None,
+    )
+
+
+def _full_profile_future_attrition(
+    *,
+    logical_execution_index: int,
+    opaque_execution_index: int,
+    reason: str,
+    attempted: bool,
+) -> FullProfileAttrition:
+    return FullProfileAttrition(
+        slot_index=8 + logical_execution_index,
+        role="future",
+        reason=reason,
+        attempted=attempted,
+        case_index=None,
+        logical_execution_index=logical_execution_index,
+        opaque_execution_index=opaque_execution_index,
+    )
+
+
+def _execute_full_profile_children(
+    database_root: str | os.PathLike[str],
+    *,
+    child_timeout_seconds: float,
+    total_timeout_seconds: float,
+) -> _FullProfileExecution:
+    """Run the fixed 8+56 process plan without replacing missing slots."""
+
+    child_timeout_seconds = _normalize_positive_finite_seconds(child_timeout_seconds)
+    total_timeout_seconds = _normalize_positive_finite_seconds(total_timeout_seconds)
+    deadline = time.monotonic() + total_timeout_seconds
+    if not math.isfinite(deadline):
+        raise WireProtocolError("closed_schema")
+    root = Path(database_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    cases = tuple(generate_case(case_index) for case_index in range(8))
+    capture_requests = tuple(
+        CaptureChildRequest(
+            case_index=case.case_index,
+            database_path=str(root / f"case-{case.case_index:03d}.sqlite3"),
+        )
+        for case in cases
+    )
+    execution_bindings = _generate_fast_execution_bindings()
+    opaque_by_logical = {
+        binding.logical_execution_index: binding.opaque_execution_index
+        for binding in execution_bindings
+    }
+    attrition: list[FullProfileAttrition] = []
+    valid_slot_indexes: set[int] = set()
+    capture_by_index: dict[int, CaptureChildResponse] = {}
+    capture_loss_reason: dict[int, str] = {}
+    deadline_exhausted = False
+
+    for request in capture_requests:
+        budget_info = (
+            None
+            if deadline_exhausted
+            else _full_profile_budget(
+                deadline=deadline,
+                child_timeout_seconds=child_timeout_seconds,
+            )
+        )
+        if budget_info is None:
+            deadline_exhausted = True
+            capture_loss_reason[request.case_index] = "total_timeout"
+            attrition.append(
+                _full_profile_capture_attrition(
+                    request,
+                    reason="total_timeout",
+                    attempted=False,
+                )
+            )
+            continue
+        budget, globally_limited = budget_info
+        try:
+            response = run_isolated_child(
+                request,
+                role="capture-child",
+                timeout_seconds=budget,
+            )
+        except WireProtocolError as error:
+            if error.reason not in _FULL_PROFILE_MISSING_REASONS:
+                raise
+            reason = "total_timeout" if globally_limited else "child_timeout"
+            capture_loss_reason[request.case_index] = reason
+            deadline_exhausted = deadline_exhausted or globally_limited
+            attrition.append(
+                _full_profile_capture_attrition(
+                    request,
+                    reason=reason,
+                    attempted=True,
+                )
+            )
+            continue
+        if time.monotonic() >= deadline:
+            deadline_exhausted = True
+            capture_loss_reason[request.case_index] = "total_timeout"
+            attrition.append(
+                _full_profile_capture_attrition(
+                    request,
+                    reason="total_timeout",
+                    attempted=True,
+                )
+            )
+            continue
+        if type(response) is not CaptureChildResponse:
+            raise ChildExecutionValidationError("process_isolation")
+        _validate_child_process_response(response, expected_pid=response.pid)
+        if response.case_index != request.case_index:
+            raise ChildExecutionValidationError("assignment_mismatch")
+        _validate_parent_foreign_companion_contract(
+            cases[request.case_index],
+            response.references,
+        )
+        capture_by_index[request.case_index] = response
+        valid_slot_indexes.add(request.case_index)
+
+    schedules: list[ParentScheduleItem] = []
+    future_plan: list[tuple[int, FutureBatchRequest]] = []
+    for case, capture_request in zip(cases, capture_requests, strict=True):
+        capture_response = capture_by_index.get(case.case_index)
+        if capture_response is None:
+            reason = capture_loss_reason[case.case_index]
+            for logical_index in range(
+                case.case_index * len(_FAST_ARMS),
+                (case.case_index + 1) * len(_FAST_ARMS),
+            ):
+                attrition.append(
+                    _full_profile_future_attrition(
+                        logical_execution_index=logical_index,
+                        opaque_execution_index=opaque_by_logical[logical_index],
+                        reason=reason,
+                        attempted=False,
+                    )
+                )
+            probe_index = 48 + case.case_index
+            attrition.append(
+                _full_profile_future_attrition(
+                    logical_execution_index=probe_index,
+                    opaque_execution_index=opaque_by_logical[probe_index],
+                    reason=reason,
+                    attempted=False,
+                )
+            )
+            continue
+        references = capture_response.references
+        for arm_offset, arm in enumerate(_FAST_ARMS):
+            logical_index = case.case_index * len(_FAST_ARMS) + arm_offset
+            schedules.append(
+                make_parent_schedule_item(
+                    execution_index=logical_index,
+                    case=case,
+                    references=references,
+                    arm=arm,
+                )
+            )
+            future_plan.append(
+                (
+                    logical_index,
+                    FutureBatchRequest(
+                        items=(
+                            _fast_future_request(
+                                execution_token=opaque_by_logical[logical_index],
+                                database_path=capture_request.database_path,
+                                case=case,
+                                references=references,
+                                source=_fast_source_spec(case, references, arm),
+                            ),
+                        )
+                    ),
+                )
+            )
+        logical_index = 48 + case.case_index
+        future_plan.append(
+            (
+                logical_index,
+                FutureBatchRequest(
+                    items=(
+                        _fast_future_request(
+                            execution_token=opaque_by_logical[logical_index],
+                            database_path=capture_request.database_path,
+                            case=case,
+                            references=references,
+                            source=WireSourceSpec(
+                                source_kind="release",
+                                release_id=(
+                                    references.releases.foreign_sentinel_release_id
+                                ),
+                                cutoff=None,
+                                allowed_evidence_kinds=(),
+                                oracle_entries=(),
+                            ),
+                        ),
+                    )
+                ),
+            )
+        )
+    future_plan.sort(key=lambda item: item[1].items[0].execution_index)
+
+    future_executions: list[_FullFutureExecution] = []
+    for logical_index, request in future_plan:
+        execution_token = request.items[0].execution_index
+        budget_info = (
+            None
+            if deadline_exhausted
+            else _full_profile_budget(
+                deadline=deadline,
+                child_timeout_seconds=child_timeout_seconds,
+            )
+        )
+        if budget_info is None:
+            deadline_exhausted = True
+            attrition.append(
+                _full_profile_future_attrition(
+                    logical_execution_index=logical_index,
+                    opaque_execution_index=execution_token,
+                    reason="total_timeout",
+                    attempted=False,
+                )
+            )
+            continue
+        budget, globally_limited = budget_info
+        try:
+            response = run_isolated_child(
+                request,
+                role="future-child",
+                timeout_seconds=budget,
+            )
+        except ChildExecutionValidationError as error:
+            if error.reason not in _FULL_PROFILE_CHILD_MISSING_REASONS:
+                raise
+            attrition.append(
+                _full_profile_future_attrition(
+                    logical_execution_index=logical_index,
+                    opaque_execution_index=execution_token,
+                    reason=error.reason,
+                    attempted=True,
+                )
+            )
+            continue
+        except WireProtocolError as error:
+            if error.reason not in _FULL_PROFILE_MISSING_REASONS:
+                raise
+            reason = "total_timeout" if globally_limited else "child_timeout"
+            deadline_exhausted = deadline_exhausted or globally_limited
+            attrition.append(
+                _full_profile_future_attrition(
+                    logical_execution_index=logical_index,
+                    opaque_execution_index=execution_token,
+                    reason=reason,
+                    attempted=True,
+                )
+            )
+            continue
+        if time.monotonic() >= deadline:
+            deadline_exhausted = True
+            attrition.append(
+                _full_profile_future_attrition(
+                    logical_execution_index=logical_index,
+                    opaque_execution_index=execution_token,
+                    reason="total_timeout",
+                    attempted=True,
+                )
+            )
+            continue
+        if type(response) is not FutureBatchResponse:
+            raise ChildExecutionValidationError("process_isolation")
+        future_executions.append(
+            _FullFutureExecution(
+                logical_execution_index=logical_index,
+                request=request,
+                response=response,
+            )
+        )
+        valid_slot_indexes.add(8 + logical_index)
+
+    if attrition:
+        raise FullProfileAttritionError(
+            tuple(attrition),
+            tuple(valid_slot_indexes),
+        )
+    return _FullProfileExecution(
+        cases=cases,
+        capture_requests=capture_requests,
+        capture_responses=tuple(
+            capture_by_index[case_index] for case_index in range(8)
+        ),
+        future_executions=tuple(future_executions),
+        schedule=tuple(schedules),
+        execution_bindings=execution_bindings,
+    )
+
+
 def _join_fast_observation(
     observation: FutureExecutionObservation,
     schedule: ParentScheduleItem,
-    capture_response: CaptureBatchResponse,
+    capture_response: CaptureBatchResponse | CaptureChildResponse,
 ) -> ExecutionObservation:
     return ExecutionObservation(
         execution_index=schedule.execution_index,
@@ -5434,25 +5923,41 @@ def _build_leakage_traces(
     future: FutureBatchResponse,
 ) -> tuple[LeakageSentinelTrace, ...]:
     return tuple(
-        LeakageSentinelTrace(
-            schema_version=SCHEMA_VERSION,
-            case_id=case.case_id,
-            case_manifest_sha256=case_manifest_sha256(case),
-            execution_index=48 + case.case_index,
-            requested_scope=probe.scope,
-            companion_scope=references.capture.foreign_scope,
-            foreign_release_id=probe.release_id,
-            foreign_evidence_id=references.capture.foreign_evidence_id,
-            future_session_id=probe.future_session_id,
-            future_run_id=probe.future_run_id,
-            capture_pid=capture.pid,
-            future_pid=future.pid,
-            capture_process_instance_id=capture.process_instance_id,
-            future_process_instance_id=future.process_instance_id,
-            reason="foreign_scope",
-            history_length=probe.history_length,
+        _build_leakage_trace(
+            case,
+            references,
+            probe,
+            capture,
+            future,
         )
         for case, references, probe in validated_probes
+    )
+
+
+def _build_leakage_trace(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+    probe: ForeignProbeObservation,
+    capture: CaptureBatchResponse | CaptureChildResponse,
+    future: FutureBatchResponse,
+) -> LeakageSentinelTrace:
+    return LeakageSentinelTrace(
+        schema_version=SCHEMA_VERSION,
+        case_id=case.case_id,
+        case_manifest_sha256=case_manifest_sha256(case),
+        execution_index=48 + case.case_index,
+        requested_scope=probe.scope,
+        companion_scope=references.capture.foreign_scope,
+        foreign_release_id=probe.release_id,
+        foreign_evidence_id=references.capture.foreign_evidence_id,
+        future_session_id=probe.future_session_id,
+        future_run_id=probe.future_run_id,
+        capture_pid=capture.pid,
+        future_pid=future.pid,
+        capture_process_instance_id=capture.process_instance_id,
+        future_process_instance_id=future.process_instance_id,
+        reason="foreign_scope",
+        history_length=probe.history_length,
     )
 
 
@@ -6123,6 +6628,368 @@ def run_fast_profile(
         execution,
         artifact_path=artifact_path,
     )
+
+
+def _finalize_full_profile_execution(
+    execution: _FullProfileExecution,
+) -> FullProfileResult:
+    """Validate all 64 isolated slots before deriving any scientific result."""
+
+    if type(execution) is not _FullProfileExecution:
+        raise ChildExecutionValidationError("replay_provenance")
+
+    expected_cases = tuple(generate_case(case_index) for case_index in range(8))
+    if (
+        type(execution.cases) is not tuple
+        or execution.cases != expected_cases
+        or any(type(case) is not CodebookCase for case in execution.cases)
+        or type(execution.capture_requests) is not tuple
+        or len(execution.capture_requests) != 8
+        or any(
+            type(request) is not CaptureChildRequest
+            for request in execution.capture_requests
+        )
+        or tuple(request.case_index for request in execution.capture_requests)
+        != tuple(range(8))
+        or len({request.database_path for request in execution.capture_requests}) != 8
+        or any(
+            type(request.database_path) is not str or not request.database_path
+            for request in execution.capture_requests
+        )
+        or type(execution.capture_responses) is not tuple
+        or len(execution.capture_responses) != 8
+        or any(
+            type(response) is not CaptureChildResponse
+            for response in execution.capture_responses
+        )
+        or tuple(response.case_index for response in execution.capture_responses)
+        != tuple(range(8))
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+
+    bindings = execution.execution_bindings
+    if (
+        type(bindings) is not tuple
+        or len(bindings) != 56
+        or any(type(binding) is not _FastExecutionBinding for binding in bindings)
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    logical_indexes = tuple(binding.logical_execution_index for binding in bindings)
+    opaque_indexes = tuple(binding.opaque_execution_index for binding in bindings)
+    if (
+        logical_indexes != tuple(range(56))
+        or len(set(opaque_indexes)) != 56
+        or any(not _is_opaque_execution_token(index) for index in opaque_indexes)
+        or not set(opaque_indexes).isdisjoint(range(56))
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    opaque_by_logical = {
+        binding.logical_execution_index: binding.opaque_execution_index
+        for binding in bindings
+    }
+    logical_by_opaque = {
+        binding.opaque_execution_index: binding.logical_execution_index
+        for binding in bindings
+    }
+
+    capture_by_index = {
+        response.case_index: response for response in execution.capture_responses
+    }
+    capture_request_by_index = {
+        request.case_index: request for request in execution.capture_requests
+    }
+    for case_index in range(8):
+        request = capture_request_by_index[case_index]
+        response = capture_by_index[case_index]
+        _validate_child_process_response(response, expected_pid=response.pid)
+        if response.case_index != request.case_index:
+            raise ChildExecutionValidationError("assignment_mismatch")
+        _validate_parent_foreign_companion_contract(
+            expected_cases[case_index],
+            response.references,
+        )
+
+    expected_schedule: list[ParentScheduleItem] = []
+    expected_requests: dict[int, FutureBatchRequest] = {}
+    try:
+        for case in expected_cases:
+            capture_request = capture_request_by_index[case.case_index]
+            references = capture_by_index[case.case_index].references
+            for arm_offset, arm in enumerate(_FAST_ARMS):
+                logical_index = case.case_index * len(_FAST_ARMS) + arm_offset
+                expected_schedule.append(
+                    make_parent_schedule_item(
+                        execution_index=logical_index,
+                        case=case,
+                        references=references,
+                        arm=arm,
+                    )
+                )
+                expected_requests[logical_index] = FutureBatchRequest(
+                    items=(
+                        _fast_future_request(
+                            execution_token=opaque_by_logical[logical_index],
+                            database_path=capture_request.database_path,
+                            case=case,
+                            references=references,
+                            source=_fast_source_spec(case, references, arm),
+                        ),
+                    )
+                )
+            logical_index = 48 + case.case_index
+            expected_requests[logical_index] = FutureBatchRequest(
+                items=(
+                    _fast_future_request(
+                        execution_token=opaque_by_logical[logical_index],
+                        database_path=capture_request.database_path,
+                        case=case,
+                        references=references,
+                        source=WireSourceSpec(
+                            source_kind="release",
+                            release_id=(
+                                references.releases.foreign_sentinel_release_id
+                            ),
+                            cutoff=None,
+                            allowed_evidence_kinds=(),
+                            oracle_entries=(),
+                        ),
+                    ),
+                )
+            )
+    except ChildExecutionValidationError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise ChildExecutionValidationError("assignment_mismatch") from error
+
+    if (
+        type(execution.schedule) is not tuple
+        or execution.schedule != tuple(expected_schedule)
+        or any(type(item) is not ParentScheduleItem for item in execution.schedule)
+        or type(execution.future_executions) is not tuple
+        or len(execution.future_executions) != 56
+        or any(
+            type(item) is not _FullFutureExecution
+            for item in execution.future_executions
+        )
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+
+    expected_future_logical_order = tuple(
+        logical_by_opaque[index] for index in sorted(logical_by_opaque)
+    )
+    if (
+        tuple(item.logical_execution_index for item in execution.future_executions)
+        != expected_future_logical_order
+        or len({item.logical_execution_index for item in execution.future_executions})
+        != 56
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+
+    future_by_logical: dict[int, _FullFutureExecution] = {}
+    future_process_instance_ids: list[str] = []
+    capture_process_instance_ids = tuple(
+        response.process_instance_id for response in execution.capture_responses
+    )
+    for item in execution.future_executions:
+        logical_index = item.logical_execution_index
+        if (
+            type(logical_index) is not int
+            or logical_index not in range(56)
+            or type(item.request) is not FutureBatchRequest
+            or item.request != expected_requests[logical_index]
+            or type(item.request.items) is not tuple
+            or len(item.request.items) != 1
+            or type(item.request.items[0]) is not FutureChildRequest
+            or type(item.response) is not FutureBatchResponse
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        request = item.request.items[0]
+        expected_session_id, expected_run_id = _opaque_future_identity(
+            opaque_by_logical[logical_index]
+        )
+        if (
+            request.execution_index != opaque_by_logical[logical_index]
+            or request.future_session_id != expected_session_id
+            or request.future_run_id != expected_run_id
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        _validate_child_process_response(
+            item.response,
+            expected_pid=item.response.pid,
+        )
+        future_process_instance_ids.append(item.response.process_instance_id)
+        future_by_logical[logical_index] = item
+
+    all_process_instance_ids = (
+        *capture_process_instance_ids,
+        *future_process_instance_ids,
+    )
+    if (
+        len(set(capture_process_instance_ids)) != 8
+        or len(set(future_process_instance_ids)) != 56
+        or not set(capture_process_instance_ids).isdisjoint(future_process_instance_ids)
+        or len(set(all_process_instance_ids)) != 64
+    ):
+        raise ChildExecutionValidationError("process_isolation")
+
+    identity_fields = (
+        "store_instance_id",
+        "reader_instance_id",
+        "resolver_instance_id",
+        "renderer_instance_id",
+        "consumer_instance_id",
+        "audit_instance_id",
+        "logical_session_instance_id",
+        "history_instance_id",
+    )
+    observations_by_logical: dict[int, FutureExecutionObservation] = {}
+    probes_by_logical: dict[int, ForeignProbeObservation] = {}
+    receipts_by_logical: dict[int, ItemStateReceipt] = {}
+    all_state_identities: list[str] = []
+
+    # This loop deliberately completes every child/source/receipt check before
+    # parent_join_and_score (or any trace/signature construction) is reachable.
+    for logical_index in range(56):
+        item = future_by_logical[logical_index]
+        request = item.request.items[0]
+        response = item.response
+        if (
+            type(response.observations) is not tuple
+            or any(
+                type(observation) is not FutureExecutionObservation
+                for observation in response.observations
+            )
+            or type(response.foreign_probes) is not tuple
+            or any(
+                type(probe) is not ForeignProbeObservation
+                for probe in response.foreign_probes
+            )
+            or type(response.state_receipts) is not tuple
+            or len(response.state_receipts) != 1
+            or type(response.state_receipts[0]) is not ItemStateReceipt
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        receipt = response.state_receipts[0]
+        if (
+            receipt.execution_index != request.execution_index
+            or receipt.generation_index != 0
+            or receipt.logical_session_id != request.future_session_id
+            or receipt.logical_run_id != request.future_run_id
+            or receipt.history_length != 0
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+        receipt_identities = tuple(
+            getattr(receipt, field_name) for field_name in identity_fields
+        )
+        if any(
+            type(identity) is not str or _SHA256_PATTERN.fullmatch(identity) is None
+            for identity in receipt_identities
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+        all_state_identities.extend(receipt_identities)
+        receipts_by_logical[logical_index] = receipt
+
+        if logical_index < 48:
+            if len(response.observations) != 1 or response.foreign_probes:
+                raise ChildExecutionValidationError("assignment_mismatch")
+            observation = response.observations[0]
+            if (
+                observation.execution_index != request.execution_index
+                or observation.future_session_id != request.future_session_id
+                or observation.future_run_id != request.future_run_id
+                or observation.future_pid != response.pid
+                or observation.future_process_instance_id
+                != response.process_instance_id
+            ):
+                raise ChildExecutionValidationError("assignment_mismatch")
+            schedule = execution.schedule[logical_index]
+            validate_future_child_response(
+                FutureChildResponse(
+                    observation=observation,
+                    pid=response.pid,
+                    process_instance_id=response.process_instance_id,
+                    isolated_mode=response.isolated_mode,
+                    areal_module_path=response.areal_module_path,
+                    visible_forbidden_environment=(
+                        response.visible_forbidden_environment
+                    ),
+                    environment_clean=response.environment_clean,
+                ),
+                replace(schedule, execution_index=request.execution_index),
+            )
+            observations_by_logical[logical_index] = observation
+            continue
+
+        if response.observations or len(response.foreign_probes) != 1:
+            raise ChildExecutionValidationError("assignment_mismatch")
+        probe = response.foreign_probes[0]
+        case_index = logical_index - 48
+        references = capture_by_index[case_index].references
+        if (
+            probe.execution_index != request.execution_index
+            or probe.scope != references.capture.local_scope
+            or probe.release_id != references.releases.foreign_sentinel_release_id
+            or probe.reason != "release_not_found"
+            or probe.history_length != 0
+            or probe.future_pid != response.pid
+            or probe.future_process_instance_id != response.process_instance_id
+            or probe.future_session_id != request.future_session_id
+            or probe.future_run_id != request.future_run_id
+        ):
+            raise ChildExecutionValidationError("foreign_scope")
+        probes_by_logical[logical_index] = probe
+
+    if len(set(all_state_identities)) != 56 * len(identity_fields):
+        raise ChildExecutionValidationError("state_reuse")
+
+    observations = tuple(
+        _join_fast_observation(
+            observations_by_logical[schedule.execution_index],
+            schedule,
+            capture_by_index[schedule.execution_index // len(_FAST_ARMS)],
+        )
+        for schedule in execution.schedule
+    )
+    outcomes = parent_join_and_score(
+        observations,
+        execution.schedule,
+        enforce_scripted_outcomes=True,
+    )
+    signatures = _build_strict_signatures(execution.cases, outcomes)
+    leakage_traces = tuple(
+        _build_leakage_trace(
+            execution.cases[logical_index - 48],
+            capture_by_index[logical_index - 48].references,
+            probes_by_logical[logical_index],
+            capture_by_index[logical_index - 48],
+            future_by_logical[logical_index].response,
+        )
+        for logical_index in range(48, 56)
+    )
+    return FullProfileResult(
+        outcomes=outcomes,
+        foreign_probes=leakage_traces,
+        signatures=signatures,
+        state_receipts=tuple(
+            receipts_by_logical[logical_index] for logical_index in range(56)
+        ),
+    )
+
+
+def run_full_profile(
+    database_root: str | os.PathLike[str],
+    *,
+    child_timeout_seconds: float = 120,
+    total_timeout_seconds: float = 900,
+) -> FullProfileResult:
+    """Run the scientific 64-process profile under one monotonic deadline."""
+
+    execution = _execute_full_profile_children(
+        database_root,
+        child_timeout_seconds=child_timeout_seconds,
+        total_timeout_seconds=total_timeout_seconds,
+    )
+    return _finalize_full_profile_execution(execution)
 
 
 def _write_child_response(response: object) -> None:
