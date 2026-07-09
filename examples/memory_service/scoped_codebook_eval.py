@@ -6,10 +6,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from areal.v2.memory_service import (
+    CandidateProposal,
+    EvidenceEvent,
+    EvidenceKind,
+    EvidenceRecord,
+    MemoryRevision,
+    MemoryScope,
+    ReleaseManifest,
+    RevisionOperation,
+    RevisionProposal,
+)
+from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 
 SCHEMA_VERSION = 1
 CASE_SEED = "areal-memory-helpfulness-v1-20260708"
@@ -116,6 +131,53 @@ class ConsumerResult:
 
     response: str
     input_receipt: ConsumerInputReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureReferences:
+    """Deterministic evidence addresses and capture-time policy boundary."""
+
+    local_scope: MemoryScope
+    foreign_scope: MemoryScope
+    case_base: datetime
+    raw_history_cutoff: datetime
+    capture_session_ids: tuple[str, str, str]
+    old_evidence_ids: tuple[str, ...]
+    current_evidence_id: str
+    control_evidence_ids: tuple[str, str]
+    foreign_evidence_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionReferences:
+    """Stable revision addresses needed to verify one case graph."""
+
+    target_old_revision_id: str
+    target_current_revision_id: str
+    shared_revision_ids: tuple[str, ...]
+    padding_revision_id: str
+    target_masked_revision_id: str
+    foreign_target_revision_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseAssignments:
+    """Exact local treatment releases plus the foreign leakage sentinel."""
+
+    stale_release_id: str
+    current_release_id: str
+    masked_release_id: str
+    empty_release_id: str
+    foreign_sentinel_release_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CaseDatabaseReferences:
+    """Portable references for a fully persisted deterministic case graph."""
+
+    capture: CaptureReferences
+    revisions: RevisionReferences
+    releases: ReleaseAssignments
 
 
 def _token(
@@ -396,3 +458,339 @@ def utility(normalized_response: str, *, current_value: str) -> int:
     if abstained(normalized_response):
         return 0
     return -1
+
+
+def _target_and_shared_slots(
+    case: CodebookCase,
+    *,
+    target_value: str,
+) -> tuple[tuple[int, CodebookEntry], ...]:
+    entries = [
+        (
+            case.target_slot,
+            CodebookEntry(key=case.target_key, value=target_value),
+        )
+    ]
+    shared_slots = iter(slot for slot in range(5) if slot != case.target_slot)
+    entries.extend(
+        (slot, entry)
+        for slot, entry in zip(
+            shared_slots,
+            case.shared_entries,
+            strict=True,
+        )
+    )
+    return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def _append_capture_record(
+    store: SQLiteMemoryStore,
+    *,
+    scope: MemoryScope,
+    session_id: str,
+    run_id: str,
+    sequence_no: int,
+    kind: EvidenceKind,
+    entry: CodebookEntry,
+    observed_at: datetime,
+    idempotency_key: str,
+) -> EvidenceRecord:
+    return store.append(
+        EvidenceEvent(
+            scope=scope,
+            session_id=session_id,
+            run_id=run_id,
+            sequence_no=sequence_no,
+            kind=kind,
+            payload=f"{entry.key} = {entry.value}",
+            observed_at=observed_at,
+            idempotency_key=idempotency_key,
+        )
+    )
+
+
+def _append_grounded_revision(
+    store: SQLiteMemoryStore,
+    *,
+    case_id: str,
+    owner: str,
+    role: str,
+    slot: int,
+    evidence: EvidenceRecord,
+    operation: RevisionOperation,
+    parent_revision_id: str | None = None,
+) -> MemoryRevision:
+    parse_fact(evidence.event.payload)
+    candidate = store.append_candidate(
+        CandidateProposal(
+            scope=evidence.event.scope,
+            content=evidence.event.payload,
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=(f"{case_id}-candidate-{owner}-{role}-{slot:02d}"),
+        )
+    )
+    return store.append_revision(
+        RevisionProposal(
+            scope=evidence.event.scope,
+            candidate_id=candidate.candidate_id,
+            operation=operation,
+            parent_revision_id=parent_revision_id,
+            idempotency_key=(f"{case_id}-revision-{owner}-{role}-{slot:02d}"),
+        )
+    )
+
+
+def _manifest_revision_ids(
+    case: CodebookCase,
+    *,
+    target_revision_id: str,
+    shared_revision_ids: tuple[str, ...],
+    padding_revision_id: str,
+) -> tuple[str, ...]:
+    shared = iter(shared_revision_ids)
+    return tuple(
+        target_revision_id if slot == case.target_slot else next(shared)
+        for slot in range(5)
+    ) + (padding_revision_id,)
+
+
+def build_case_database(
+    case: CodebookCase,
+    database_path: str | os.PathLike[str],
+) -> CaseDatabaseReferences:
+    """Persist one exact local graph and its answer-bearing foreign sentinel."""
+
+    return _build_case_database(case, database_path)
+
+
+def _build_case_database(
+    case: CodebookCase,
+    database_path: str | os.PathLike[str],
+) -> CaseDatabaseReferences:
+    if type(case) is not CodebookCase:
+        raise TypeError("case must be a CodebookCase")
+
+    store = SQLiteMemoryStore(database_path)
+    local_scope = MemoryScope(
+        tenant_id="memory-eval",
+        namespace="scoped-codebook-v1",
+        subject_id=case.subject_id,
+    )
+    foreign_scope = MemoryScope(
+        tenant_id="memory-eval",
+        namespace="scoped-codebook-v1",
+        subject_id=f"{case.subject_id}-foreign",
+    )
+    case_base = datetime(2026, 7, 8, tzinfo=UTC) + timedelta(days=case.case_index)
+    raw_history_cutoff = case_base + timedelta(seconds=90)
+    capture_session_ids = (
+        f"{case.case_id}-capture-old",
+        f"{case.case_id}-capture-new",
+        f"{case.case_id}-capture-control",
+    )
+
+    old_records_by_slot: dict[int, EvidenceRecord] = {}
+    for slot, entry in _target_and_shared_slots(case, target_value=case.old_value):
+        old_records_by_slot[slot] = _append_capture_record(
+            store,
+            scope=local_scope,
+            session_id=capture_session_ids[0],
+            run_id=f"{case.case_id}-run-old",
+            sequence_no=slot,
+            kind=EvidenceKind.USER_MESSAGE,
+            entry=entry,
+            observed_at=case_base + timedelta(seconds=slot),
+            idempotency_key=f"{case.case_id}-evidence-old-{slot:02d}",
+        )
+    current_record = _append_capture_record(
+        store,
+        scope=local_scope,
+        session_id=capture_session_ids[1],
+        run_id=f"{case.case_id}-run-new",
+        sequence_no=0,
+        kind=EvidenceKind.FEEDBACK,
+        entry=CodebookEntry(key=case.target_key, value=case.current_value),
+        observed_at=case_base + timedelta(seconds=60),
+        idempotency_key=(f"{case.case_id}-evidence-new-{case.target_slot:02d}"),
+    )
+    padding_record = _append_capture_record(
+        store,
+        scope=local_scope,
+        session_id=capture_session_ids[2],
+        run_id=f"{case.case_id}-run-control",
+        sequence_no=0,
+        kind=EvidenceKind.ENVIRONMENT,
+        entry=case.padding_entry,
+        observed_at=case_base + timedelta(seconds=120),
+        idempotency_key=f"{case.case_id}-evidence-control-05",
+    )
+    masked_record = _append_capture_record(
+        store,
+        scope=local_scope,
+        session_id=capture_session_ids[2],
+        run_id=f"{case.case_id}-run-control",
+        sequence_no=1,
+        kind=EvidenceKind.ENVIRONMENT,
+        entry=CodebookEntry(key=case.target_key, value=case.masked_value),
+        observed_at=case_base + timedelta(seconds=121),
+        idempotency_key=(f"{case.case_id}-evidence-control-{case.target_slot:02d}"),
+    )
+    foreign_record = _append_capture_record(
+        store,
+        scope=foreign_scope,
+        session_id=f"{case.case_id}-capture-foreign",
+        run_id=f"{case.case_id}-run-foreign",
+        sequence_no=0,
+        kind=EvidenceKind.ENVIRONMENT,
+        entry=CodebookEntry(key=case.target_key, value=case.current_value),
+        observed_at=case_base + timedelta(seconds=180),
+        idempotency_key=(
+            f"{case.case_id}-evidence-foreign-target-current-{case.target_slot:02d}"
+        ),
+    )
+
+    target_old_revision = _append_grounded_revision(
+        store,
+        case_id=case.case_id,
+        owner="local",
+        role="target-old",
+        slot=case.target_slot,
+        evidence=old_records_by_slot[case.target_slot],
+        operation=RevisionOperation.ADD,
+    )
+    target_current_revision = _append_grounded_revision(
+        store,
+        case_id=case.case_id,
+        owner="local",
+        role="target-current",
+        slot=case.target_slot,
+        evidence=current_record,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=target_old_revision.revision_id,
+    )
+    shared_slots = tuple(slot for slot in range(5) if slot != case.target_slot)
+    shared_revisions = tuple(
+        _append_grounded_revision(
+            store,
+            case_id=case.case_id,
+            owner="local",
+            role="shared",
+            slot=slot,
+            evidence=old_records_by_slot[slot],
+            operation=RevisionOperation.ADD,
+        )
+        for slot in shared_slots
+    )
+    padding_revision = _append_grounded_revision(
+        store,
+        case_id=case.case_id,
+        owner="local",
+        role="padding",
+        slot=5,
+        evidence=padding_record,
+        operation=RevisionOperation.ADD,
+    )
+    target_masked_revision = _append_grounded_revision(
+        store,
+        case_id=case.case_id,
+        owner="local",
+        role="target-masked",
+        slot=case.target_slot,
+        evidence=masked_record,
+        operation=RevisionOperation.ADD,
+    )
+    foreign_target_revision = _append_grounded_revision(
+        store,
+        case_id=case.case_id,
+        owner="foreign",
+        role="target-current",
+        slot=case.target_slot,
+        evidence=foreign_record,
+        operation=RevisionOperation.ADD,
+    )
+
+    shared_revision_ids = tuple(revision.revision_id for revision in shared_revisions)
+    stale_manifest = ReleaseManifest(
+        scope=local_scope,
+        revision_ids=_manifest_revision_ids(
+            case,
+            target_revision_id=target_old_revision.revision_id,
+            shared_revision_ids=shared_revision_ids,
+            padding_revision_id=padding_revision.revision_id,
+        ),
+    )
+    current_manifest = ReleaseManifest(
+        scope=local_scope,
+        revision_ids=_manifest_revision_ids(
+            case,
+            target_revision_id=target_current_revision.revision_id,
+            shared_revision_ids=shared_revision_ids,
+            padding_revision_id=padding_revision.revision_id,
+        ),
+    )
+    masked_manifest = ReleaseManifest(
+        scope=local_scope,
+        revision_ids=_manifest_revision_ids(
+            case,
+            target_revision_id=target_masked_revision.revision_id,
+            shared_revision_ids=shared_revision_ids,
+            padding_revision_id=padding_revision.revision_id,
+        ),
+    )
+    stale_release = store.append_release(
+        stale_manifest,
+        idempotency_key=f"{case.case_id}-release-local-stale",
+    )
+    current_release = store.append_release(
+        current_manifest,
+        idempotency_key=f"{case.case_id}-release-local-current",
+    )
+    masked_release = store.append_release(
+        masked_manifest,
+        idempotency_key=f"{case.case_id}-release-local-masked",
+    )
+    empty_release = store.append_release(
+        ReleaseManifest(scope=local_scope, revision_ids=()),
+        idempotency_key=f"{case.case_id}-release-local-empty",
+    )
+    foreign_release = store.append_release(
+        ReleaseManifest(
+            scope=foreign_scope,
+            revision_ids=(foreign_target_revision.revision_id,),
+        ),
+        idempotency_key=f"{case.case_id}-release-foreign-sentinel",
+    )
+
+    return CaseDatabaseReferences(
+        capture=CaptureReferences(
+            local_scope=local_scope,
+            foreign_scope=foreign_scope,
+            case_base=case_base,
+            raw_history_cutoff=raw_history_cutoff,
+            capture_session_ids=capture_session_ids,
+            old_evidence_ids=tuple(
+                old_records_by_slot[slot].evidence_id for slot in range(5)
+            ),
+            current_evidence_id=current_record.evidence_id,
+            control_evidence_ids=(
+                padding_record.evidence_id,
+                masked_record.evidence_id,
+            ),
+            foreign_evidence_id=foreign_record.evidence_id,
+        ),
+        revisions=RevisionReferences(
+            target_old_revision_id=target_old_revision.revision_id,
+            target_current_revision_id=target_current_revision.revision_id,
+            shared_revision_ids=shared_revision_ids,
+            padding_revision_id=padding_revision.revision_id,
+            target_masked_revision_id=target_masked_revision.revision_id,
+            foreign_target_revision_id=foreign_target_revision.revision_id,
+        ),
+        releases=ReleaseAssignments(
+            stale_release_id=stale_release.release_id,
+            current_release_id=current_release.release_id,
+            masked_release_id=masked_release.release_id,
+            empty_release_id=empty_release.release_id,
+            foreign_sentinel_release_id=foreign_release.release_id,
+        ),
+    )
