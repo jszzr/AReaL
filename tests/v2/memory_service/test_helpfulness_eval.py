@@ -1445,6 +1445,57 @@ class ProxyPrivateStateBugResolver:
         return capability._missing_proxy_private_state
 
 
+def _guard_source_render(monkeypatch: pytest.MonkeyPatch) -> Counter:
+    calls = Counter()
+
+    def forbidden(stage: str):
+        def fail(*_args, **_kwargs):
+            calls[stage] += 1
+            raise AssertionError(f"{stage} ran for an invalid mutation")
+
+        return fail
+
+    monkeypatch.setattr(
+        helpfulness,
+        "render_context",
+        forbidden("render"),
+    )
+    return calls
+
+
+def _guard_trace_output(monkeypatch: pytest.MonkeyPatch) -> Counter:
+    calls = Counter()
+
+    def trace_must_not_run(*_args, **_kwargs):
+        calls["trace"] += 1
+        raise AssertionError("trace ran for an invalid mutation")
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_trace_from_observation",
+        trace_must_not_run,
+    )
+    return calls
+
+
+def _guard_process_join(monkeypatch: pytest.MonkeyPatch) -> Counter:
+    calls = Counter()
+
+    def forbidden(stage: str):
+        def fail(*_args, **_kwargs):
+            calls[stage] += 1
+            raise AssertionError(f"{stage} ran for an invalid process mutation")
+
+        return fail
+
+    monkeypatch.setattr(
+        helpfulness,
+        "parent_join_and_score",
+        forbidden("join"),
+    )
+    return calls
+
+
 def test_capability_interface_error_does_not_swallow_resolver_attribute_bugs(
     tmp_path: Path,
 ) -> None:
@@ -1537,8 +1588,9 @@ def test_capability_missing_private_state_is_not_misclassified_as_interface(
         ("source_swap", "source_or_audit_mismatch"),
     ),
 )
-def test_source_mutants_fail_for_pre_registered_reason(
+def test_source_and_provenance_mutation_matrix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutant: str,
     reason: str,
 ) -> None:
@@ -1581,15 +1633,18 @@ def test_source_mutants_fail_for_pre_registered_reason(
         assert raw_assignment.scope == assignment.scope
         resolver = SourceSwapResolver()
 
+    downstream_calls = _guard_source_render(monkeypatch)
     with pytest.raises(helpfulness.TreatmentValidationError) as error:
-        helpfulness.resolve_and_validate(
+        treatment = helpfulness.resolve_and_validate(
             resolver,
             capability,
             database_path=path,
             assignment=assignment,
             audit_sink=audit,
         )
+        helpfulness.render_context(treatment.entries)
     assert error.value.reason == reason
+    assert downstream_calls == Counter()
 
 
 def _task5_bundle(tmp_path: Path, *, arm: str, execution_index: int = 0):
@@ -1690,7 +1745,10 @@ def _observation_with_rendered(bundle, rendered, consumer_result, *, model=None)
     )
 
 
-def test_ids_are_not_injected_before_consumer_receipt_matches(tmp_path: Path) -> None:
+def test_ids_are_not_injected_before_consumer_receipt_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bundle = _task5_bundle(tmp_path, arm="current_release")
     observation = bundle["observation"]
 
@@ -1704,6 +1762,23 @@ def test_ids_are_not_injected_before_consumer_receipt_matches(tmp_path: Path) ->
         enforce_scripted_outcomes=True,
     )
     assert trace.injected_revision_ids == observation.returned_ids
+
+    invalid = replace(
+        observation,
+        consumer_input_receipt=replace(
+            observation.consumer_input_receipt,
+            received_context_sha256="0" * 64,
+        ),
+    )
+    trace_calls = _guard_trace_output(monkeypatch)
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (invalid,),
+            (bundle["schedule"],),
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == "received_context_mismatch"
+    assert trace_calls == Counter()
 
 
 @pytest.mark.parametrize(
@@ -1845,6 +1920,10 @@ def test_parent_rejects_missing_duplicate_or_swapped_execution_indexes(
         ((observations[0],), "execution_index_mismatch"),
         ((observations[0], observations[0]), "execution_index_mismatch"),
         (
+            (observations[0], observations[0], observations[1]),
+            "execution_index_mismatch",
+        ),
+        (
             (*observations, replace(observations[0], execution_index=99)),
             "execution_index_mismatch",
         ),
@@ -1878,6 +1957,15 @@ def test_parent_rejects_missing_duplicate_or_swapped_execution_indexes(
                 enforce_scripted_outcomes=False,
             )
         assert error.value.reason == reason
+
+    duplicate_schedule = (schedule[0], schedule[0], schedule[1])
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            observations,
+            duplicate_schedule,
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == "execution_index_mismatch"
 
 
 def test_parent_validates_entire_batch_before_any_normalization(
@@ -2054,8 +2142,9 @@ def test_followed_injected_value_requires_acknowledged_target_entry(
         ("first_occurrence_raw", "raw_order_failure"),
     ),
 )
-def test_exposure_mutants_fail_for_pre_registered_reason(
+def test_exposure_and_consumer_mutation_matrix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutant: str,
     reason: str,
 ) -> None:
@@ -2102,6 +2191,7 @@ def test_exposure_mutants_fail_for_pre_registered_reason(
     else:
         observation = replace(observation, response=bundle["case"].old_value)
 
+    trace_calls = _guard_trace_output(monkeypatch)
     with pytest.raises(helpfulness.ObservationValidationError) as error:
         helpfulness.parent_join_and_score(
             (observation,),
@@ -2109,6 +2199,7 @@ def test_exposure_mutants_fail_for_pre_registered_reason(
             enforce_scripted_outcomes=True,
         )
     assert error.value.reason == reason
+    assert trace_calls == Counter()
 
 
 @pytest.mark.parametrize(
@@ -2879,25 +2970,6 @@ def test_child_timeout_has_stable_protocol_reason(
     assert process.reaped is True
 
 
-def test_ground_truth_child_payload_is_rejected(tmp_path: Path) -> None:
-    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
-    value = json.loads(helpfulness.wire_dumps(request))
-    value["payload"]["expected_response"] = "LEAKED-TRUTH"
-    encoded = (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-
-    with pytest.raises(helpfulness.WireProtocolError) as error:
-        helpfulness.wire_loads(encoded)
-    assert error.value.reason == "closed_schema"
-
-
 def test_missing_local_release_is_not_misclassified_as_foreign_scope(
     tmp_path: Path,
 ) -> None:
@@ -2916,80 +2988,27 @@ def test_missing_local_release_is_not_misclassified_as_foreign_scope(
     assert error.value.reason == "child_nonzero_exit"
 
 
-@pytest.mark.parametrize(
-    ("mutant", "reason"),
-    (
-        ("in_process", "process_isolation"),
-        ("identity", "process_isolation"),
-        ("history", "history_nonzero"),
-        ("assignment", "assignment_mismatch"),
-    ),
-)
-def test_child_execution_mutants_fail_for_pre_registered_reason(
+def test_child_response_rejects_missing_process_identity(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mutant: str,
-    reason: str,
 ) -> None:
-    case, references, request, schedule = _wire_future_setup(tmp_path)
-    if mutant == "in_process":
-        response = helpfulness.execute_future_child_request(request)
-    else:
-        response = helpfulness.run_isolated_child(
-            request,
-            role="future-child",
-            timeout_seconds=20,
-        )
-        if mutant == "identity":
-            response = replace(
-                response,
-                process_instance_id="",
-                observation=replace(
-                    response.observation,
-                    future_process_instance_id="",
-                ),
-            )
-        elif mutant == "history":
-            isolated_response = response
-            consume_without_leak = helpfulness.consume_scripted
-
-            def consume_with_hidden_history(query, rendered_context, *, history=()):
-                return consume_without_leak(
-                    query,
-                    rendered_context,
-                    history=(b"capture-only prior turn",),
-                )
-
-            monkeypatch.setattr(
-                helpfulness,
-                "consume_scripted",
-                consume_with_hidden_history,
-            )
-            leaky_response = helpfulness.execute_future_child_request(request)
-            assert leaky_response.observation.history_length == 1
-            assert (
-                leaky_response.observation.consumer_input_receipt.received_history_length
-                == 1
-            )
-            response = replace(
-                isolated_response,
-                observation=replace(
-                    leaky_response.observation,
-                    future_pid=isolated_response.pid,
-                    future_process_instance_id=(isolated_response.process_instance_id),
-                ),
-            )
-        elif mutant == "assignment":
-            schedule = helpfulness.make_parent_schedule_item(
-                execution_index=request.execution_index,
-                case=case,
-                references=references,
-                arm="stale_release",
-            )
+    _case, _references, request, schedule = _wire_future_setup(tmp_path)
+    response = helpfulness.run_isolated_child(
+        request,
+        role="future-child",
+        timeout_seconds=20,
+    )
+    response = replace(
+        response,
+        process_instance_id="",
+        observation=replace(
+            response.observation,
+            future_process_instance_id="",
+        ),
+    )
 
     with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
         helpfulness.validate_future_child_response(response, schedule)
-    assert error.value.reason == reason
+    assert error.value.reason == "process_isolation"
 
 
 def test_single_future_cannot_classify_a_foreign_sentinel_from_local_not_found(
@@ -3050,6 +3069,142 @@ def fast_profile_bundle(tmp_path_factory: pytest.TempPathFactory):
         "result": result,
         "root": root,
     }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_type", "reason"),
+    (
+        (
+            "ground_truth",
+            helpfulness.WireProtocolError,
+            "closed_schema",
+        ),
+        (
+            "in_process",
+            helpfulness.ChildExecutionValidationError,
+            "process_isolation",
+        ),
+        (
+            "history_leak",
+            helpfulness.ChildExecutionValidationError,
+            "history_nonzero",
+        ),
+        (
+            "assignment_swap",
+            helpfulness.ChildExecutionValidationError,
+            "assignment_mismatch",
+        ),
+        (
+            "foreign_scope",
+            helpfulness.ChildExecutionValidationError,
+            "foreign_scope",
+        ),
+    ),
+)
+def test_process_assignment_and_leakage_mutation_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    error_type: type[Exception],
+    reason: str,
+) -> None:
+    case, references, request, schedule = _wire_future_setup(tmp_path)
+    derived_calls = _guard_process_join(monkeypatch)
+
+    def reach_derived_pipeline() -> None:
+        helpfulness.parent_join_and_score(
+            (),
+            (),
+            enforce_scripted_outcomes=False,
+        )
+
+    if mutation == "ground_truth":
+        value = json.loads(helpfulness.wire_dumps(request))
+        value["payload"]["expected_response"] = case.current_value
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        with pytest.raises(error_type) as error:
+            helpfulness.wire_loads(encoded)
+            reach_derived_pipeline()
+    elif mutation == "in_process":
+        response = helpfulness.execute_future_child_request(request)
+        with pytest.raises(error_type) as error:
+            helpfulness.validate_future_child_response(response, schedule)
+            reach_derived_pipeline()
+    elif mutation == "history_leak":
+        isolated = helpfulness.run_isolated_child(
+            request,
+            role="future-child",
+            timeout_seconds=20,
+        )
+        original_consumer = helpfulness.consume_scripted
+
+        def consume_with_history(query, rendered_context, *, history=()):
+            return original_consumer(
+                query,
+                rendered_context,
+                history=(b"capture-only prior turn",),
+            )
+
+        monkeypatch.setattr(
+            helpfulness,
+            "consume_scripted",
+            consume_with_history,
+        )
+        leaky = helpfulness.execute_future_child_request(request)
+        response = replace(
+            isolated,
+            observation=replace(
+                leaky.observation,
+                future_pid=isolated.pid,
+                future_process_instance_id=isolated.process_instance_id,
+            ),
+        )
+        with pytest.raises(error_type) as error:
+            helpfulness.validate_future_child_response(response, schedule)
+            reach_derived_pipeline()
+    elif mutation == "assignment_swap":
+        response = helpfulness.run_isolated_child(
+            request,
+            role="future-child",
+            timeout_seconds=20,
+        )
+        stale_schedule = helpfulness.make_parent_schedule_item(
+            execution_index=request.execution_index,
+            case=case,
+            references=references,
+            arm="stale_release",
+        )
+        with pytest.raises(error_type) as error:
+            helpfulness.validate_future_child_response(response, stale_schedule)
+            reach_derived_pipeline()
+    else:
+        foreign_request = replace(
+            request,
+            scope=references.capture.foreign_scope,
+            source=replace(
+                request.source,
+                release_id=references.releases.foreign_sentinel_release_id,
+            ),
+        )
+        response = helpfulness.run_isolated_child(
+            foreign_request,
+            role="future-child",
+            timeout_seconds=20,
+        )
+        with pytest.raises(error_type) as error:
+            helpfulness.validate_future_child_response(response, schedule)
+            reach_derived_pipeline()
+
+    assert error.value.reason == reason
+    assert derived_calls == Counter()
 
 
 def test_fast_profile_produces_48_outcomes_and_8_foreign_probes(
