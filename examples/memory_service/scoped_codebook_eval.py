@@ -9,15 +9,19 @@ import json
 import os
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from areal.v2.memory_service import (
     CandidateProposal,
     EvidenceEvent,
     EvidenceKind,
     EvidenceRecord,
+    MemoryCandidate,
+    MemoryRelease,
     MemoryRevision,
     MemoryScope,
     ReleaseManifest,
@@ -178,6 +182,89 @@ class CaseDatabaseReferences:
     capture: CaptureReferences
     revisions: RevisionReferences
     releases: ReleaseAssignments
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAuditEvent:
+    """One evaluator-owned record of an allowed or denied capability call."""
+
+    operation: str
+    requested_scope: MemoryScope
+    requested_ids: tuple[str, ...]
+    allowed: bool
+    returned_record_ids: tuple[str, ...]
+    returned_content_hashes: tuple[str, ...]
+
+
+class ReadAuditSink:
+    """Mutable audit buffer held outside resolver-owned return values."""
+
+    __slots__ = ("__events",)
+
+    def __init__(self) -> None:
+        self.__events: list[ReadAuditEvent] = []
+
+    def _record(self, event: ReadAuditEvent) -> None:
+        self.__events.append(event)
+
+    def snapshot(self) -> tuple[ReadAuditEvent, ...]:
+        return tuple(self.__events)
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseSourceAssignment:
+    scope: MemoryScope
+    release_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RawSourceAssignment:
+    scope: MemoryScope
+    cutoff: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OracleSourceAssignment:
+    scope: MemoryScope
+    entries: tuple[ResolvedEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OracleEntryBatch:
+    """Structural scope plus explicit entries returned by the only oracle call."""
+
+    scope: MemoryScope
+    entries: tuple[ResolvedEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTreatment:
+    """Unrendered entries plus resolver-reported retrieval provenance."""
+
+    source_kind: str
+    scope: MemoryScope
+    release_id: str | None
+    eligible_ids: tuple[str, ...]
+    retrieved_ids: tuple[str, ...]
+    returned_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[ResolvedEntry, ...]
+
+
+class CapabilityInterfaceError(AttributeError):
+    """A resolver requested an operation absent from its sealed capability."""
+
+
+class UnauthorizedReadError(PermissionError):
+    """An exposed point-read requested an ID outside the sealed graph."""
+
+
+class TreatmentValidationError(ValueError):
+    """A stable pre-registered reason for rejecting source evidence."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 def _token(
@@ -794,3 +881,611 @@ def _build_case_database(
             foreign_sentinel_release_id=foreign_release.release_id,
         ),
     )
+
+
+def _semantic_entry_hash(entry: ResolvedEntry) -> str:
+    return hashlib.sha256(f"{entry.key}\t{entry.value}".encode()).hexdigest()
+
+
+def _allowed_audit_event(
+    *,
+    operation: str,
+    scope: MemoryScope,
+    requested_ids: tuple[str, ...],
+    returned_record_ids: tuple[str, ...],
+    returned_content_hashes: tuple[str, ...],
+) -> ReadAuditEvent:
+    return ReadAuditEvent(
+        operation=operation,
+        requested_scope=scope,
+        requested_ids=requested_ids,
+        allowed=True,
+        returned_record_ids=returned_record_ids,
+        returned_content_hashes=returned_content_hashes,
+    )
+
+
+def _denied_audit_event(
+    *,
+    operation: str,
+    scope: MemoryScope,
+    requested_id: str,
+) -> ReadAuditEvent:
+    return ReadAuditEvent(
+        operation=operation,
+        requested_scope=scope,
+        requested_ids=(requested_id,),
+        allowed=False,
+        returned_record_ids=(),
+        returned_content_hashes=(),
+    )
+
+
+class ReleaseReadCapability:
+    """Sealed point-reader for one assigned release's reachable graph."""
+
+    __slots__ = (
+        "__assignment",
+        "__audit",
+        "__candidate_ids",
+        "__revision_ids",
+        "__store",
+    )
+
+    def __init__(
+        self,
+        store: SQLiteMemoryStore,
+        assignment: ReleaseSourceAssignment,
+        audit: ReadAuditSink,
+    ) -> None:
+        if type(store) is not SQLiteMemoryStore:
+            raise TypeError("store must be a SQLiteMemoryStore")
+        if type(assignment) is not ReleaseSourceAssignment:
+            raise TypeError("assignment must be a ReleaseSourceAssignment")
+        if type(audit) is not ReadAuditSink:
+            raise TypeError("audit must be a ReadAuditSink")
+        self.__store = store
+        self.__assignment = assignment
+        self.__audit = audit
+        self.__revision_ids: set[str] = set()
+        self.__candidate_ids: set[str] = set()
+
+    def get_assigned_release(self) -> MemoryRelease:
+        release = self.__store.get_release(
+            self.__assignment.scope,
+            self.__assignment.release_id,
+        )
+        self.__revision_ids = set(release.manifest.revision_ids)
+        self.__audit._record(
+            _allowed_audit_event(
+                operation="get_assigned_release",
+                scope=self.__assignment.scope,
+                requested_ids=(self.__assignment.release_id,),
+                returned_record_ids=(release.release_id,),
+                returned_content_hashes=(release.content_hash,),
+            )
+        )
+        return release
+
+    def get_revision(self, revision_id: str) -> MemoryRevision:
+        if revision_id not in self.__revision_ids:
+            self.__audit._record(
+                _denied_audit_event(
+                    operation="get_revision",
+                    scope=self.__assignment.scope,
+                    requested_id=revision_id,
+                )
+            )
+            raise UnauthorizedReadError("revision is outside the assigned release")
+        revision = self.__store.get_revision(self.__assignment.scope, revision_id)
+        self.__candidate_ids.add(revision.proposal.candidate_id)
+        self.__audit._record(
+            _allowed_audit_event(
+                operation="get_revision",
+                scope=self.__assignment.scope,
+                requested_ids=(revision_id,),
+                returned_record_ids=(revision.revision_id,),
+                returned_content_hashes=(revision.content_hash,),
+            )
+        )
+        return revision
+
+    def get_candidate(self, candidate_id: str) -> MemoryCandidate:
+        if candidate_id not in self.__candidate_ids:
+            self.__audit._record(
+                _denied_audit_event(
+                    operation="get_candidate",
+                    scope=self.__assignment.scope,
+                    requested_id=candidate_id,
+                )
+            )
+            raise UnauthorizedReadError("candidate is outside the assigned release")
+        candidate = self.__store.get_candidate(self.__assignment.scope, candidate_id)
+        self.__audit._record(
+            _allowed_audit_event(
+                operation="get_candidate",
+                scope=self.__assignment.scope,
+                requested_ids=(candidate_id,),
+                returned_record_ids=(candidate.candidate_id,),
+                returned_content_hashes=(candidate.content_hash,),
+            )
+        )
+        return candidate
+
+
+class RawEvidenceReadCapability:
+    """Sealed list-reader for the frozen evidence-kind and cutoff policy."""
+
+    __slots__ = ("__assignment", "__audit", "__store")
+
+    def __init__(
+        self,
+        store: SQLiteMemoryStore,
+        assignment: RawSourceAssignment,
+        audit: ReadAuditSink,
+    ) -> None:
+        if type(store) is not SQLiteMemoryStore:
+            raise TypeError("store must be a SQLiteMemoryStore")
+        if type(assignment) is not RawSourceAssignment:
+            raise TypeError("assignment must be a RawSourceAssignment")
+        if type(audit) is not ReadAuditSink:
+            raise TypeError("audit must be a ReadAuditSink")
+        self.__store = store
+        self.__assignment = assignment
+        self.__audit = audit
+
+    def list_eligible_evidence(self) -> tuple[EvidenceRecord, ...]:
+        records = tuple(
+            sorted(
+                (
+                    record
+                    for record in self.__store.list(self.__assignment.scope)
+                    if record.event.kind
+                    in {EvidenceKind.USER_MESSAGE, EvidenceKind.FEEDBACK}
+                    and record.event.observed_at <= self.__assignment.cutoff
+                ),
+                key=lambda record: (
+                    record.event.observed_at,
+                    record.event.sequence_no,
+                    record.evidence_id,
+                ),
+            )
+        )
+        self.__audit._record(
+            _allowed_audit_event(
+                operation="list_eligible_evidence",
+                scope=self.__assignment.scope,
+                requested_ids=(),
+                returned_record_ids=tuple(record.evidence_id for record in records),
+                returned_content_hashes=tuple(
+                    record.content_hash for record in records
+                ),
+            )
+        )
+        return records
+
+
+class OracleEntryCapability:
+    """Store-free capability for explicit evaluator-owned oracle entries."""
+
+    __slots__ = ("__assignment", "__audit")
+
+    def __init__(
+        self,
+        assignment: OracleSourceAssignment,
+        audit: ReadAuditSink,
+    ) -> None:
+        if type(assignment) is not OracleSourceAssignment:
+            raise TypeError("assignment must be an OracleSourceAssignment")
+        if type(audit) is not ReadAuditSink:
+            raise TypeError("audit must be a ReadAuditSink")
+        self.__assignment = assignment
+        self.__audit = audit
+
+    def entries(self) -> OracleEntryBatch:
+        batch = OracleEntryBatch(
+            scope=self.__assignment.scope,
+            entries=self.__assignment.entries,
+        )
+        self.__audit._record(
+            _allowed_audit_event(
+                operation="entries",
+                scope=self.__assignment.scope,
+                requested_ids=(),
+                returned_record_ids=(),
+                returned_content_hashes=tuple(
+                    _semantic_entry_hash(entry) for entry in batch.entries
+                ),
+            )
+        )
+        return batch
+
+
+class _CapabilityBoundary:
+    """Resolver-facing allowlist with no target capability in instance state."""
+
+    __slots__ = ("__weakref__",)
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            target = _BOUNDARY_TARGETS[self]
+            allowed = _BOUNDARY_ALLOWED_METHODS[self]
+        except KeyError as error:
+            raise AttributeError("unbound capability boundary") from error
+        if name not in allowed:
+            raise CapabilityInterfaceError(
+                f"source capability does not expose {name!r}"
+            )
+        return getattr(target, name)
+
+
+_BOUNDARY_TARGETS: WeakKeyDictionary[_CapabilityBoundary, object] = WeakKeyDictionary()
+_BOUNDARY_ALLOWED_METHODS: WeakKeyDictionary[_CapabilityBoundary, frozenset[str]] = (
+    WeakKeyDictionary()
+)
+
+
+def _resolver_boundary(capability: object) -> _CapabilityBoundary:
+    target = _unwrap_capability(capability)
+    if type(target) is ReleaseReadCapability:
+        allowed = frozenset({"get_assigned_release", "get_revision", "get_candidate"})
+    elif type(target) is RawEvidenceReadCapability:
+        allowed = frozenset({"list_eligible_evidence"})
+    elif type(target) is OracleEntryCapability:
+        allowed = frozenset({"entries"})
+    else:
+        raise TypeError("unsupported source capability")
+    boundary = _CapabilityBoundary()
+    _BOUNDARY_TARGETS[boundary] = target
+    _BOUNDARY_ALLOWED_METHODS[boundary] = allowed
+    return boundary
+
+
+def _unwrap_capability(capability: object) -> object:
+    if type(capability) is not _CapabilityBoundary:
+        return capability
+    try:
+        return _BOUNDARY_TARGETS[capability]
+    except KeyError as error:
+        raise AttributeError("unbound capability boundary") from error
+
+
+def _resolve_raw_records(
+    records: tuple[EvidenceRecord, ...],
+) -> tuple[ResolvedEntry, ...]:
+    slots_by_key: dict[str, int] = {}
+    entries: list[ResolvedEntry] = []
+    for record in records:
+        parsed = parse_fact(record.event.payload)
+        slot = slots_by_key.setdefault(parsed.key, record.event.sequence_no)
+        entries.append(
+            ResolvedEntry(
+                slot=slot,
+                key=parsed.key,
+                value=parsed.value,
+                source_kind="raw_evidence",
+                evidence_ids=(record.evidence_id,),
+            )
+        )
+    return tuple(entries)
+
+
+def resolve_treatment(
+    capability: ReleaseReadCapability
+    | RawEvidenceReadCapability
+    | OracleEntryCapability
+    | _CapabilityBoundary,
+) -> ResolvedTreatment:
+    """Run the frozen resolver against one least-privilege capability."""
+
+    capability = _unwrap_capability(capability)
+    if type(capability) is ReleaseReadCapability:
+        release = capability.get_assigned_release()
+        entries: list[ResolvedEntry] = []
+        source_evidence_ids: list[str] = []
+        for slot, revision_id in enumerate(release.manifest.revision_ids):
+            revision = capability.get_revision(revision_id)
+            candidate = capability.get_candidate(revision.proposal.candidate_id)
+            parsed = parse_fact(candidate.proposal.content)
+            entries.append(
+                ResolvedEntry(
+                    slot=slot,
+                    key=parsed.key,
+                    value=parsed.value,
+                    source_kind="release",
+                    revision_id=revision.revision_id,
+                    candidate_id=candidate.candidate_id,
+                    evidence_ids=candidate.proposal.evidence_ids,
+                )
+            )
+            source_evidence_ids.extend(candidate.proposal.evidence_ids)
+        revision_ids = release.manifest.revision_ids
+        return ResolvedTreatment(
+            source_kind="release",
+            scope=release.manifest.scope,
+            release_id=release.release_id,
+            eligible_ids=revision_ids,
+            retrieved_ids=revision_ids,
+            returned_ids=revision_ids,
+            source_evidence_ids=tuple(source_evidence_ids),
+            entries=tuple(entries),
+        )
+    if type(capability) is RawEvidenceReadCapability:
+        records = capability.list_eligible_evidence()
+        evidence_ids = tuple(record.evidence_id for record in records)
+        entries = _resolve_raw_records(records)
+        scope = records[0].event.scope if records else None
+        if scope is None:
+            raise TreatmentValidationError("source_or_audit_mismatch")
+        return ResolvedTreatment(
+            source_kind="raw_evidence",
+            scope=scope,
+            release_id=None,
+            eligible_ids=evidence_ids,
+            retrieved_ids=evidence_ids,
+            returned_ids=evidence_ids,
+            source_evidence_ids=evidence_ids,
+            entries=entries,
+        )
+    if type(capability) is OracleEntryCapability:
+        batch = capability.entries()
+        if not batch.entries:
+            raise TreatmentValidationError("source_or_audit_mismatch")
+        return ResolvedTreatment(
+            source_kind="oracle",
+            scope=batch.scope,
+            release_id=None,
+            eligible_ids=(),
+            retrieved_ids=(),
+            returned_ids=(),
+            source_evidence_ids=(),
+            entries=batch.entries,
+        )
+    raise TypeError("unsupported source capability")
+
+
+def _expected_release_source(
+    store: SQLiteMemoryStore,
+    assignment: ReleaseSourceAssignment,
+) -> tuple[ResolvedTreatment, tuple[ReadAuditEvent, ...]]:
+    release = store.get_release(assignment.scope, assignment.release_id)
+    audit = [
+        _allowed_audit_event(
+            operation="get_assigned_release",
+            scope=assignment.scope,
+            requested_ids=(assignment.release_id,),
+            returned_record_ids=(release.release_id,),
+            returned_content_hashes=(release.content_hash,),
+        )
+    ]
+    entries: list[ResolvedEntry] = []
+    evidence_ids: list[str] = []
+    for slot, revision_id in enumerate(release.manifest.revision_ids):
+        revision = store.get_revision(assignment.scope, revision_id)
+        candidate = store.get_candidate(
+            assignment.scope,
+            revision.proposal.candidate_id,
+        )
+        audit.extend(
+            (
+                _allowed_audit_event(
+                    operation="get_revision",
+                    scope=assignment.scope,
+                    requested_ids=(revision_id,),
+                    returned_record_ids=(revision.revision_id,),
+                    returned_content_hashes=(revision.content_hash,),
+                ),
+                _allowed_audit_event(
+                    operation="get_candidate",
+                    scope=assignment.scope,
+                    requested_ids=(candidate.candidate_id,),
+                    returned_record_ids=(candidate.candidate_id,),
+                    returned_content_hashes=(candidate.content_hash,),
+                ),
+            )
+        )
+        parsed = parse_fact(candidate.proposal.content)
+        if not candidate.proposal.evidence_ids:
+            raise TreatmentValidationError("provenance_mismatch")
+        for evidence_id in candidate.proposal.evidence_ids:
+            evidence = store.get(assignment.scope, evidence_id)
+            if evidence.event.payload != candidate.proposal.content:
+                raise TreatmentValidationError("provenance_mismatch")
+        entries.append(
+            ResolvedEntry(
+                slot=slot,
+                key=parsed.key,
+                value=parsed.value,
+                source_kind="release",
+                revision_id=revision.revision_id,
+                candidate_id=candidate.candidate_id,
+                evidence_ids=candidate.proposal.evidence_ids,
+            )
+        )
+        evidence_ids.extend(candidate.proposal.evidence_ids)
+    revision_ids = release.manifest.revision_ids
+    return (
+        ResolvedTreatment(
+            source_kind="release",
+            scope=assignment.scope,
+            release_id=assignment.release_id,
+            eligible_ids=revision_ids,
+            retrieved_ids=revision_ids,
+            returned_ids=revision_ids,
+            source_evidence_ids=tuple(evidence_ids),
+            entries=tuple(entries),
+        ),
+        tuple(audit),
+    )
+
+
+def _expected_raw_source(
+    store: SQLiteMemoryStore,
+    assignment: RawSourceAssignment,
+) -> tuple[ResolvedTreatment, tuple[ReadAuditEvent, ...]]:
+    records = tuple(
+        sorted(
+            (
+                record
+                for record in store.list(assignment.scope)
+                if record.event.kind
+                in {EvidenceKind.USER_MESSAGE, EvidenceKind.FEEDBACK}
+                and record.event.observed_at <= assignment.cutoff
+            ),
+            key=lambda record: (
+                record.event.observed_at,
+                record.event.sequence_no,
+                record.evidence_id,
+            ),
+        )
+    )
+    evidence_ids = tuple(record.evidence_id for record in records)
+    slots_by_key: dict[str, int] = {}
+    expected_entries: list[ResolvedEntry] = []
+    for record in records:
+        parsed = parse_fact(record.event.payload)
+        slot = slots_by_key.setdefault(parsed.key, record.event.sequence_no)
+        expected_entries.append(
+            ResolvedEntry(
+                slot=slot,
+                key=parsed.key,
+                value=parsed.value,
+                source_kind="raw_evidence",
+                evidence_ids=(record.evidence_id,),
+            )
+        )
+    expected = ResolvedTreatment(
+        source_kind="raw_evidence",
+        scope=assignment.scope,
+        release_id=None,
+        eligible_ids=evidence_ids,
+        retrieved_ids=evidence_ids,
+        returned_ids=evidence_ids,
+        source_evidence_ids=evidence_ids,
+        entries=tuple(expected_entries),
+    )
+    audit = (
+        _allowed_audit_event(
+            operation="list_eligible_evidence",
+            scope=assignment.scope,
+            requested_ids=(),
+            returned_record_ids=evidence_ids,
+            returned_content_hashes=tuple(record.content_hash for record in records),
+        ),
+    )
+    return expected, audit
+
+
+def _expected_oracle_source(
+    assignment: OracleSourceAssignment,
+) -> tuple[ResolvedTreatment, tuple[ReadAuditEvent, ...]]:
+    if any(
+        entry.source_kind != "oracle"
+        or entry.revision_id is not None
+        or entry.candidate_id is not None
+        or entry.evidence_ids
+        for entry in assignment.entries
+    ):
+        raise TreatmentValidationError("provenance_mismatch")
+    expected = ResolvedTreatment(
+        source_kind="oracle",
+        scope=assignment.scope,
+        release_id=None,
+        eligible_ids=(),
+        retrieved_ids=(),
+        returned_ids=(),
+        source_evidence_ids=(),
+        entries=assignment.entries,
+    )
+    audit = (
+        _allowed_audit_event(
+            operation="entries",
+            scope=assignment.scope,
+            requested_ids=(),
+            returned_record_ids=(),
+            returned_content_hashes=tuple(
+                _semantic_entry_hash(entry) for entry in assignment.entries
+            ),
+        ),
+    )
+    return expected, audit
+
+
+def validate_resolved_treatment(
+    database_path: str | os.PathLike[str],
+    assignment: ReleaseSourceAssignment | RawSourceAssignment | OracleSourceAssignment,
+    treatment: ResolvedTreatment,
+    reader_audit: tuple[ReadAuditEvent, ...],
+) -> None:
+    """Independently reopen the source and reject provenance or audit drift."""
+
+    if type(treatment) is not ResolvedTreatment:
+        raise TreatmentValidationError("provenance_mismatch")
+    if type(assignment) is ReleaseSourceAssignment:
+        if (
+            treatment.source_kind != "release"
+            or treatment.scope != assignment.scope
+            or treatment.release_id != assignment.release_id
+        ):
+            raise TreatmentValidationError("source_or_audit_mismatch")
+        expected, expected_audit = _expected_release_source(
+            SQLiteMemoryStore(database_path),
+            assignment,
+        )
+    elif type(assignment) is RawSourceAssignment:
+        if (
+            treatment.source_kind != "raw_evidence"
+            or treatment.scope != assignment.scope
+            or treatment.release_id is not None
+        ):
+            raise TreatmentValidationError("source_or_audit_mismatch")
+        expected, expected_audit = _expected_raw_source(
+            SQLiteMemoryStore(database_path),
+            assignment,
+        )
+    elif type(assignment) is OracleSourceAssignment:
+        if (
+            treatment.source_kind != "oracle"
+            or treatment.scope != assignment.scope
+            or treatment.release_id is not None
+        ):
+            raise TreatmentValidationError("source_or_audit_mismatch")
+        expected, expected_audit = _expected_oracle_source(assignment)
+    else:
+        raise TypeError("unsupported source assignment")
+
+    if len(reader_audit) > len(expected_audit):
+        raise TreatmentValidationError("extra_read")
+    if reader_audit != expected_audit:
+        raise TreatmentValidationError("source_or_audit_mismatch")
+    if treatment != expected:
+        raise TreatmentValidationError("provenance_mismatch")
+
+
+def resolve_and_validate(
+    resolver: Callable[[object], object],
+    capability: object,
+    *,
+    database_path: str | os.PathLike[str],
+    assignment: ReleaseSourceAssignment | RawSourceAssignment | OracleSourceAssignment,
+    audit_sink: ReadAuditSink,
+) -> ResolvedTreatment:
+    """Classify capability failures, then independently validate resolver output."""
+
+    try:
+        treatment = resolver(_resolver_boundary(capability))
+    except UnauthorizedReadError as error:
+        raise TreatmentValidationError("unauthorized_read") from error
+    except CapabilityInterfaceError as error:
+        raise TreatmentValidationError("capability_interface_violation") from error
+    if type(treatment) is not ResolvedTreatment:
+        raise TreatmentValidationError("provenance_mismatch")
+    validate_resolved_treatment(
+        database_path,
+        assignment,
+        treatment,
+        audit_sink.snapshot(),
+    )
+    return treatment

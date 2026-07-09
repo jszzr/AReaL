@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -16,7 +16,12 @@ import pytest
 
 from examples.memory_service import scoped_codebook_eval as helpfulness
 
-from areal.v2.memory_service import EvidenceKind, MemoryScope, RevisionOperation
+from areal.v2.memory_service import (
+    EvidenceEvent,
+    EvidenceKind,
+    MemoryScope,
+    RevisionOperation,
+)
 from areal.v2.memory_service.errors import ReleaseNotFoundError
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 
@@ -921,3 +926,663 @@ def test_foreign_sentinel_release_is_not_found_in_local_scope(tmp_path: Path) ->
     with pytest.raises(ReleaseNotFoundError) as error:
         store.get_release(references.capture.local_scope, foreign_release_id)
     assert error.type is ReleaseNotFoundError
+
+
+def _release_source_setup(tmp_path: Path):
+    case, path, references, store = _build_case_graph(tmp_path)
+    assignment = helpfulness.ReleaseSourceAssignment(
+        scope=references.capture.local_scope,
+        release_id=references.releases.current_release_id,
+    )
+    audit = helpfulness.ReadAuditSink()
+    capability = helpfulness.ReleaseReadCapability(
+        store,
+        assignment,
+        audit,
+    )
+    return case, path, references, store, assignment, audit, capability
+
+
+def _raw_source_setup(tmp_path: Path):
+    case, path, references, store = _build_case_graph(tmp_path)
+    assignment = helpfulness.RawSourceAssignment(
+        scope=references.capture.local_scope,
+        cutoff=references.capture.raw_history_cutoff,
+    )
+    audit = helpfulness.ReadAuditSink()
+    capability = helpfulness.RawEvidenceReadCapability(
+        store,
+        assignment,
+        audit,
+    )
+    return case, path, references, store, assignment, audit, capability
+
+
+def _oracle_source_setup(tmp_path: Path):
+    case, path, references, _store = _build_case_graph(tmp_path)
+    entries = _case_entries(
+        case,
+        target_value=case.current_value,
+        source_kind="oracle",
+    )
+    assignment = helpfulness.OracleSourceAssignment(
+        scope=references.capture.local_scope,
+        entries=entries,
+    )
+    audit = helpfulness.ReadAuditSink()
+    capability = helpfulness.OracleEntryCapability(assignment, audit)
+    return case, path, references, assignment, audit, capability
+
+
+def test_release_capability_exposes_only_assigned_reachable_graph(
+    tmp_path: Path,
+) -> None:
+    (
+        case,
+        path,
+        references,
+        store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+
+    assert not hasattr(capability, "list_releases")
+    assert not hasattr(capability, "list_candidates")
+    assert not hasattr(capability, "list_revisions")
+    assert not hasattr(capability, "database_path")
+    treatment = helpfulness.resolve_treatment(capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        assignment,
+        treatment,
+        audit.snapshot(),
+    )
+    assigned = store.get_release(assignment.scope, assignment.release_id)
+    assert treatment.release_id == assignment.release_id
+    assert treatment.eligible_ids == assigned.manifest.revision_ids
+    assert treatment.retrieved_ids == assigned.manifest.revision_ids
+    assert treatment.returned_ids == assigned.manifest.revision_ids
+    assert len(treatment.entries) == 6
+    assert tuple(entry.slot for entry in treatment.entries) == tuple(range(6))
+    assert tuple(f"{entry.key} = {entry.value}" for entry in treatment.entries) == (
+        _expected_release_payloads(case, target_value=case.current_value)
+    )
+    assert not hasattr(treatment, "injected_ids")
+
+    denied_audit = helpfulness.ReadAuditSink()
+    denied = helpfulness.ReleaseReadCapability(store, assignment, denied_audit)
+    denied.get_assigned_release()
+    with pytest.raises(helpfulness.UnauthorizedReadError):
+        denied.get_revision(references.revisions.target_old_revision_id)
+    denied_event = denied_audit.snapshot()[-1]
+    assert denied_event.operation == "get_revision"
+    assert denied_event.allowed is False
+    assert denied_event.requested_ids == (references.revisions.target_old_revision_id,)
+    assert denied_event.returned_record_ids == ()
+    assert denied_event.returned_content_hashes == ()
+
+    before_interface_attempt = denied_audit.snapshot()
+    with pytest.raises(AttributeError):
+        denied.list_releases()  # type: ignore[attr-defined]
+    assert denied_audit.snapshot() == before_interface_attempt
+
+
+def test_raw_capability_exposes_only_fixed_cutoff_policy(tmp_path: Path) -> None:
+    (
+        _case,
+        path,
+        references,
+        _store,
+        assignment,
+        audit,
+        capability,
+    ) = _raw_source_setup(tmp_path)
+
+    assert not hasattr(capability, "get_revision")
+    assert not hasattr(capability, "get_candidate")
+    assert not hasattr(capability, "get_assigned_release")
+    assert not hasattr(capability, "database_path")
+    treatment = helpfulness.resolve_treatment(capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        assignment,
+        treatment,
+        audit.snapshot(),
+    )
+    assert treatment.source_kind == "raw_evidence"
+    assert treatment.release_id is None
+    assert treatment.eligible_ids == treatment.source_evidence_ids
+    assert treatment.retrieved_ids == treatment.source_evidence_ids
+    assert treatment.returned_ids == treatment.source_evidence_ids
+    assert all(entry.revision_id is None for entry in treatment.entries)
+    assert all(entry.candidate_id is None for entry in treatment.entries)
+
+
+def test_raw_cutoff_returns_only_six_user_feedback_records_in_chronology(
+    tmp_path: Path,
+) -> None:
+    (
+        case,
+        _path,
+        references,
+        store,
+        assignment,
+        audit,
+        capability,
+    ) = _raw_source_setup(tmp_path)
+    native_records = store.list(references.capture.local_scope)
+
+    treatment = helpfulness.resolve_treatment(capability)
+
+    chronological = tuple(
+        sorted(
+            (
+                record
+                for record in native_records
+                if record.event.kind
+                in {EvidenceKind.USER_MESSAGE, EvidenceKind.FEEDBACK}
+                and record.event.observed_at <= references.capture.raw_history_cutoff
+            ),
+            key=lambda record: (
+                record.event.observed_at,
+                record.event.sequence_no,
+                record.evidence_id,
+            ),
+        )
+    )
+    assert tuple(record.evidence_id for record in native_records[:6]) != tuple(
+        record.evidence_id for record in chronological
+    )
+    assert treatment.source_evidence_ids == tuple(
+        record.evidence_id for record in chronological
+    )
+    assert len(treatment.entries) == 6
+    assert tuple(entry.value for entry in treatment.entries) == (
+        *(
+            entry.value
+            for entry in _core_entries(
+                case,
+                target_value=case.old_value,
+                source_kind="raw_evidence",
+            )
+        ),
+        case.current_value,
+    )
+    target_entries = tuple(
+        entry for entry in treatment.entries if entry.key == case.target_key
+    )
+    assert tuple(entry.value for entry in target_entries) == (
+        case.old_value,
+        case.current_value,
+    )
+    assert target_entries[0].slot == target_entries[1].slot == case.target_slot
+    assert tuple(event.operation for event in audit.snapshot()) == (
+        "list_eligible_evidence",
+    )
+    raw_event = audit.snapshot()[0]
+    assert raw_event.requested_scope == assignment.scope
+    assert raw_event.requested_ids == ()
+    assert raw_event.allowed is True
+    assert raw_event.returned_record_ids == tuple(
+        record.evidence_id for record in chronological
+    )
+    assert raw_event.returned_content_hashes == tuple(
+        record.content_hash for record in chronological
+    )
+
+
+def test_raw_policy_rejects_before_cutoff_kind_and_after_cutoff_kind_sentinels(
+    tmp_path: Path,
+) -> None:
+    (
+        case,
+        path,
+        references,
+        store,
+        assignment,
+        audit,
+        capability,
+    ) = _raw_source_setup(tmp_path)
+    before_cutoff_environment = store.append(
+        EvidenceEvent(
+            scope=assignment.scope,
+            session_id=f"{case.case_id}-sentinel-kind",
+            run_id=f"{case.case_id}-run-sentinel-kind",
+            sequence_no=0,
+            kind=EvidenceKind.ENVIRONMENT,
+            payload=f"{case.padding_entry.key} = {case.padding_entry.value}",
+            observed_at=assignment.cutoff - timedelta(seconds=1),
+            idempotency_key=f"{case.case_id}-evidence-sentinel-kind",
+        )
+    )
+    after_cutoff_user = store.append(
+        EvidenceEvent(
+            scope=assignment.scope,
+            session_id=f"{case.case_id}-sentinel-cutoff-user",
+            run_id=f"{case.case_id}-run-sentinel-cutoff-user",
+            sequence_no=0,
+            kind=EvidenceKind.USER_MESSAGE,
+            payload=f"{case.target_key} = {case.current_value}",
+            observed_at=assignment.cutoff + timedelta(seconds=1),
+            idempotency_key=f"{case.case_id}-evidence-sentinel-cutoff-user",
+        )
+    )
+    after_cutoff_feedback = store.append(
+        EvidenceEvent(
+            scope=assignment.scope,
+            session_id=f"{case.case_id}-sentinel-cutoff-feedback",
+            run_id=f"{case.case_id}-run-sentinel-cutoff-feedback",
+            sequence_no=0,
+            kind=EvidenceKind.FEEDBACK,
+            payload=f"{case.shared_entries[0].key} = {case.shared_entries[0].value}",
+            observed_at=assignment.cutoff + timedelta(seconds=2),
+            idempotency_key=f"{case.case_id}-evidence-sentinel-cutoff-feedback",
+        )
+    )
+
+    treatment = helpfulness.resolve_treatment(capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        assignment,
+        treatment,
+        audit.snapshot(),
+    )
+
+    assert treatment.source_evidence_ids == (
+        *references.capture.old_evidence_ids,
+        references.capture.current_evidence_id,
+    )
+    assert {
+        before_cutoff_environment.evidence_id,
+        after_cutoff_user.evidence_id,
+        after_cutoff_feedback.evidence_id,
+    }.isdisjoint(treatment.source_evidence_ids)
+
+
+def test_oracle_capability_has_no_store_access(tmp_path: Path) -> None:
+    case, path, _references, assignment, audit, capability = _oracle_source_setup(
+        tmp_path
+    )
+
+    assert not hasattr(capability, "store")
+    assert not hasattr(capability, "_store")
+    assert not hasattr(capability, "get_revision")
+    assert not hasattr(capability, "get_candidate")
+    treatment = helpfulness.resolve_treatment(capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        assignment,
+        treatment,
+        audit.snapshot(),
+    )
+    assert treatment.entries == assignment.entries
+    assert treatment.release_id is None
+    assert treatment.eligible_ids == ()
+    assert treatment.retrieved_ids == ()
+    assert treatment.returned_ids == ()
+    assert treatment.source_evidence_ids == ()
+    assert tuple(entry.value for entry in treatment.entries) == tuple(
+        entry.value
+        for entry in _case_entries(
+            case,
+            target_value=case.current_value,
+            source_kind="oracle",
+        )
+    )
+    oracle_event = audit.snapshot()[0]
+    assert oracle_event.operation == "entries"
+    assert oracle_event.requested_scope == assignment.scope
+    assert oracle_event.requested_ids == ()
+    assert oracle_event.allowed is True
+    assert oracle_event.returned_record_ids == ()
+    assert oracle_event.returned_content_hashes == tuple(
+        sha256(f"{entry.key}\t{entry.value}".encode()).hexdigest()
+        for entry in assignment.entries
+    )
+
+
+def test_audit_sequence_scope_ids_and_hashes_are_exact(tmp_path: Path) -> None:
+    (
+        _case,
+        path,
+        references,
+        store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+
+    treatment = helpfulness.resolve_treatment(capability)
+    events = audit.snapshot()
+    release = store.get_release(assignment.scope, assignment.release_id)
+    expected_operations = ["get_assigned_release"]
+    expected_ids = [(release.release_id,)]
+    expected_hashes = [(release.content_hash,)]
+    for revision_id in release.manifest.revision_ids:
+        revision = store.get_revision(assignment.scope, revision_id)
+        candidate = store.get_candidate(
+            assignment.scope,
+            revision.proposal.candidate_id,
+        )
+        expected_operations.extend(("get_revision", "get_candidate"))
+        expected_ids.extend(((revision.revision_id,), (candidate.candidate_id,)))
+        expected_hashes.extend(((revision.content_hash,), (candidate.content_hash,)))
+
+    assert tuple(event.operation for event in events) == tuple(expected_operations)
+    assert all(event.requested_scope == assignment.scope for event in events)
+    assert all(event.allowed is True for event in events)
+    assert tuple(event.requested_ids for event in events) == tuple(expected_ids)
+    assert tuple(event.returned_record_ids for event in events) == tuple(expected_ids)
+    assert tuple(event.returned_content_hashes for event in events) == tuple(
+        expected_hashes
+    )
+    assert treatment.source_evidence_ids == tuple(
+        evidence_id for entry in treatment.entries for evidence_id in entry.evidence_ids
+    )
+
+    empty_assignment = helpfulness.ReleaseSourceAssignment(
+        scope=assignment.scope,
+        release_id=references.releases.empty_release_id,
+    )
+    empty_audit = helpfulness.ReadAuditSink()
+    empty_capability = helpfulness.ReleaseReadCapability(
+        store,
+        empty_assignment,
+        empty_audit,
+    )
+    empty_treatment = helpfulness.resolve_treatment(empty_capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        empty_assignment,
+        empty_treatment,
+        empty_audit.snapshot(),
+    )
+    assert empty_treatment.entries == ()
+    assert tuple(event.operation for event in empty_audit.snapshot()) == (
+        "get_assigned_release",
+    )
+
+
+@pytest.mark.parametrize("mutation", ("swap", "hash"))
+def test_same_length_wrong_audit_is_rejected(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (
+        _case,
+        path,
+        _references,
+        _store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+    treatment = helpfulness.resolve_treatment(capability)
+    valid = audit.snapshot()
+    if mutation == "swap":
+        wrong = (valid[0], valid[2], valid[1], *valid[3:])
+    else:
+        wrong = (
+            valid[0],
+            replace(valid[1], returned_content_hashes=("0" * 64,)),
+            *valid[2:],
+        )
+
+    assert len(wrong) == len(valid)
+    with pytest.raises(helpfulness.TreatmentValidationError) as error:
+        helpfulness.validate_resolved_treatment(
+            path,
+            assignment,
+            treatment,
+            wrong,
+        )
+    assert error.value.reason == "source_or_audit_mismatch"
+
+
+def test_entries_must_be_independently_reachable_from_assigned_source(
+    tmp_path: Path,
+) -> None:
+    (
+        _case,
+        path,
+        _references,
+        _store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+    treatment = helpfulness.resolve_treatment(capability)
+    forged = replace(
+        treatment,
+        entries=(
+            replace(treatment.entries[0], candidate_id="cand_forged"),
+            *treatment.entries[1:],
+        ),
+    )
+
+    with pytest.raises(helpfulness.TreatmentValidationError) as provenance_error:
+        helpfulness.validate_resolved_treatment(
+            path,
+            assignment,
+            forged,
+            audit.snapshot(),
+        )
+    assert provenance_error.value.reason == "provenance_mismatch"
+
+    extra_audit = helpfulness.ReadAuditSink()
+    extra_capability = helpfulness.ReleaseReadCapability(
+        SQLiteMemoryStore(path),
+        assignment,
+        extra_audit,
+    )
+    extra_capability.get_assigned_release()
+    otherwise_valid = helpfulness.resolve_treatment(extra_capability)
+    with pytest.raises(helpfulness.TreatmentValidationError) as extra_error:
+        helpfulness.validate_resolved_treatment(
+            path,
+            assignment,
+            otherwise_valid,
+            extra_audit.snapshot(),
+        )
+    assert extra_error.value.reason == "extra_read"
+
+
+class LatestReleaseResolver:
+    def __call__(self, capability):
+        return capability.list_releases()
+
+
+class AllCandidatesResolver:
+    def __init__(self, candidate_id: str) -> None:
+        self._candidate_id = candidate_id
+
+    def __call__(self, capability):
+        capability.get_assigned_release()
+        return capability.get_candidate(self._candidate_id)
+
+
+class PeekThenDiscardResolver:
+    def __call__(self, capability):
+        capability.get_assigned_release()
+        return helpfulness.resolve_treatment(capability)
+
+
+class ForgedProvenanceResolver:
+    def __call__(self, capability):
+        treatment = helpfulness.resolve_treatment(capability)
+        return replace(
+            treatment,
+            entries=(
+                replace(treatment.entries[0], revision_id="rev_forged"),
+                *treatment.entries[1:],
+            ),
+        )
+
+
+class RawViaRevisionResolver:
+    def __call__(self, capability):
+        return capability.get_revision("rev_forbidden")
+
+
+class SourceSwapResolver:
+    def __call__(self, capability):
+        return helpfulness.resolve_treatment(capability)
+
+
+class InternalAttributeBugResolver:
+    def __call__(self, capability):
+        del capability
+        return self.missing_internal_attribute
+
+
+class ProxyPrivateStateBugResolver:
+    def __call__(self, capability):
+        return capability._missing_proxy_private_state
+
+
+def test_capability_interface_error_does_not_swallow_resolver_attribute_bugs(
+    tmp_path: Path,
+) -> None:
+    (
+        _case,
+        path,
+        _references,
+        _store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+
+    before = audit.snapshot()
+    with pytest.raises(AttributeError) as direct_interface_error:
+        capability.list_releases()  # type: ignore[attr-defined]
+    assert type(direct_interface_error.value) is AttributeError
+    assert audit.snapshot() == before
+
+    with pytest.raises(AttributeError) as error:
+        helpfulness.resolve_and_validate(
+            InternalAttributeBugResolver(),
+            capability,
+            database_path=path,
+            assignment=assignment,
+            audit_sink=audit,
+        )
+    assert type(error.value) is AttributeError
+
+    with pytest.raises(AttributeError) as proxy_error:
+        helpfulness.resolve_and_validate(
+            ProxyPrivateStateBugResolver(),
+            capability,
+            database_path=path,
+            assignment=assignment,
+            audit_sink=audit,
+        )
+    assert type(proxy_error.value) is AttributeError
+
+    unbound_proxy = object.__new__(helpfulness._CapabilityBoundary)
+    with pytest.raises(AttributeError) as unbound_error:
+        helpfulness.resolve_treatment(unbound_proxy)
+    assert type(unbound_error.value) is AttributeError
+
+
+def test_capability_missing_private_state_is_not_misclassified_as_interface(
+    tmp_path: Path,
+) -> None:
+    (
+        _case,
+        path,
+        _references,
+        store,
+        assignment,
+        audit,
+        capability,
+    ) = _release_source_setup(tmp_path)
+    object.__delattr__(capability, "_ReleaseReadCapability__store")
+
+    with pytest.raises(AttributeError) as direct_error:
+        helpfulness.resolve_treatment(capability)
+    assert type(direct_error.value) is AttributeError
+
+    runner_audit = helpfulness.ReadAuditSink()
+    runner_capability = helpfulness.ReleaseReadCapability(
+        store,
+        assignment,
+        runner_audit,
+    )
+    object.__delattr__(runner_capability, "_ReleaseReadCapability__store")
+    with pytest.raises(AttributeError) as runner_error:
+        helpfulness.resolve_and_validate(
+            helpfulness.resolve_treatment,
+            runner_capability,
+            database_path=path,
+            assignment=assignment,
+            audit_sink=runner_audit,
+        )
+    assert type(runner_error.value) is AttributeError
+
+
+@pytest.mark.parametrize(
+    ("mutant", "reason"),
+    (
+        ("latest", "capability_interface_violation"),
+        ("all_candidates", "unauthorized_read"),
+        ("peek", "extra_read"),
+        ("forged", "provenance_mismatch"),
+        ("raw_via_revision", "capability_interface_violation"),
+        ("source_swap", "source_or_audit_mismatch"),
+    ),
+)
+def test_source_mutants_fail_for_pre_registered_reason(
+    tmp_path: Path,
+    mutant: str,
+    reason: str,
+) -> None:
+    (
+        _case,
+        path,
+        references,
+        store,
+        release_assignment,
+        release_audit,
+        release_capability,
+    ) = _release_source_setup(tmp_path)
+    assignment = release_assignment
+    audit = release_audit
+    capability = release_capability
+    if mutant == "latest":
+        resolver = LatestReleaseResolver()
+    elif mutant == "all_candidates":
+        stale = store.get_revision(
+            references.capture.local_scope,
+            references.revisions.target_old_revision_id,
+        )
+        resolver = AllCandidatesResolver(stale.proposal.candidate_id)
+    elif mutant == "peek":
+        resolver = PeekThenDiscardResolver()
+    elif mutant == "forged":
+        resolver = ForgedProvenanceResolver()
+    elif mutant == "raw_via_revision":
+        (tmp_path / "raw").mkdir()
+        _case, path, _references, _store, assignment, audit, capability = (
+            _raw_source_setup(tmp_path / "raw")
+        )
+        resolver = RawViaRevisionResolver()
+    else:
+        (tmp_path / "swap").mkdir()
+        _case, path, _references, _store, raw_assignment, audit, capability = (
+            _raw_source_setup(tmp_path / "swap")
+        )
+        assignment = release_assignment
+        assert raw_assignment.scope == assignment.scope
+        resolver = SourceSwapResolver()
+
+    with pytest.raises(helpfulness.TreatmentValidationError) as error:
+        helpfulness.resolve_and_validate(
+            resolver,
+            capability,
+            database_path=path,
+            assignment=assignment,
+            audit_sink=audit,
+        )
+    assert error.value.reason == reason
