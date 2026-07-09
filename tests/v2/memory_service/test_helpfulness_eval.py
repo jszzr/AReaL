@@ -2361,6 +2361,69 @@ def test_wire_rejects_unknown_missing_and_wrong_type_fields() -> None:
         assert error.value.reason == "closed_schema"
 
 
+def test_wire_rejects_strings_that_are_not_strict_utf8(
+    tmp_path: Path,
+) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    invalid = replace(request, query=f"{request.query}\ud800")
+
+    with pytest.raises(helpfulness.WireProtocolError) as encode_error:
+        helpfulness.wire_dumps(invalid)
+    assert encode_error.value.reason == "closed_schema"
+
+    value = json.loads(helpfulness.wire_dumps(request))
+    value["payload"]["query"] = f"{request.query}\ud800"
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    with pytest.raises(helpfulness.WireProtocolError) as decode_error:
+        helpfulness.wire_loads(encoded)
+    assert decode_error.value.reason == "closed_schema"
+
+
+def test_run_raw_rejects_non_utf8_wire_before_spawning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    invalid = replace(request, query=f"{request.query}\ud800")
+    calls = Counter()
+
+    def forbidden_popen(*_args, **_kwargs):
+        calls["popen"] += 1
+        raise AssertionError("Popen must not run for an invalid wire string")
+
+    monkeypatch.setattr(helpfulness.subprocess, "Popen", forbidden_popen)
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child_raw(
+            invalid,
+            role="future-child",
+            timeout_seconds=20,
+        )
+
+    assert error.value.reason == "closed_schema"
+    assert calls == Counter()
+
+
+def test_wire_canonically_round_trips_valid_non_ascii_strings() -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path="/tmp/记忆服务.sqlite3",
+    )
+
+    encoded = helpfulness.wire_dumps(request)
+
+    assert "记忆服务" in encoded
+    assert helpfulness.wire_loads(encoded) == request
+    assert helpfulness.wire_dumps(helpfulness.wire_loads(encoded)) == encoded
+
+
 @pytest.mark.parametrize(
     "encoded",
     (
@@ -2860,7 +2923,6 @@ def test_missing_local_release_is_not_misclassified_as_foreign_scope(
         ("identity", "process_isolation"),
         ("history", "history_nonzero"),
         ("assignment", "assignment_mismatch"),
-        ("foreign", "foreign_scope"),
     ),
 )
 def test_child_execution_mutants_fail_for_pre_registered_reason(
@@ -2872,22 +2934,6 @@ def test_child_execution_mutants_fail_for_pre_registered_reason(
     case, references, request, schedule = _wire_future_setup(tmp_path)
     if mutant == "in_process":
         response = helpfulness.execute_future_child_request(request)
-    elif mutant == "foreign":
-        foreign_request = replace(
-            request,
-            source=replace(
-                request.source,
-                release_id=references.releases.foreign_sentinel_release_id,
-            ),
-        )
-        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
-            helpfulness.run_isolated_child(
-                foreign_request,
-                role="future-child",
-                timeout_seconds=20,
-            )
-        assert error.value.reason == reason
-        return
     else:
         response = helpfulness.run_isolated_child(
             request,
@@ -2944,3 +2990,1230 @@ def test_child_execution_mutants_fail_for_pre_registered_reason(
     with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
         helpfulness.validate_future_child_response(response, schedule)
     assert error.value.reason == reason
+
+
+def test_single_future_cannot_classify_a_foreign_sentinel_from_local_not_found(
+    tmp_path: Path,
+) -> None:
+    _case, references, request, _schedule = _wire_future_setup(tmp_path)
+    foreign_request = replace(
+        request,
+        source=replace(
+            request.source,
+            release_id=references.releases.foreign_sentinel_release_id,
+        ),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child(
+            foreign_request,
+            role="future-child",
+            timeout_seconds=20,
+        )
+
+    assert error.value.reason == "child_nonzero_exit"
+
+
+@pytest.fixture(scope="module")
+def fast_profile_bundle(tmp_path_factory: pytest.TempPathFactory):
+    root = tmp_path_factory.mktemp("fast-profile")
+    artifact_path = root / "replay.jsonl"
+    original_popen = helpfulness.subprocess.Popen
+    original_store = helpfulness.SQLiteMemoryStore
+    launches = []
+
+    def spy_popen(*args, **kwargs):
+        launches.append(tuple(args[0]))
+        return original_popen(*args, **kwargs)
+
+    def parent_store_access_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("the parent opened a case database")
+
+    helpfulness.subprocess.Popen = spy_popen
+    helpfulness.SQLiteMemoryStore = parent_store_access_is_forbidden
+    try:
+        execution = helpfulness._execute_fast_profile_children(
+            root / "databases",
+            timeout_seconds=120,
+        )
+        result = helpfulness._finalize_fast_profile_execution(
+            execution,
+            artifact_path=artifact_path,
+        )
+    finally:
+        helpfulness.subprocess.Popen = original_popen
+        helpfulness.SQLiteMemoryStore = original_store
+    return {
+        "artifact_path": artifact_path,
+        "execution": execution,
+        "launches": tuple(launches),
+        "result": result,
+        "root": root,
+    }
+
+
+def test_fast_profile_produces_48_outcomes_and_8_foreign_probes(
+    fast_profile_bundle,
+) -> None:
+    result = fast_profile_bundle["result"]
+    launches = fast_profile_bundle["launches"]
+    execution = fast_profile_bundle["execution"]
+
+    script_path = str(Path(helpfulness.__file__).resolve())
+    assert launches == (
+        (sys.executable, "-I", script_path, "capture-child"),
+        (sys.executable, "-I", script_path, "future-child"),
+    )
+    assert (
+        execution.capture_response.process_instance_id
+        != helpfulness.PROCESS_INSTANCE_ID
+    )
+    assert (
+        execution.future_response.process_instance_id != helpfulness.PROCESS_INSTANCE_ID
+    )
+    assert len(result.outcomes) == 48
+    assert len(result.foreign_probes) == 8
+    assert {trace.execution_index for trace in result.outcomes} == set(range(48))
+    assert {trace.execution_index for trace in result.foreign_probes} == set(
+        range(48, 56)
+    )
+
+
+def test_batch_not_found_witnesses_read_only_the_requested_local_scope(
+    fast_profile_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    foreign_release_ids = {
+        item.references.releases.foreign_sentinel_release_id
+        for item in execution.capture_response.items
+    }
+    probe_items = tuple(
+        item
+        for item in execution.future_request.items
+        if item.source.release_id in foreign_release_ids
+    )
+    expected_scopes = {item.scope for item in probe_items}
+    original_get_release = helpfulness.SQLiteMemoryStore.get_release
+    reads = []
+
+    def spy_get_release(store, scope, release_id):
+        reads.append((scope, release_id))
+        return original_get_release(store, scope, release_id)
+
+    monkeypatch.setattr(
+        helpfulness.SQLiteMemoryStore,
+        "get_release",
+        spy_get_release,
+    )
+    response = helpfulness.execute_future_batch_request(
+        helpfulness.FutureBatchRequest(items=probe_items)
+    )
+
+    assert len(probe_items) == 8
+    assert len(response.foreign_probes) == 8
+    assert {probe.reason for probe in response.foreign_probes} == {"release_not_found"}
+    assert len(reads) == 8
+    assert {scope for scope, _release_id in reads} == expected_scopes
+    assert all(not scope.subject_id.endswith("-foreign") for scope, _ in reads)
+
+
+def test_fast_profile_future_batch_has_no_explicit_scorer_metadata(
+    fast_profile_bundle,
+) -> None:
+    """Check the honest-runner boundary, not secrecy from a malicious child."""
+
+    execution = fast_profile_bundle["execution"]
+    encoded = helpfulness.wire_dumps(execution.future_request)
+    payload = json.loads(encoded)["payload"]
+
+    assert set(payload) == {"items"}
+    assert len(payload["items"]) == 56
+    assert all(
+        set(item)
+        == {
+            "consumer_version",
+            "database_path",
+            "execution_index",
+            "future_run_id",
+            "future_session_id",
+            "query",
+            "renderer_version",
+            "scope",
+            "source",
+        }
+        for item in payload["items"]
+    )
+    assert all(
+        forbidden not in encoded
+        for forbidden in (
+            '"arm"',
+            '"case_id"',
+            '"capture_',
+            '"expected_response"',
+            '"utility"',
+        )
+    )
+
+
+def test_fast_future_wire_indexes_are_opaque_and_not_parent_logical_indexes(
+    fast_profile_bundle,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    round_tripped = helpfulness.wire_loads(
+        helpfulness.wire_dumps(execution.future_request)
+    )
+    assert type(round_tripped) is helpfulness.FutureBatchRequest
+    bindings = execution.execution_bindings
+    logical_by_opaque = {
+        binding.opaque_execution_index: binding.logical_execution_index
+        for binding in bindings
+    }
+    wire_tokens = tuple(item.execution_index for item in round_tripped.items)
+    logical_order = tuple(logical_by_opaque[token] for token in wire_tokens)
+
+    assert len(bindings) == 56
+    assert set(logical_by_opaque.values()) == set(range(56))
+    assert wire_tokens == tuple(sorted(wire_tokens))
+    assert len(set(wire_tokens)) == 56
+    assert all(token.bit_length() == 128 for token in wire_tokens)
+    assert set(wire_tokens).isdisjoint(range(56))
+    assert logical_order != tuple(range(56))
+    assert any(logical >= 48 for logical in logical_order[:48])
+    assert any(logical < 48 for logical in logical_order[48:])
+    for remainder in range(6):
+        possible_arms = {
+            logical % 6
+            for token, logical in logical_by_opaque.items()
+            if logical < 48 and token % 6 == remainder
+        }
+        assert len(possible_arms) >= 2
+    for item in round_tripped.items:
+        suffix = f"{item.execution_index:032x}"
+        assert item.future_session_id == f"future-session-{suffix}"
+        assert item.future_run_id == f"future-run-{suffix}"
+        logical = logical_by_opaque[item.execution_index]
+        assert item.future_session_id != f"future-session-{logical:03d}"
+        assert item.future_run_id != f"future-run-{logical:03d}"
+
+    response_indexes = {
+        item.execution_index for item in execution.future_response.observations
+    } | {item.execution_index for item in execution.future_response.foreign_probes}
+    receipt_indexes = {
+        item.execution_index for item in execution.future_response.state_receipts
+    }
+    assert response_indexes == set(wire_tokens)
+    assert receipt_indexes == set(wire_tokens)
+
+
+def test_fast_opaque_execution_token_rejects_negative_128_bit_magnitude() -> None:
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness._opaque_future_identity(-(1 << 127))
+
+    assert error.value.reason == "assignment_mismatch"
+
+
+def test_fast_profile_matches_all_eight_strict_signatures(
+    fast_profile_bundle,
+) -> None:
+    result = fast_profile_bundle["result"]
+
+    assert len(result.signatures) == 8
+    for signature in result.signatures:
+        case = helpfulness.generate_case(signature.case_index)
+        assert signature.case_id == case.case_id
+        assert signature.normalized_responses == (
+            case.current_value,
+            case.current_value,
+            "UNKNOWN",
+            "UNKNOWN",
+            case.old_value,
+            case.current_value,
+        )
+        assert signature.matches is True
+        case_traces = tuple(
+            trace for trace in result.outcomes if trace.case_id == case.case_id
+        )
+        by_arm = {trace.arm: trace for trace in case_traces}
+        assert (
+            by_arm["current_release"].rendered_context_sha256
+            == by_arm["oracle"].rendered_context_sha256
+        )
+        assert (
+            by_arm["current_release"].rendered_context_utf8_bytes
+            == by_arm["oracle"].rendered_context_utf8_bytes
+        )
+
+
+def test_fast_profile_uses_distinct_capture_and_future_instances(
+    fast_profile_bundle,
+) -> None:
+    result = fast_profile_bundle["result"]
+    traces = (*result.outcomes, *result.foreign_probes)
+
+    capture_instances = {trace.capture_process_instance_id for trace in traces}
+    future_instances = {trace.future_process_instance_id for trace in traces}
+    assert len(capture_instances) == 1
+    assert len(future_instances) == 1
+    assert capture_instances.isdisjoint(future_instances)
+    assert len({trace.capture_pid for trace in traces}) == 1
+    assert len({trace.future_pid for trace in traces}) == 1
+    assert len({trace.future_session_id for trace in traces}) == 56
+    assert len({trace.future_run_id for trace in traces}) == 56
+
+
+def test_fast_profile_recreates_every_per_item_state(
+    fast_profile_bundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = fast_profile_bundle["result"]
+    receipts = result.state_receipts
+    identity_fields = (
+        "store_instance_id",
+        "reader_instance_id",
+        "resolver_instance_id",
+        "renderer_instance_id",
+        "consumer_instance_id",
+        "audit_instance_id",
+        "logical_session_instance_id",
+        "history_instance_id",
+    )
+
+    assert len(receipts) == 56
+    assert tuple(receipt.generation_index for receipt in receipts) == tuple(range(56))
+    assert all(receipt.history_length == 0 for receipt in receipts)
+    for field_name in identity_fields:
+        assert len({getattr(receipt, field_name) for receipt in receipts}) == 56
+
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    batch = helpfulness.FutureBatchRequest(
+        items=(
+            request,
+            replace(
+                request,
+                execution_index=1,
+                future_session_id="future-session-001",
+                future_run_id="future-run-001",
+            ),
+        )
+    )
+    original_factory = helpfulness._new_item_execution_state
+    constructed = []
+
+    def spy_factory(item, generation_index):
+        state = original_factory(item, generation_index)
+        constructed.append(state)
+        return state
+
+    monkeypatch.setattr(helpfulness, "_new_item_execution_state", spy_factory)
+    helpfulness.execute_future_batch_request(batch)
+    assert len(constructed) == 2
+    for field_name in (
+        "store",
+        "reader",
+        "resolver",
+        "renderer",
+        "consumer",
+        "audit",
+        "logical_session",
+        "history",
+    ):
+        assert len({id(getattr(state, field_name)) for state in constructed}) == 2
+
+    reused = constructed[0]
+    monkeypatch.setattr(
+        helpfulness,
+        "_new_item_execution_state",
+        lambda _item, _generation_index: reused,
+    )
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.execute_future_batch_request(batch)
+    assert error.value.reason == "state_reuse"
+
+    shared_store = constructed[0].store
+
+    def shared_store_factory(item, generation_index):
+        state = original_factory(item, generation_index)
+        state.store = shared_store
+        return state
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_new_item_execution_state",
+        shared_store_factory,
+    )
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.execute_future_batch_request(batch)
+    assert error.value.reason == "state_reuse"
+
+
+@pytest.mark.parametrize("version_field", ["renderer_version", "consumer_version"])
+def test_future_batch_prevalidates_every_item_before_creating_any_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version_field: str,
+) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    bad_last = replace(
+        request,
+        execution_index=1,
+        future_session_id="future-session-bad-last",
+        future_run_id="future-run-bad-last",
+        **{version_field: "unsupported-version/v999"},
+    )
+    batch = helpfulness.FutureBatchRequest(items=(request, bad_last))
+    original_factory = helpfulness._new_item_execution_state
+    original_consumer = helpfulness.consume_scripted
+    calls = Counter()
+
+    def spy_factory(item, generation_index):
+        calls["state"] += 1
+        return original_factory(item, generation_index)
+
+    def spy_consumer(query, context, *, history=()):
+        calls["consumer"] += 1
+        return original_consumer(query, context, history=history)
+
+    monkeypatch.setattr(helpfulness, "_new_item_execution_state", spy_factory)
+    monkeypatch.setattr(helpfulness, "consume_scripted", spy_consumer)
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.execute_future_batch_request(batch)
+
+    assert error.value.reason == "assignment_mismatch"
+    assert calls == Counter()
+
+
+@pytest.mark.parametrize(
+    ("bad_query", "error_type", "reason"),
+    [
+        (
+            "What is the code?",
+            helpfulness.ChildExecutionValidationError,
+            "assignment_mismatch",
+        ),
+        (
+            "What is the current code for project-abc234?\ud800",
+            helpfulness.WireProtocolError,
+            "closed_schema",
+        ),
+    ],
+)
+def test_future_batch_prevalidates_strict_query_before_store_or_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_query: str,
+    error_type: type[Exception],
+    reason: str,
+) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    bad_last = replace(
+        request,
+        execution_index=1,
+        future_session_id="future-session-bad-query",
+        future_run_id="future-run-bad-query",
+        query=bad_query,
+    )
+    batch = helpfulness.FutureBatchRequest(items=(request, bad_last))
+    original_store = helpfulness.SQLiteMemoryStore
+    original_factory = helpfulness._new_item_execution_state
+    original_consumer = helpfulness.consume_scripted
+    calls = Counter()
+
+    def spy_store(*args, **kwargs):
+        calls["store"] += 1
+        return original_store(*args, **kwargs)
+
+    def spy_factory(item, generation_index):
+        calls["state"] += 1
+        return original_factory(item, generation_index)
+
+    def spy_consumer(query, context, *, history=()):
+        calls["consumer"] += 1
+        return original_consumer(query, context, history=history)
+
+    monkeypatch.setattr(helpfulness, "SQLiteMemoryStore", spy_store)
+    monkeypatch.setattr(helpfulness, "_new_item_execution_state", spy_factory)
+    monkeypatch.setattr(helpfulness, "consume_scripted", spy_consumer)
+
+    with pytest.raises(error_type) as error:
+        helpfulness.execute_future_batch_request(batch)
+
+    assert error.value.reason == reason
+    assert calls == Counter()
+
+
+def test_fast_profile_batch_join_is_order_independent_but_complete(
+    fast_profile_bundle,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    response = execution.future_response
+    reversed_execution = replace(
+        execution,
+        future_response=replace(
+            response,
+            observations=tuple(reversed(response.observations)),
+            foreign_probes=tuple(reversed(response.foreign_probes)),
+        ),
+    )
+
+    reversed_result = helpfulness._finalize_fast_profile_execution(
+        reversed_execution,
+        artifact_path=None,
+    )
+    assert reversed_result.outcomes == fast_profile_bundle["result"].outcomes
+    assert (
+        reversed_result.foreign_probes == fast_profile_bundle["result"].foreign_probes
+    )
+
+    duplicate_execution = replace(
+        execution,
+        future_response=replace(
+            response,
+            observations=(*response.observations, response.observations[0]),
+        ),
+    )
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness._finalize_fast_profile_execution(
+            duplicate_execution,
+            artifact_path=None,
+        )
+    assert error.value.reason == "execution_index_mismatch"
+
+    first, second, *rest = response.observations
+    swapped_execution = replace(
+        execution,
+        future_response=replace(
+            response,
+            observations=(
+                replace(first, execution_index=second.execution_index),
+                replace(second, execution_index=first.execution_index),
+                *rest,
+            ),
+        ),
+    )
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness._finalize_fast_profile_execution(
+            swapped_execution,
+            artifact_path=None,
+        )
+    assert error.value.reason == "assignment_mismatch"
+
+
+def test_fast_profile_parent_independently_rejects_forged_foreign_contract(
+    fast_profile_bundle,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    capture = execution.capture_response
+    future_request = execution.future_request
+    future_response = execution.future_response
+    first_item = capture.items[0]
+    references = first_item.references
+
+    def same_length_forgery(value: str) -> str:
+        replacement = "0" if value[-1] != "0" else "1"
+        return value[:-1] + replacement
+
+    forged_release_id = same_length_forgery(
+        references.releases.foreign_sentinel_release_id
+    )
+    forged_references = replace(
+        references,
+        capture=replace(
+            references.capture,
+            foreign_scope=replace(
+                references.capture.foreign_scope,
+                subject_id=same_length_forgery(
+                    references.capture.foreign_scope.subject_id
+                ),
+            ),
+            foreign_evidence_id=same_length_forgery(
+                references.capture.foreign_evidence_id
+            ),
+        ),
+        revisions=replace(
+            references.revisions,
+            foreign_target_revision_id=same_length_forgery(
+                references.revisions.foreign_target_revision_id
+            ),
+        ),
+        releases=replace(
+            references.releases,
+            foreign_sentinel_release_id=forged_release_id,
+        ),
+    )
+    forged_capture = replace(
+        capture,
+        items=(replace(first_item, references=forged_references), *capture.items[1:]),
+    )
+    probe_token = next(
+        binding.opaque_execution_index
+        for binding in execution.execution_bindings
+        if binding.logical_execution_index == 48
+    )
+    probe_request_position = next(
+        index
+        for index, item in enumerate(future_request.items)
+        if item.execution_index == probe_token
+    )
+    probe_request = future_request.items[probe_request_position]
+    forged_future_request = replace(
+        future_request,
+        items=tuple(
+            replace(
+                probe_request,
+                source=replace(probe_request.source, release_id=forged_release_id),
+            )
+            if index == probe_request_position
+            else item
+            for index, item in enumerate(future_request.items)
+        ),
+    )
+    probe_response_position = next(
+        index
+        for index, probe in enumerate(future_response.foreign_probes)
+        if probe.execution_index == probe_token
+    )
+    first_probe = future_response.foreign_probes[probe_response_position]
+    forged_future_response = replace(
+        future_response,
+        foreign_probes=tuple(
+            replace(first_probe, release_id=forged_release_id)
+            if index == probe_response_position
+            else probe
+            for index, probe in enumerate(future_response.foreign_probes)
+        ),
+    )
+    forged_execution = replace(
+        execution,
+        capture_response=forged_capture,
+        future_request=forged_future_request,
+        future_response=forged_future_response,
+    )
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness._finalize_fast_profile_execution(
+            forged_execution,
+            artifact_path=None,
+        )
+    assert error.value.reason == "foreign_scope"
+
+
+def test_fast_profile_writes_and_strictly_replays_canonical_jsonl(
+    fast_profile_bundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_path = fast_profile_bundle["artifact_path"]
+    result = fast_profile_bundle["result"]
+    lines = artifact_path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    assert len(lines) == 57
+    decoded = tuple(helpfulness.wire_loads(line) for line in lines)
+    assert type(decoded[0]) is helpfulness.ReplayHeader
+    assert all(type(item) is helpfulness.EvaluationTrace for item in decoded[1:49])
+    assert all(type(item) is helpfulness.LeakageSentinelTrace for item in decoded[49:])
+    assert all(
+        helpfulness.wire_dumps(item) == line
+        for item, line in zip(decoded, lines, strict=True)
+    )
+
+    replay = helpfulness.read_fast_profile_artifact(artifact_path)
+    assert type(replay) is helpfulness.ReplayedFastRun
+    assert not isinstance(replay, helpfulness.FastProfileResult)
+    assert replay.header == decoded[0]
+    assert replay.outcomes == result.outcomes
+    assert replay.foreign_probes == result.foreign_probes
+    assert replay.signatures == result.signatures
+    assert replay.header.case_manifest_sha256s == FIRST_EIGHT_MANIFEST_SHA256
+
+    untouched = tmp_path / "none-means-no-artifact.jsonl"
+
+    def unexpected_writer(*_args, **_kwargs):
+        raise AssertionError("artifact writer ran for artifact_path=None")
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_write_fast_profile_artifact",
+        unexpected_writer,
+    )
+    helpfulness._finalize_fast_profile_execution(
+        fast_profile_bundle["execution"],
+        artifact_path=None,
+    )
+    assert not untouched.exists()
+
+
+def test_fast_profile_replay_is_file_only_and_cannot_claim_live_provenance(
+    fast_profile_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_live_operation(*_args, **_kwargs):
+        raise AssertionError("replay touched a live process or database")
+
+    monkeypatch.setattr(helpfulness, "SQLiteMemoryStore", forbidden_live_operation)
+    monkeypatch.setattr(helpfulness.subprocess, "Popen", forbidden_live_operation)
+
+    replay = helpfulness.read_fast_profile_artifact(
+        fast_profile_bundle["artifact_path"]
+    )
+    assert type(replay) is helpfulness.ReplayedFastRun
+    assert not hasattr(replay, "state_receipts")
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness._finalize_fast_profile_execution(
+            replay,
+            artifact_path=None,
+        )
+    assert error.value.reason == "replay_provenance"
+
+
+def test_fast_profile_replay_rejects_truncation_duplicates_extras_and_type_swaps(
+    fast_profile_bundle,
+    tmp_path: Path,
+) -> None:
+    original = (
+        fast_profile_bundle["artifact_path"]
+        .read_text(encoding="utf-8")
+        .splitlines(keepends=True)
+    )
+    first_outcome = helpfulness.wire_loads(original[1])
+    first_probe = helpfulness.wire_loads(original[49])
+    assert type(first_outcome) is helpfulness.EvaluationTrace
+    assert type(first_probe) is helpfulness.LeakageSentinelTrace
+    case_one = helpfulness.generate_case(1)
+    forged_manifest = helpfulness.wire_dumps(
+        replace(
+            first_outcome,
+            case_manifest_sha256=FIRST_EIGHT_MANIFEST_SHA256[1],
+        )
+    )
+    forged_probe_case = helpfulness.wire_dumps(
+        replace(
+            first_probe,
+            case_id=case_one.case_id,
+            case_manifest_sha256=FIRST_EIGHT_MANIFEST_SHA256[1],
+            requested_scope=MemoryScope(
+                "memory-eval",
+                "scoped-codebook-v1",
+                case_one.subject_id,
+            ),
+            companion_scope=MemoryScope(
+                "memory-eval",
+                "scoped-codebook-v1",
+                f"{case_one.subject_id}-foreign",
+            ),
+        )
+    )
+
+    def alter_last_character(value: str) -> str:
+        return value[:-1] + ("0" if value[-1] != "0" else "1")
+
+    forged_probe_release = helpfulness.wire_dumps(
+        replace(
+            first_probe,
+            foreign_release_id=alter_last_character(first_probe.foreign_release_id),
+        )
+    )
+    forged_probe_evidence = helpfulness.wire_dumps(
+        replace(
+            first_probe,
+            foreign_evidence_id=alter_last_character(first_probe.foreign_evidence_id),
+        )
+    )
+    forged_probe_session = helpfulness.wire_dumps(
+        replace(first_probe, future_session_id="future-session-049")
+    )
+    forged_probe_run = helpfulness.wire_dumps(
+        replace(first_probe, future_run_id="future-run-049")
+    )
+    forged_probe_history = helpfulness.wire_dumps(
+        replace(first_probe, history_length=1)
+    )
+    forged_probe_reason_value = json.loads(original[49])
+    forged_probe_reason_value["payload"]["reason"] = "accepted_foreign_release"
+    forged_probe_reason = (
+        json.dumps(
+            forged_probe_reason_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    corruptions = {
+        "truncated": original[:-1],
+        "duplicate": [*original[:2], original[1], *original[2:]],
+        "extra": [*original, original[0]],
+        "manifest-swap": [original[0], forged_manifest, *original[2:]],
+        "probe-case-swap": [*original[:49], forged_probe_case, *original[50:]],
+        "probe-release": [
+            *original[:49],
+            forged_probe_release,
+            *original[50:],
+        ],
+        "probe-evidence": [
+            *original[:49],
+            forged_probe_evidence,
+            *original[50:],
+        ],
+        "probe-session": [
+            *original[:49],
+            forged_probe_session,
+            *original[50:],
+        ],
+        "probe-run": [*original[:49], forged_probe_run, *original[50:]],
+        "probe-history": [
+            *original[:49],
+            forged_probe_history,
+            *original[50:],
+        ],
+        "probe-reason": [*original[:49], forged_probe_reason, *original[50:]],
+        "type-swap": [
+            original[0],
+            original[49],
+            *original[2:49],
+            original[1],
+            *original[50:],
+        ],
+    }
+
+    for name, lines in corruptions.items():
+        path = tmp_path / f"{name}.jsonl"
+        path.write_text("".join(lines), encoding="utf-8")
+        with pytest.raises(helpfulness.WireProtocolError):
+            helpfulness.read_fast_profile_artifact(path)
+
+
+def test_fast_profile_replay_rejects_derived_outcome_semantic_mutations(
+    fast_profile_bundle,
+    tmp_path: Path,
+) -> None:
+    lines = (
+        fast_profile_bundle["artifact_path"]
+        .read_text(encoding="utf-8")
+        .splitlines(keepends=True)
+    )
+    trace = helpfulness.wire_loads(lines[1])
+    assert type(trace) is helpfulness.EvaluationTrace
+    mutations = {
+        "response": replace(trace, response="UNKNOWN"),
+        "normalized": replace(trace, normalized_response="UNKNOWN"),
+        "expected": replace(trace, expected_response="UNKNOWN"),
+        "utility": replace(trace, utility=0),
+        "abstained": replace(trace, abstained=True),
+        "followed": replace(trace, followed_injected_value=False),
+    }
+
+    for name, mutated in mutations.items():
+        path = tmp_path / f"derived-{name}.jsonl"
+        path.write_text(
+            "".join((lines[0], helpfulness.wire_dumps(mutated), *lines[2:])),
+            encoding="utf-8",
+        )
+        with pytest.raises(helpfulness.WireProtocolError):
+            helpfulness.read_fast_profile_artifact(path)
+
+
+def test_fast_profile_replay_rejects_canonical_source_contract_mutations(
+    fast_profile_bundle,
+    tmp_path: Path,
+) -> None:
+    lines = (
+        fast_profile_bundle["artifact_path"]
+        .read_text(encoding="utf-8")
+        .splitlines(keepends=True)
+    )
+    trace = helpfulness.wire_loads(lines[1])
+    assert type(trace) is helpfulness.EvaluationTrace
+    assert trace.arm == "current_release"
+    assert trace.release_id is not None
+    assert trace.reader_audit
+    forged_release = "rel_" + "0" * 24
+    old_revision = trace.entries[0].revision_id
+    assert old_revision is not None
+    forged_revision = "rev_" + "0" * 24
+
+    def replace_id(values: tuple[str, ...], old: str, new: str) -> tuple[str, ...]:
+        return tuple(new if value == old else value for value in values)
+
+    forged_entries = (
+        replace(trace.entries[0], revision_id=forged_revision),
+        *trace.entries[1:],
+    )
+    forged_audit = tuple(
+        replace(
+            event,
+            requested_ids=replace_id(
+                replace_id(event.requested_ids, trace.release_id, forged_release),
+                old_revision,
+                forged_revision,
+            ),
+            returned_record_ids=replace_id(
+                replace_id(
+                    event.returned_record_ids,
+                    trace.release_id,
+                    forged_release,
+                ),
+                old_revision,
+                forged_revision,
+            ),
+            returned_content_hashes=(
+                tuple("0" * 64 for _ in event.returned_content_hashes)
+                if trace.release_id in event.returned_record_ids
+                or old_revision in event.returned_record_ids
+                else event.returned_content_hashes
+            ),
+        )
+        for event in trace.reader_audit
+    )
+    mutations = {
+        "empty-audit": replace(trace, reader_audit=()),
+        "forged-release": replace(trace, release_id=forged_release),
+        "audit-hash": replace(
+            trace,
+            reader_audit=(
+                replace(
+                    trace.reader_audit[0],
+                    returned_content_hashes=tuple(
+                        "0" * 64 for _ in trace.reader_audit[0].returned_content_hashes
+                    ),
+                ),
+                *trace.reader_audit[1:],
+            ),
+        ),
+        "coherent-graph-audit": replace(
+            trace,
+            release_id=forged_release,
+            entries=forged_entries,
+            eligible_revision_ids=replace_id(
+                trace.eligible_revision_ids,
+                old_revision,
+                forged_revision,
+            ),
+            retrieved_revision_ids=replace_id(
+                trace.retrieved_revision_ids,
+                old_revision,
+                forged_revision,
+            ),
+            returned_revision_ids=replace_id(
+                trace.returned_revision_ids,
+                old_revision,
+                forged_revision,
+            ),
+            injected_revision_ids=replace_id(
+                trace.injected_revision_ids,
+                old_revision,
+                forged_revision,
+            ),
+            reader_audit=forged_audit,
+        ),
+        "normalized-but-not-scripted": replace(
+            trace,
+            response=f" {trace.response.lower()} ",
+        ),
+    }
+
+    for name, mutated in mutations.items():
+        path = tmp_path / f"source-contract-{name}.jsonl"
+        mutated_lines = list(lines)
+        mutated_lines[1] = helpfulness.wire_dumps(mutated)
+        path.write_text("".join(mutated_lines), encoding="utf-8")
+        with pytest.raises(helpfulness.WireProtocolError):
+            helpfulness.read_fast_profile_artifact(path)
+
+
+def test_fast_profile_replay_rejects_offline_receipt_scope_and_process_mutations(
+    fast_profile_bundle,
+    tmp_path: Path,
+) -> None:
+    lines = (
+        fast_profile_bundle["artifact_path"]
+        .read_text(encoding="utf-8")
+        .splitlines(keepends=True)
+    )
+    target_line = 2
+    trace = helpfulness.wire_loads(lines[target_line])
+    assert type(trace) is helpfulness.EvaluationTrace
+    zero_hash = "0" * 64
+    first_entry = trace.entries[0]
+    mutated_resolved = tuple(
+        helpfulness.ResolvedEntry(
+            slot=entry.slot,
+            key=entry.key,
+            value="AAAAA" if index == 0 else entry.value,
+            source_kind=entry.source_kind,
+            revision_id=entry.revision_id,
+            candidate_id=entry.candidate_id,
+            evidence_ids=entry.evidence_ids,
+        )
+        for index, entry in enumerate(trace.entries)
+    )
+    assert first_entry.value != "AAAAA"
+    mutated_render = helpfulness.render_context(mutated_resolved)
+    mutated_render_hash = sha256(mutated_render.bytes).hexdigest()
+    mutations = {
+        "context-sync": replace(
+            trace,
+            rendered_context_sha256=zero_hash,
+            received_context_sha256=zero_hash,
+        ),
+        "query-sync": replace(
+            trace,
+            query_sha256=zero_hash,
+            received_query_sha256=zero_hash,
+        ),
+        "scope": replace(
+            trace,
+            scope=replace(trace.scope, subject_id="nonce-subject-000-foreign"),
+        ),
+        "source": replace(trace, source_kind="oracle"),
+        "pid": replace(trace, future_pid=0),
+        "uuid": replace(trace, future_process_instance_id="not-a-uuid4"),
+        "entries-sync": replace(
+            trace,
+            entries=mutated_render.entry_receipts,
+            rendered_context_sha256=mutated_render_hash,
+            received_context_sha256=mutated_render_hash,
+            rendered_context_utf8_bytes=len(mutated_render.bytes),
+            received_context_utf8_bytes=len(mutated_render.bytes),
+            followed_injected_value=True,
+        ),
+    }
+
+    for name, mutated in mutations.items():
+        path = tmp_path / f"offline-{name}.jsonl"
+        mutated_lines = list(lines)
+        mutated_lines[target_line] = helpfulness.wire_dumps(mutated)
+        path.write_text(
+            "".join(mutated_lines),
+            encoding="utf-8",
+        )
+        with pytest.raises(helpfulness.WireProtocolError):
+            helpfulness.read_fast_profile_artifact(path)
+
+    coherent_mutations = {
+        "uuid-coherent": (
+            "future_process_instance_id",
+            "not-a-canonical-uuid4",
+        ),
+    }
+    for name, (field_name, value) in coherent_mutations.items():
+        mutated_lines = [lines[0]]
+        for line in lines[1:]:
+            record = helpfulness.wire_loads(line)
+            mutated_lines.append(
+                helpfulness.wire_dumps(replace(record, **{field_name: value}))
+            )
+        path = tmp_path / f"offline-{name}.jsonl"
+        path.write_text("".join(mutated_lines), encoding="utf-8")
+        with pytest.raises(helpfulness.WireProtocolError):
+            helpfulness.read_fast_profile_artifact(path)
+
+
+def test_fast_profile_artifact_replace_failure_preserves_existing_file(
+    fast_profile_bundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "existing.jsonl"
+    original = b"existing artifact must survive\n"
+    path.write_bytes(original)
+
+    def fail_replace(_source, _target):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(helpfulness.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        helpfulness._write_fast_profile_artifact(
+            path,
+            fast_profile_bundle["result"].outcomes,
+            fast_profile_bundle["result"].foreign_probes,
+        )
+
+    assert path.read_bytes() == original
+    assert tuple(tmp_path.iterdir()) == (path,)
+
+
+@pytest.mark.parametrize("late_failure", ["outcome-48", "probe-8"])
+def test_fast_profile_late_validation_failure_precedes_all_derived_work_and_writes(
+    fast_profile_bundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    late_failure: str,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    response = execution.future_response
+    opaque_by_logical = {
+        binding.logical_execution_index: binding.opaque_execution_index
+        for binding in execution.execution_bindings
+    }
+    if late_failure == "outcome-48":
+        target_token = opaque_by_logical[47]
+        target_position = next(
+            index
+            for index, observation in enumerate(response.observations)
+            if observation.execution_index == target_token
+        )
+        last = response.observations[target_position]
+        bad_last = replace(
+            last,
+            history_length=1,
+            consumer_input_receipt=replace(
+                last.consumer_input_receipt,
+                received_history_length=1,
+            ),
+        )
+        execution = replace(
+            execution,
+            future_response=replace(
+                response,
+                observations=tuple(
+                    bad_last if index == target_position else observation
+                    for index, observation in enumerate(response.observations)
+                ),
+            ),
+        )
+        expected_error = helpfulness.ChildExecutionValidationError
+        expected_reason = "history_nonzero"
+    else:
+        target_token = opaque_by_logical[55]
+        target_position = next(
+            index
+            for index, probe in enumerate(response.foreign_probes)
+            if probe.execution_index == target_token
+        )
+        last_probe = response.foreign_probes[target_position]
+        execution = replace(
+            execution,
+            future_response=replace(
+                response,
+                foreign_probes=tuple(
+                    replace(last_probe, reason="accepted_foreign_release")
+                    if index == target_position
+                    else probe
+                    for index, probe in enumerate(response.foreign_probes)
+                ),
+            ),
+        )
+        expected_error = helpfulness.ChildExecutionValidationError
+        expected_reason = "foreign_scope"
+
+    called = Counter()
+
+    def forbidden(stage):
+        def fail(*_args, **_kwargs):
+            called[stage] += 1
+            raise AssertionError(f"{stage} ran before complete validation")
+
+        return fail
+
+    monkeypatch.setattr(helpfulness, "normalize_response", forbidden("normalize"))
+    monkeypatch.setattr(
+        helpfulness,
+        "_trace_from_observation",
+        forbidden("outcome-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_strict_signatures",
+        forbidden("signature"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_leakage_traces",
+        forbidden("probe-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_write_fast_profile_artifact",
+        forbidden("artifact"),
+    )
+    artifact = tmp_path / f"{late_failure}.jsonl"
+    existing = b"do not replace on validation failure\n"
+    artifact.write_bytes(existing)
+
+    with pytest.raises(expected_error) as error:
+        helpfulness._finalize_fast_profile_execution(
+            execution,
+            artifact_path=artifact,
+        )
+
+    assert error.value.reason == expected_reason
+    assert called == Counter()
+    assert artifact.read_bytes() == existing
+
+
+def test_fast_profile_late_strict_outcome_failure_builds_no_trace_or_artifact(
+    fast_profile_bundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution = fast_profile_bundle["execution"]
+    response = execution.future_response
+    target_token = next(
+        binding.opaque_execution_index
+        for binding in execution.execution_bindings
+        if binding.logical_execution_index == 47
+    )
+    target_position = next(
+        index
+        for index, observation in enumerate(response.observations)
+        if observation.execution_index == target_token
+    )
+    last = response.observations[target_position]
+    execution = replace(
+        execution,
+        future_response=replace(
+            response,
+            observations=tuple(
+                replace(last, response="UNKNOWN")
+                if index == target_position
+                else observation
+                for index, observation in enumerate(response.observations)
+            ),
+        ),
+    )
+    called = Counter()
+
+    def forbidden(stage):
+        def fail(*_args, **_kwargs):
+            called[stage] += 1
+            raise AssertionError(f"{stage} ran after a strict failure")
+
+        return fail
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_trace_from_observation",
+        forbidden("outcome-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_strict_signatures",
+        forbidden("signature"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_build_leakage_traces",
+        forbidden("probe-trace"),
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_write_fast_profile_artifact",
+        forbidden("artifact"),
+    )
+    artifact = tmp_path / "strict-outcome.jsonl"
+    existing = b"keep the earlier artifact\n"
+    artifact.write_bytes(existing)
+
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness._finalize_fast_profile_execution(
+            execution,
+            artifact_path=artifact,
+        )
+
+    assert error.value.reason == "strict_outcome_failure"
+    assert called == Counter()
+    assert artifact.read_bytes() == existing

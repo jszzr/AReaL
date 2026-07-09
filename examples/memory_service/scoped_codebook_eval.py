@@ -8,15 +8,17 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import unicodedata
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from weakref import WeakKeyDictionary
 
 _INITIAL_ENVIRONMENT_NAMES = frozenset(os.environ)
@@ -49,6 +51,7 @@ CASE_SEED = "areal-memory-helpfulness-v1-20260708"
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MASKED_VALUE = "XXXXX"
 UNKNOWN = "UNKNOWN"
+FAST_PROFILE_NAME = "fast-two-child-v1"
 _RENDER_HEADER = (
     b"[memory-codebook/v1]\n[mask=XXXXX means unavailable; answer UNKNOWN]\n"
 )
@@ -70,6 +73,7 @@ _FACT_PATTERN = re.compile(
     rb"(?P<key>" + _KEY_PATTERN + rb") = (?P<value>" + _VALUE_PATTERN + rb")"
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_OPAQUE_TOKEN_PATTERN = re.compile(r"[89abcdef][0-9a-f]{31}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +330,7 @@ class ParentSourceContract:
 
 @dataclass(frozen=True, slots=True)
 class ParentScheduleItem:
-    """Private parent-owned case truth joined by opaque execution index."""
+    """Private parent-owned case truth joined by a logical execution index."""
 
     execution_index: int
     case: CodebookCase
@@ -483,6 +487,24 @@ class FutureExecutionObservation:
     response: str
 
 
+class _ObservationView(Protocol):
+    """Common validated fields shared by live and wire-future observations."""
+
+    source_kind: str
+    eligible_ids: tuple[str, ...]
+    retrieved_ids: tuple[str, ...]
+    returned_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[EntryReceipt, ...]
+    reader_audit: tuple[ReadAuditEvent, ...]
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+    consumer_input_receipt: ConsumerInputReceipt
+    model_call_receipt: ModelCallReceipt | None
+    query_sha256: str
+    history_length: int
+
+
 @dataclass(frozen=True, slots=True)
 class FutureChildResponse:
     observation: FutureExecutionObservation
@@ -492,6 +514,157 @@ class FutureChildResponse:
     areal_module_path: str
     visible_forbidden_environment: tuple[str, ...]
     environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureBatchRequest:
+    """Ordered capture items executed by one capture OS process."""
+
+    items: tuple[CaptureChildRequest, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureBatchItemResult:
+    case_index: int
+    references: CaseDatabaseReferences
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureBatchResponse:
+    items: tuple[CaptureBatchItemResult, ...]
+    pid: int
+    process_instance_id: str
+    isolated_mode: bool
+    areal_module_path: str
+    visible_forbidden_environment: tuple[str, ...]
+    environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FutureBatchRequest:
+    """Honest-runner items without explicit scorer labels, not a secrecy claim."""
+
+    items: tuple[FutureChildRequest, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForeignProbeObservation:
+    """Unclassified local-scope release-not-found witness from the child."""
+
+    execution_index: int
+    scope: MemoryScope
+    release_id: str
+    future_session_id: str
+    future_run_id: str
+    future_pid: int
+    future_process_instance_id: str
+    reason: str
+    history_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class ItemStateReceipt:
+    execution_index: int
+    generation_index: int
+    store_instance_id: str
+    reader_instance_id: str
+    resolver_instance_id: str
+    renderer_instance_id: str
+    consumer_instance_id: str
+    audit_instance_id: str
+    logical_session_instance_id: str
+    history_instance_id: str
+    logical_session_id: str
+    logical_run_id: str
+    history_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class FutureBatchResponse:
+    observations: tuple[FutureExecutionObservation, ...]
+    foreign_probes: tuple[ForeignProbeObservation, ...]
+    state_receipts: tuple[ItemStateReceipt, ...]
+    pid: int
+    process_instance_id: str
+    isolated_mode: bool
+    areal_module_path: str
+    visible_forbidden_environment: tuple[str, ...]
+    environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LeakageSentinelTrace:
+    schema_version: int
+    case_id: str
+    case_manifest_sha256: str
+    execution_index: int
+    requested_scope: MemoryScope
+    companion_scope: MemoryScope
+    foreign_release_id: str
+    foreign_evidence_id: str
+    future_session_id: str
+    future_run_id: str
+    capture_pid: int
+    future_pid: int
+    capture_process_instance_id: str
+    future_process_instance_id: str
+    reason: str
+    history_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class StrictSignature:
+    case_index: int
+    case_id: str
+    normalized_responses: tuple[str, str, str, str, str, str]
+    matches: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FastProfileResult:
+    outcomes: tuple[EvaluationTrace, ...]
+    foreign_probes: tuple[LeakageSentinelTrace, ...]
+    signatures: tuple[StrictSignature, ...]
+    state_receipts: tuple[ItemStateReceipt, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayHeader:
+    """Self-describing first record for one canonical fast-profile artifact."""
+
+    schema_version: int
+    profile: str
+    case_seed: str
+    case_manifest_sha256s: tuple[str, ...]
+    outcome_count: int
+    foreign_probe_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayedFastRun:
+    """Offline semantic consistency result, not proof of artifact authenticity."""
+
+    header: ReplayHeader
+    outcomes: tuple[EvaluationTrace, ...]
+    foreign_probes: tuple[LeakageSentinelTrace, ...]
+    signatures: tuple[StrictSignature, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FastExecutionBinding:
+    logical_execution_index: int
+    opaque_execution_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FastProfileExecution:
+    cases: tuple[CodebookCase, ...]
+    capture_request: CaptureBatchRequest
+    capture_response: CaptureBatchResponse
+    future_request: FutureBatchRequest
+    future_response: FutureBatchResponse
+    schedule: tuple[ParentScheduleItem, ...]
+    execution_bindings: tuple[_FastExecutionBinding, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1965,6 +2138,80 @@ def _parent_capture_catalog(
     return catalog
 
 
+def _parent_foreign_companion_contract(
+    case: CodebookCase,
+) -> tuple[MemoryScope, str, str, str]:
+    """Derive the foreign scope and graph addresses from parent-owned truth."""
+
+    expected_scope = MemoryScope(
+        tenant_id="memory-eval",
+        namespace="scoped-codebook-v1",
+        subject_id=f"{case.subject_id}-foreign",
+    )
+    expected_base = datetime(2026, 7, 8, tzinfo=UTC) + timedelta(days=case.case_index)
+    event = EvidenceEvent(
+        scope=expected_scope,
+        session_id=f"{case.case_id}-capture-foreign",
+        run_id=f"{case.case_id}-run-foreign",
+        sequence_no=0,
+        kind=EvidenceKind.ENVIRONMENT,
+        payload=f"{case.target_key} = {case.current_value}",
+        observed_at=expected_base + timedelta(seconds=180),
+        idempotency_key=(
+            f"{case.case_id}-evidence-foreign-target-current-{case.target_slot:02d}"
+        ),
+    )
+    evidence_hash = hashlib.sha256(event.canonical_bytes()).hexdigest()
+    evidence_id = f"evd_{evidence_hash[:24]}"
+    candidate = CandidateProposal(
+        scope=expected_scope,
+        content=event.payload,
+        evidence_ids=(evidence_id,),
+        idempotency_key=(
+            f"{case.case_id}-candidate-foreign-target-current-{case.target_slot:02d}"
+        ),
+    )
+    candidate_hash = hashlib.sha256(candidate.canonical_bytes()).hexdigest()
+    candidate_id = f"cand_{candidate_hash[:24]}"
+    revision = RevisionProposal(
+        scope=expected_scope,
+        candidate_id=candidate_id,
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+        idempotency_key=(
+            f"{case.case_id}-revision-foreign-target-current-{case.target_slot:02d}"
+        ),
+    )
+    revision_hash = hashlib.sha256(revision.canonical_bytes()).hexdigest()
+    revision_id = f"rev_{revision_hash[:24]}"
+    manifest = ReleaseManifest(
+        scope=expected_scope,
+        revision_ids=(revision_id,),
+    )
+    release_hash = hashlib.sha256(manifest.canonical_bytes()).hexdigest()
+    release_id = f"rel_{release_hash[:24]}"
+    return expected_scope, evidence_id, revision_id, release_id
+
+
+def _validate_parent_foreign_companion_contract(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+) -> tuple[MemoryScope, str, str, str]:
+    """Reject capture references that differ from the reconstructed graph."""
+
+    expected_scope, evidence_id, revision_id, release_id = (
+        _parent_foreign_companion_contract(case)
+    )
+    if (
+        references.capture.foreign_scope != expected_scope
+        or references.capture.foreign_evidence_id != evidence_id
+        or references.revisions.foreign_target_revision_id != revision_id
+        or references.releases.foreign_sentinel_release_id != release_id
+    ):
+        raise ChildExecutionValidationError("foreign_scope")
+    return expected_scope, evidence_id, revision_id, release_id
+
+
 def _parent_graph_entry(
     *,
     case: CodebookCase,
@@ -2316,7 +2563,7 @@ def make_parent_schedule_item(
 
 
 def _validate_receipts_and_acknowledge(
-    observation: ExecutionObservation,
+    observation: _ObservationView,
     schedule: ParentScheduleItem,
 ) -> tuple[str, ...]:
     receipt = observation.consumer_input_receipt
@@ -2420,7 +2667,7 @@ def _validate_receipts_and_acknowledge(
 
 
 def _validate_parent_source_contract(
-    observation: ExecutionObservation,
+    observation: _ObservationView,
     schedule: ParentScheduleItem,
 ) -> None:
     expected = schedule.expected_source
@@ -2615,6 +2862,10 @@ def _wire_object(value: object, keys: frozenset[str]) -> dict[str, object]:
 def _wire_string(value: object) -> str:
     if type(value) is not str:
         raise WireProtocolError("closed_schema")
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise WireProtocolError("closed_schema") from error
     return value
 
 
@@ -3045,12 +3296,12 @@ def _capture_references_from_wire(value: object) -> CaptureReferences:
         foreign_scope=_scope_from_wire(item["foreign_scope"]),
         case_base=_datetime_from_wire(item["case_base"]),
         raw_history_cutoff=_datetime_from_wire(item["raw_history_cutoff"]),
-        capture_session_ids=sessions,  # type: ignore[arg-type]
+        capture_session_ids=(sessions[0], sessions[1], sessions[2]),
         old_evidence_ids=tuple(
             _wire_string(part) for part in _wire_list(item["old_evidence_ids"])
         ),
         current_evidence_id=_wire_string(item["current_evidence_id"]),
-        control_evidence_ids=controls,  # type: ignore[arg-type]
+        control_evidence_ids=(controls[0], controls[1]),
         foreign_evidence_id=_wire_string(item["foreign_evidence_id"]),
     )
 
@@ -3393,6 +3644,587 @@ def _future_response_from_wire(value: object) -> FutureChildResponse:
     )
 
 
+def _capture_batch_request_to_wire(
+    value: CaptureBatchRequest,
+) -> dict[str, object]:
+    return {"items": [_capture_request_to_wire(item) for item in value.items]}
+
+
+def _capture_batch_request_from_wire(value: object) -> CaptureBatchRequest:
+    item = _wire_object(value, frozenset({"items"}))
+    return CaptureBatchRequest(
+        items=tuple(
+            _capture_request_from_wire(part) for part in _wire_list(item["items"])
+        )
+    )
+
+
+def _capture_batch_item_to_wire(
+    value: CaptureBatchItemResult,
+) -> dict[str, object]:
+    return {
+        "case_index": _wire_integer(value.case_index),
+        "references": _database_references_to_wire(value.references),
+    }
+
+
+def _capture_batch_item_from_wire(value: object) -> CaptureBatchItemResult:
+    item = _wire_object(value, frozenset({"case_index", "references"}))
+    return CaptureBatchItemResult(
+        case_index=_wire_integer(item["case_index"]),
+        references=_database_references_from_wire(item["references"]),
+    )
+
+
+def _capture_batch_response_to_wire(
+    value: CaptureBatchResponse,
+) -> dict[str, object]:
+    return {
+        "areal_module_path": _wire_string(value.areal_module_path),
+        "environment_clean": _wire_boolean(value.environment_clean),
+        "isolated_mode": _wire_boolean(value.isolated_mode),
+        "items": [_capture_batch_item_to_wire(item) for item in value.items],
+        "pid": _wire_integer(value.pid),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "visible_forbidden_environment": [
+            _wire_string(name) for name in value.visible_forbidden_environment
+        ],
+    }
+
+
+def _capture_batch_response_from_wire(value: object) -> CaptureBatchResponse:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "items",
+                "pid",
+                "process_instance_id",
+                "isolated_mode",
+                "areal_module_path",
+                "visible_forbidden_environment",
+                "environment_clean",
+            }
+        ),
+    )
+    return CaptureBatchResponse(
+        items=tuple(
+            _capture_batch_item_from_wire(part) for part in _wire_list(item["items"])
+        ),
+        pid=_wire_integer(item["pid"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        isolated_mode=_wire_boolean(item["isolated_mode"]),
+        areal_module_path=_wire_string(item["areal_module_path"]),
+        visible_forbidden_environment=tuple(
+            _wire_string(part)
+            for part in _wire_list(item["visible_forbidden_environment"])
+        ),
+        environment_clean=_wire_boolean(item["environment_clean"]),
+    )
+
+
+def _future_batch_request_to_wire(value: FutureBatchRequest) -> dict[str, object]:
+    return {"items": [_future_request_to_wire(item) for item in value.items]}
+
+
+def _future_batch_request_from_wire(value: object) -> FutureBatchRequest:
+    item = _wire_object(value, frozenset({"items"}))
+    return FutureBatchRequest(
+        items=tuple(
+            _future_request_from_wire(part) for part in _wire_list(item["items"])
+        )
+    )
+
+
+def _foreign_probe_observation_to_wire(
+    value: ForeignProbeObservation,
+) -> dict[str, object]:
+    return {
+        "execution_index": _wire_integer(value.execution_index),
+        "future_pid": _wire_integer(value.future_pid),
+        "future_process_instance_id": _wire_string(value.future_process_instance_id),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "history_length": _wire_integer(value.history_length),
+        "reason": _wire_string(value.reason),
+        "release_id": _wire_string(value.release_id),
+        "scope": _scope_to_wire(value.scope),
+    }
+
+
+def _foreign_probe_observation_from_wire(
+    value: object,
+) -> ForeignProbeObservation:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "scope",
+                "release_id",
+                "future_session_id",
+                "future_run_id",
+                "future_pid",
+                "future_process_instance_id",
+                "reason",
+                "history_length",
+            }
+        ),
+    )
+    reason = _wire_string(item["reason"])
+    if reason != "release_not_found":
+        raise WireProtocolError("closed_schema")
+    return ForeignProbeObservation(
+        execution_index=_wire_integer(item["execution_index"]),
+        scope=_scope_from_wire(item["scope"]),
+        release_id=_wire_string(item["release_id"]),
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        future_pid=_wire_integer(item["future_pid"]),
+        future_process_instance_id=_wire_string(item["future_process_instance_id"]),
+        reason=reason,
+        history_length=_wire_integer(item["history_length"]),
+    )
+
+
+def _item_state_receipt_to_wire(value: ItemStateReceipt) -> dict[str, object]:
+    return {
+        "audit_instance_id": _wire_string(value.audit_instance_id),
+        "consumer_instance_id": _wire_string(value.consumer_instance_id),
+        "execution_index": _wire_integer(value.execution_index),
+        "generation_index": _wire_integer(value.generation_index),
+        "history_instance_id": _wire_string(value.history_instance_id),
+        "history_length": _wire_integer(value.history_length),
+        "logical_run_id": _wire_string(value.logical_run_id),
+        "logical_session_id": _wire_string(value.logical_session_id),
+        "logical_session_instance_id": _wire_string(value.logical_session_instance_id),
+        "reader_instance_id": _wire_string(value.reader_instance_id),
+        "renderer_instance_id": _wire_string(value.renderer_instance_id),
+        "resolver_instance_id": _wire_string(value.resolver_instance_id),
+        "store_instance_id": _wire_string(value.store_instance_id),
+    }
+
+
+def _item_state_receipt_from_wire(value: object) -> ItemStateReceipt:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "generation_index",
+                "reader_instance_id",
+                "store_instance_id",
+                "resolver_instance_id",
+                "renderer_instance_id",
+                "consumer_instance_id",
+                "audit_instance_id",
+                "logical_session_instance_id",
+                "history_instance_id",
+                "logical_session_id",
+                "logical_run_id",
+                "history_length",
+            }
+        ),
+    )
+    return ItemStateReceipt(
+        execution_index=_wire_integer(item["execution_index"]),
+        generation_index=_wire_integer(item["generation_index"]),
+        store_instance_id=_wire_string(item["store_instance_id"]),
+        reader_instance_id=_wire_string(item["reader_instance_id"]),
+        resolver_instance_id=_wire_string(item["resolver_instance_id"]),
+        renderer_instance_id=_wire_string(item["renderer_instance_id"]),
+        consumer_instance_id=_wire_string(item["consumer_instance_id"]),
+        audit_instance_id=_wire_string(item["audit_instance_id"]),
+        logical_session_instance_id=_wire_string(item["logical_session_instance_id"]),
+        history_instance_id=_wire_string(item["history_instance_id"]),
+        logical_session_id=_wire_string(item["logical_session_id"]),
+        logical_run_id=_wire_string(item["logical_run_id"]),
+        history_length=_wire_integer(item["history_length"]),
+    )
+
+
+def _future_batch_response_to_wire(
+    value: FutureBatchResponse,
+) -> dict[str, object]:
+    return {
+        "areal_module_path": _wire_string(value.areal_module_path),
+        "environment_clean": _wire_boolean(value.environment_clean),
+        "foreign_probes": [
+            _foreign_probe_observation_to_wire(probe) for probe in value.foreign_probes
+        ],
+        "isolated_mode": _wire_boolean(value.isolated_mode),
+        "observations": [
+            _future_observation_to_wire(observation)
+            for observation in value.observations
+        ],
+        "pid": _wire_integer(value.pid),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "state_receipts": [
+            _item_state_receipt_to_wire(receipt) for receipt in value.state_receipts
+        ],
+        "visible_forbidden_environment": [
+            _wire_string(name) for name in value.visible_forbidden_environment
+        ],
+    }
+
+
+def _future_batch_response_from_wire(value: object) -> FutureBatchResponse:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "observations",
+                "foreign_probes",
+                "state_receipts",
+                "pid",
+                "process_instance_id",
+                "isolated_mode",
+                "areal_module_path",
+                "visible_forbidden_environment",
+                "environment_clean",
+            }
+        ),
+    )
+    return FutureBatchResponse(
+        observations=tuple(
+            _future_observation_from_wire(part)
+            for part in _wire_list(item["observations"])
+        ),
+        foreign_probes=tuple(
+            _foreign_probe_observation_from_wire(part)
+            for part in _wire_list(item["foreign_probes"])
+        ),
+        state_receipts=tuple(
+            _item_state_receipt_from_wire(part)
+            for part in _wire_list(item["state_receipts"])
+        ),
+        pid=_wire_integer(item["pid"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        isolated_mode=_wire_boolean(item["isolated_mode"]),
+        areal_module_path=_wire_string(item["areal_module_path"]),
+        visible_forbidden_environment=tuple(
+            _wire_string(part)
+            for part in _wire_list(item["visible_forbidden_environment"])
+        ),
+        environment_clean=_wire_boolean(item["environment_clean"]),
+    )
+
+
+def _replay_header_to_wire(value: ReplayHeader) -> dict[str, object]:
+    return {
+        "case_manifest_sha256s": [
+            _wire_string(part) for part in value.case_manifest_sha256s
+        ],
+        "case_seed": _wire_string(value.case_seed),
+        "foreign_probe_count": _wire_integer(value.foreign_probe_count),
+        "outcome_count": _wire_integer(value.outcome_count),
+        "profile": _wire_string(value.profile),
+        "schema_version": _wire_integer(value.schema_version),
+    }
+
+
+def _replay_header_from_wire(value: object) -> ReplayHeader:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "schema_version",
+                "profile",
+                "case_seed",
+                "case_manifest_sha256s",
+                "outcome_count",
+                "foreign_probe_count",
+            }
+        ),
+    )
+    schema_version = _wire_integer(item["schema_version"])
+    if schema_version != SCHEMA_VERSION:
+        raise WireProtocolError("closed_schema")
+    return ReplayHeader(
+        schema_version=schema_version,
+        profile=_wire_string(item["profile"]),
+        case_seed=_wire_string(item["case_seed"]),
+        case_manifest_sha256s=tuple(
+            _wire_string(part) for part in _wire_list(item["case_manifest_sha256s"])
+        ),
+        outcome_count=_wire_integer(item["outcome_count"]),
+        foreign_probe_count=_wire_integer(item["foreign_probe_count"]),
+    )
+
+
+def _evaluation_trace_to_wire(value: EvaluationTrace) -> dict[str, object]:
+    return {
+        "abstained": _wire_boolean(value.abstained),
+        "arm": _wire_string(value.arm),
+        "capture_pid": _wire_integer(value.capture_pid),
+        "capture_process_instance_id": _wire_string(value.capture_process_instance_id),
+        "capture_session_ids": [
+            _wire_string(part) for part in value.capture_session_ids
+        ],
+        "case_id": _wire_string(value.case_id),
+        "case_manifest_sha256": _wire_string(value.case_manifest_sha256),
+        "eligible_revision_ids": [
+            _wire_string(part) for part in value.eligible_revision_ids
+        ],
+        "entries": [_entry_receipt_to_wire(entry) for entry in value.entries],
+        "execution_index": _wire_integer(value.execution_index),
+        "expected_response": _wire_string(value.expected_response),
+        "followed_injected_value": _wire_boolean(value.followed_injected_value),
+        "future_pid": _wire_integer(value.future_pid),
+        "future_process_instance_id": _wire_string(value.future_process_instance_id),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "history_length": _wire_integer(value.history_length),
+        "injected_revision_ids": [
+            _wire_string(part) for part in value.injected_revision_ids
+        ],
+        "normalized_response": _wire_string(value.normalized_response),
+        "query_sha256": _wire_string(value.query_sha256),
+        "reader_audit": [_audit_to_wire(event) for event in value.reader_audit],
+        "received_context_sha256": _wire_string(value.received_context_sha256),
+        "received_context_utf8_bytes": _wire_integer(value.received_context_utf8_bytes),
+        "received_query_sha256": _wire_string(value.received_query_sha256),
+        "release_id": value.release_id,
+        "rendered_context_sha256": _wire_string(value.rendered_context_sha256),
+        "rendered_context_token_count": value.rendered_context_token_count,
+        "rendered_context_utf8_bytes": _wire_integer(value.rendered_context_utf8_bytes),
+        "response": _wire_string(value.response),
+        "retrieved_revision_ids": [
+            _wire_string(part) for part in value.retrieved_revision_ids
+        ],
+        "returned_revision_ids": [
+            _wire_string(part) for part in value.returned_revision_ids
+        ],
+        "schema_version": _wire_integer(value.schema_version),
+        "scope": _scope_to_wire(value.scope),
+        "source_evidence_ids": [
+            _wire_string(part) for part in value.source_evidence_ids
+        ],
+        "source_kind": _wire_string(value.source_kind),
+        "submitted_input_token_count": value.submitted_input_token_count,
+        "submitted_input_token_ids_sha256": value.submitted_input_token_ids_sha256,
+        "submitted_prompt_context_end": value.submitted_prompt_context_end,
+        "submitted_prompt_context_sha256": value.submitted_prompt_context_sha256,
+        "submitted_prompt_context_start": value.submitted_prompt_context_start,
+        "submitted_prompt_sha256": value.submitted_prompt_sha256,
+        "utility": _wire_integer(value.utility),
+    }
+
+
+def _evaluation_trace_from_wire(value: object) -> EvaluationTrace:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "schema_version",
+                "case_id",
+                "case_manifest_sha256",
+                "execution_index",
+                "arm",
+                "source_kind",
+                "scope",
+                "capture_session_ids",
+                "future_session_id",
+                "future_run_id",
+                "capture_pid",
+                "future_pid",
+                "capture_process_instance_id",
+                "future_process_instance_id",
+                "release_id",
+                "eligible_revision_ids",
+                "retrieved_revision_ids",
+                "returned_revision_ids",
+                "injected_revision_ids",
+                "source_evidence_ids",
+                "entries",
+                "reader_audit",
+                "rendered_context_sha256",
+                "rendered_context_utf8_bytes",
+                "rendered_context_token_count",
+                "received_context_sha256",
+                "received_context_utf8_bytes",
+                "received_query_sha256",
+                "submitted_prompt_sha256",
+                "submitted_prompt_context_start",
+                "submitted_prompt_context_end",
+                "submitted_prompt_context_sha256",
+                "submitted_input_token_ids_sha256",
+                "submitted_input_token_count",
+                "query_sha256",
+                "history_length",
+                "response",
+                "normalized_response",
+                "expected_response",
+                "utility",
+                "abstained",
+                "followed_injected_value",
+            }
+        ),
+    )
+    capture_session_ids = tuple(
+        _wire_string(part) for part in _wire_list(item["capture_session_ids"])
+    )
+    if len(capture_session_ids) != 3:
+        raise WireProtocolError("closed_schema")
+    schema_version = _wire_integer(item["schema_version"])
+    submitted_values = (
+        item["submitted_prompt_sha256"],
+        item["submitted_prompt_context_start"],
+        item["submitted_prompt_context_end"],
+        item["submitted_prompt_context_sha256"],
+        item["submitted_input_token_ids_sha256"],
+        item["submitted_input_token_count"],
+    )
+    if schema_version != SCHEMA_VERSION or (
+        any(part is None for part in submitted_values)
+        and not all(part is None for part in submitted_values)
+    ):
+        raise WireProtocolError("closed_schema")
+    return EvaluationTrace(
+        schema_version=schema_version,
+        case_id=_wire_string(item["case_id"]),
+        case_manifest_sha256=_wire_string(item["case_manifest_sha256"]),
+        execution_index=_wire_integer(item["execution_index"]),
+        arm=_wire_string(item["arm"]),
+        source_kind=_wire_string(item["source_kind"]),
+        scope=_scope_from_wire(item["scope"]),
+        capture_session_ids=(
+            capture_session_ids[0],
+            capture_session_ids[1],
+            capture_session_ids[2],
+        ),
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        capture_pid=_wire_integer(item["capture_pid"]),
+        future_pid=_wire_integer(item["future_pid"]),
+        capture_process_instance_id=_wire_string(item["capture_process_instance_id"]),
+        future_process_instance_id=_wire_string(item["future_process_instance_id"]),
+        release_id=_optional_string(item["release_id"]),
+        eligible_revision_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["eligible_revision_ids"])
+        ),
+        retrieved_revision_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["retrieved_revision_ids"])
+        ),
+        returned_revision_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["returned_revision_ids"])
+        ),
+        injected_revision_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["injected_revision_ids"])
+        ),
+        source_evidence_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["source_evidence_ids"])
+        ),
+        entries=tuple(
+            _entry_receipt_from_wire(part) for part in _wire_list(item["entries"])
+        ),
+        reader_audit=tuple(
+            _audit_from_wire(part) for part in _wire_list(item["reader_audit"])
+        ),
+        rendered_context_sha256=_wire_string(item["rendered_context_sha256"]),
+        rendered_context_utf8_bytes=_wire_integer(item["rendered_context_utf8_bytes"]),
+        rendered_context_token_count=_optional_integer(
+            item["rendered_context_token_count"]
+        ),
+        received_context_sha256=_wire_string(item["received_context_sha256"]),
+        received_context_utf8_bytes=_wire_integer(item["received_context_utf8_bytes"]),
+        received_query_sha256=_wire_string(item["received_query_sha256"]),
+        submitted_prompt_sha256=_optional_string(item["submitted_prompt_sha256"]),
+        submitted_prompt_context_start=_optional_integer(
+            item["submitted_prompt_context_start"]
+        ),
+        submitted_prompt_context_end=_optional_integer(
+            item["submitted_prompt_context_end"]
+        ),
+        submitted_prompt_context_sha256=_optional_string(
+            item["submitted_prompt_context_sha256"]
+        ),
+        submitted_input_token_ids_sha256=_optional_string(
+            item["submitted_input_token_ids_sha256"]
+        ),
+        submitted_input_token_count=_optional_integer(
+            item["submitted_input_token_count"]
+        ),
+        query_sha256=_wire_string(item["query_sha256"]),
+        history_length=_wire_integer(item["history_length"]),
+        response=_wire_string(item["response"]),
+        normalized_response=_wire_string(item["normalized_response"]),
+        expected_response=_wire_string(item["expected_response"]),
+        utility=_wire_integer(item["utility"]),
+        abstained=_wire_boolean(item["abstained"]),
+        followed_injected_value=_wire_boolean(item["followed_injected_value"]),
+    )
+
+
+def _leakage_trace_to_wire(value: LeakageSentinelTrace) -> dict[str, object]:
+    return {
+        "capture_pid": _wire_integer(value.capture_pid),
+        "capture_process_instance_id": _wire_string(value.capture_process_instance_id),
+        "case_id": _wire_string(value.case_id),
+        "case_manifest_sha256": _wire_string(value.case_manifest_sha256),
+        "companion_scope": _scope_to_wire(value.companion_scope),
+        "execution_index": _wire_integer(value.execution_index),
+        "foreign_evidence_id": _wire_string(value.foreign_evidence_id),
+        "foreign_release_id": _wire_string(value.foreign_release_id),
+        "future_pid": _wire_integer(value.future_pid),
+        "future_process_instance_id": _wire_string(value.future_process_instance_id),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "history_length": _wire_integer(value.history_length),
+        "reason": _wire_string(value.reason),
+        "requested_scope": _scope_to_wire(value.requested_scope),
+        "schema_version": _wire_integer(value.schema_version),
+    }
+
+
+def _leakage_trace_from_wire(value: object) -> LeakageSentinelTrace:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "schema_version",
+                "case_id",
+                "case_manifest_sha256",
+                "execution_index",
+                "requested_scope",
+                "companion_scope",
+                "foreign_release_id",
+                "foreign_evidence_id",
+                "future_session_id",
+                "future_run_id",
+                "capture_pid",
+                "future_pid",
+                "capture_process_instance_id",
+                "future_process_instance_id",
+                "reason",
+                "history_length",
+            }
+        ),
+    )
+    schema_version = _wire_integer(item["schema_version"])
+    reason = _wire_string(item["reason"])
+    if schema_version != SCHEMA_VERSION or reason != "foreign_scope":
+        raise WireProtocolError("closed_schema")
+    return LeakageSentinelTrace(
+        schema_version=schema_version,
+        case_id=_wire_string(item["case_id"]),
+        case_manifest_sha256=_wire_string(item["case_manifest_sha256"]),
+        execution_index=_wire_integer(item["execution_index"]),
+        requested_scope=_scope_from_wire(item["requested_scope"]),
+        companion_scope=_scope_from_wire(item["companion_scope"]),
+        foreign_release_id=_wire_string(item["foreign_release_id"]),
+        foreign_evidence_id=_wire_string(item["foreign_evidence_id"]),
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        capture_pid=_wire_integer(item["capture_pid"]),
+        future_pid=_wire_integer(item["future_pid"]),
+        capture_process_instance_id=_wire_string(item["capture_process_instance_id"]),
+        future_process_instance_id=_wire_string(item["future_process_instance_id"]),
+        reason=reason,
+        history_length=_wire_integer(item["history_length"]),
+    )
+
+
 _CHILD_FAILURE_REASONS = frozenset(
     {
         "assignment_mismatch",
@@ -3401,6 +4233,7 @@ _CHILD_FAILURE_REASONS = frozenset(
         "framing",
         "history_nonzero",
         "process_isolation",
+        "state_reuse",
     }
 )
 
@@ -3421,17 +4254,31 @@ def _failure_response_from_wire(value: object) -> ChildFailureResponse:
 
 
 _WIRE_ENCODERS: dict[type[object], tuple[str, Callable[[Any], dict[str, object]]]] = {
+    CaptureBatchRequest: ("capture_batch_request", _capture_batch_request_to_wire),
+    CaptureBatchResponse: ("capture_batch_response", _capture_batch_response_to_wire),
     CaptureChildRequest: ("capture_child_request", _capture_request_to_wire),
     CaptureChildResponse: ("capture_child_response", _capture_response_to_wire),
+    FutureBatchRequest: ("future_batch_request", _future_batch_request_to_wire),
+    FutureBatchResponse: ("future_batch_response", _future_batch_response_to_wire),
     FutureChildRequest: ("future_child_request", _future_request_to_wire),
     FutureChildResponse: ("future_child_response", _future_response_to_wire),
+    ReplayHeader: ("fast_profile_replay_header", _replay_header_to_wire),
+    EvaluationTrace: ("evaluation_trace", _evaluation_trace_to_wire),
+    LeakageSentinelTrace: ("leakage_sentinel_trace", _leakage_trace_to_wire),
     ChildFailureResponse: ("child_failure_response", _failure_response_to_wire),
 }
 _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
+    "capture_batch_request": _capture_batch_request_from_wire,
+    "capture_batch_response": _capture_batch_response_from_wire,
     "capture_child_request": _capture_request_from_wire,
     "capture_child_response": _capture_response_from_wire,
+    "future_batch_request": _future_batch_request_from_wire,
+    "future_batch_response": _future_batch_response_from_wire,
     "future_child_request": _future_request_from_wire,
     "future_child_response": _future_response_from_wire,
+    "fast_profile_replay_header": _replay_header_from_wire,
+    "evaluation_trace": _evaluation_trace_from_wire,
+    "leakage_sentinel_trace": _leakage_trace_from_wire,
     "child_failure_response": _failure_response_from_wire,
 }
 
@@ -3617,6 +4464,44 @@ def execute_capture_child_request(
     )
 
 
+def execute_capture_batch_request(
+    request: CaptureBatchRequest,
+) -> CaptureBatchResponse:
+    """Build every capture item in one OS process without parent DB access."""
+
+    if type(request) is not CaptureBatchRequest:
+        raise WireProtocolError("closed_schema")
+    _capture_batch_request_from_wire(_capture_batch_request_to_wire(request))
+    indexes = tuple(item.case_index for item in request.items)
+    paths = tuple(item.database_path for item in request.items)
+    if (
+        not request.items
+        or len(set(indexes)) != len(indexes)
+        or len(set(paths)) != len(paths)
+    ):
+        raise WireProtocolError("closed_schema")
+    items = tuple(
+        CaptureBatchItemResult(
+            case_index=item.case_index,
+            references=build_case_database(
+                generate_case(item.case_index),
+                item.database_path,
+            ),
+        )
+        for item in request.items
+    )
+    visible = _visible_forbidden_environment()
+    return CaptureBatchResponse(
+        items=items,
+        pid=os.getpid(),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        isolated_mode=bool(sys.flags.isolated),
+        areal_module_path=_areal_module_path(),
+        visible_forbidden_environment=visible,
+        environment_clean=not visible,
+    )
+
+
 def _assignment_and_capability(
     request: FutureChildRequest,
     store: SQLiteMemoryStore,
@@ -3639,50 +4524,231 @@ def _assignment_and_capability(
     return assignment, OracleEntryCapability(assignment, audit)
 
 
-def execute_future_child_request(
-    request: FutureChildRequest,
-) -> FutureChildResponse:
-    """Resolve, render, and consume one sealed future item in this process."""
+@dataclass(slots=True)
+class _LogicalSessionState:
+    session_id: str
+    run_id: str
 
-    if type(request) is not FutureChildRequest:
-        raise WireProtocolError("closed_schema")
-    _future_request_from_wire(_future_request_to_wire(request))
-    if (
-        request.renderer_version != "memory-codebook/v1"
-        or request.consumer_version != "scripted-last-occurrence/v1"
-    ):
-        raise ChildExecutionValidationError("assignment_mismatch")
+
+class _ItemResolver:
+    __slots__ = ()
+
+    def run(
+        self,
+        reader: ReleaseReadCapability
+        | RawEvidenceReadCapability
+        | OracleEntryCapability,
+    ) -> ResolvedTreatment:
+        return resolve_treatment(reader)
+
+
+class _ItemRenderer:
+    __slots__ = ()
+
+    def run(self, entries: tuple[ResolvedEntry, ...]) -> RenderedContext:
+        return render_context(entries)
+
+
+class _ItemConsumer:
+    __slots__ = ()
+
+    def run(
+        self,
+        query: bytes,
+        context: bytes,
+        history: list[bytes],
+    ) -> ConsumerResult:
+        return consume_scripted(query, context, history=tuple(history))
+
+
+@dataclass(slots=True)
+class _ItemExecutionState:
+    generation_index: int
+    store: SQLiteMemoryStore
+    assignment: ReleaseSourceAssignment | RawSourceAssignment | OracleSourceAssignment
+    reader: ReleaseReadCapability | RawEvidenceReadCapability | OracleEntryCapability
+    audit: ReadAuditSink
+    resolver: _ItemResolver
+    renderer: _ItemRenderer
+    consumer: _ItemConsumer
+    logical_session: _LogicalSessionState
+    history: list[bytes]
+    receipt: ItemStateReceipt
+    used: bool
+
+
+def _state_identity(
+    *,
+    generation_index: int,
+    component: str,
+    value: object,
+) -> str:
+    material = (
+        f"{PROCESS_INSTANCE_ID}|{generation_index}|{component}|{id(value)}"
+    ).encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def _new_item_execution_state(
+    request: FutureChildRequest,
+    generation_index: int,
+) -> _ItemExecutionState:
     audit = ReadAuditSink()
     store = SQLiteMemoryStore(request.database_path)
-    assignment, capability = _assignment_and_capability(request, store, audit)
-    try:
-        treatment = resolve_treatment(capability)
-        validate_resolved_treatment(
-            request.database_path,
-            assignment,
-            treatment,
-            audit.snapshot(),
+    assignment, reader = _assignment_and_capability(request, store, audit)
+    resolver = _ItemResolver()
+    renderer = _ItemRenderer()
+    consumer = _ItemConsumer()
+    logical_session = _LogicalSessionState(
+        session_id=request.future_session_id,
+        run_id=request.future_run_id,
+    )
+    history: list[bytes] = []
+    receipt = ItemStateReceipt(
+        execution_index=request.execution_index,
+        generation_index=generation_index,
+        store_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="store",
+            value=store,
+        ),
+        reader_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="reader",
+            value=reader,
+        ),
+        resolver_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="resolver",
+            value=resolver,
+        ),
+        renderer_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="renderer",
+            value=renderer,
+        ),
+        consumer_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="consumer",
+            value=consumer,
+        ),
+        audit_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="audit",
+            value=audit,
+        ),
+        logical_session_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="logical_session",
+            value=logical_session,
+        ),
+        history_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="history",
+            value=history,
+        ),
+        logical_session_id=logical_session.session_id,
+        logical_run_id=logical_session.run_id,
+        history_length=len(history),
+    )
+    return _ItemExecutionState(
+        generation_index=generation_index,
+        store=store,
+        assignment=assignment,
+        reader=reader,
+        audit=audit,
+        resolver=resolver,
+        renderer=renderer,
+        consumer=consumer,
+        logical_session=logical_session,
+        history=history,
+        receipt=receipt,
+        used=False,
+    )
+
+
+def _item_identity_objects(state: _ItemExecutionState) -> tuple[object, ...]:
+    return (
+        state.store,
+        state.reader,
+        state.resolver,
+        state.renderer,
+        state.consumer,
+        state.audit,
+        state.logical_session,
+        state.history,
+    )
+
+
+def _claim_item_execution_state(
+    state: _ItemExecutionState,
+    request: FutureChildRequest,
+    generation_index: int,
+) -> tuple[int, ...]:
+    if (
+        state.used
+        or state.generation_index != generation_index
+        or state.receipt.execution_index != request.execution_index
+        or state.logical_session.session_id != request.future_session_id
+        or state.logical_session.run_id != request.future_run_id
+        or state.history
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    objects = _item_identity_objects(state)
+    object_ids = tuple(id(value) for value in objects)
+    expected_identities = (
+        state.receipt.store_instance_id,
+        state.receipt.reader_instance_id,
+        state.receipt.resolver_instance_id,
+        state.receipt.renderer_instance_id,
+        state.receipt.consumer_instance_id,
+        state.receipt.audit_instance_id,
+        state.receipt.logical_session_instance_id,
+        state.receipt.history_instance_id,
+    )
+    actual_identities = tuple(
+        _state_identity(
+            generation_index=generation_index,
+            component=component,
+            value=value,
         )
-    except ReleaseNotFoundError as error:
-        release_id = request.source.release_id
-        if request.source.source_kind != "release" or release_id is None:
-            raise
-        foreign_scope = MemoryScope(
-            tenant_id=request.scope.tenant_id,
-            namespace=request.scope.namespace,
-            subject_id=f"{request.scope.subject_id}-foreign",
+        for component, value in zip(
+            (
+                "store",
+                "reader",
+                "resolver",
+                "renderer",
+                "consumer",
+                "audit",
+                "logical_session",
+                "history",
+            ),
+            objects,
+            strict=True,
         )
-        try:
-            store.get_release(foreign_scope, release_id)
-        except ReleaseNotFoundError:
-            # An ordinary missing local release is not a valid foreign probe.
-            raise error
-        raise ChildExecutionValidationError("foreign_scope") from error
-    rendered = render_context(treatment.entries)
+    )
+    if len(set(object_ids)) != 8 or actual_identities != expected_identities:
+        raise ChildExecutionValidationError("state_reuse")
+    state.used = True
+    return object_ids
+
+
+def _execute_future_item(
+    request: FutureChildRequest,
+    state: _ItemExecutionState,
+) -> FutureExecutionObservation:
+    treatment = state.resolver.run(state.reader)
+    validate_resolved_treatment(
+        request.database_path,
+        state.assignment,
+        treatment,
+        state.audit.snapshot(),
+    )
+    rendered = state.renderer.run(treatment.entries)
     query = request.query.encode("utf-8", errors="strict")
-    consumer_result = consume_scripted(query, rendered.bytes)
+    consumer_result = state.consumer.run(query, rendered.bytes, state.history)
     pid = os.getpid()
-    observation = FutureExecutionObservation(
+    return FutureExecutionObservation(
         execution_index=request.execution_index,
         source_kind=treatment.source_kind,
         scope=treatment.scope,
@@ -3696,7 +4762,7 @@ def execute_future_child_request(
         returned_ids=treatment.returned_ids,
         source_evidence_ids=treatment.source_evidence_ids,
         entries=rendered.entry_receipts,
-        reader_audit=audit.snapshot(),
+        reader_audit=state.audit.snapshot(),
         rendered_context_sha256=hashlib.sha256(rendered.bytes).hexdigest(),
         rendered_context_utf8_bytes=len(rendered.bytes),
         rendered_context_token_count=None,
@@ -3706,6 +4772,37 @@ def execute_future_child_request(
         history_length=consumer_result.input_receipt.received_history_length,
         response=consumer_result.response,
     )
+
+
+def _validate_future_request_item(request: FutureChildRequest) -> None:
+    """Validate one item without creating execution state or consuming input."""
+
+    if type(request) is not FutureChildRequest:
+        raise WireProtocolError("closed_schema")
+    _future_request_from_wire(_future_request_to_wire(request))
+    _validate_wire_source_spec(request.source)
+    try:
+        query = request.query.encode("utf-8", errors="strict")
+        _query_key(query)
+    except (UnicodeEncodeError, ValueError) as error:
+        raise ChildExecutionValidationError("assignment_mismatch") from error
+    if (
+        request.renderer_version != "memory-codebook/v1"
+        or request.consumer_version != "scripted-last-occurrence/v1"
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+
+
+def execute_future_child_request(
+    request: FutureChildRequest,
+) -> FutureChildResponse:
+    """Resolve, render, and consume one sealed future item in this process."""
+
+    _validate_future_request_item(request)
+    state = _new_item_execution_state(request, request.execution_index)
+    _claim_item_execution_state(state, request, request.execution_index)
+    observation = _execute_future_item(request, state)
+    pid = os.getpid()
     visible = _visible_forbidden_environment()
     return FutureChildResponse(
         observation=observation,
@@ -3718,8 +4815,71 @@ def execute_future_child_request(
     )
 
 
+def execute_future_batch_request(
+    request: FutureBatchRequest,
+) -> FutureBatchResponse:
+    """Execute an ordered future batch while recreating each item execution."""
+
+    if type(request) is not FutureBatchRequest:
+        raise WireProtocolError("closed_schema")
+    _future_batch_request_from_wire(_future_batch_request_to_wire(request))
+    indexes = tuple(item.execution_index for item in request.items)
+    if not request.items or len(set(indexes)) != len(indexes):
+        raise WireProtocolError("closed_schema")
+    for item in request.items:
+        _validate_future_request_item(item)
+    observations: list[FutureExecutionObservation] = []
+    probes: list[ForeignProbeObservation] = []
+    receipts: list[ItemStateReceipt] = []
+    retained_states: list[_ItemExecutionState] = []
+    seen_object_ids: set[int] = set()
+    for generation_index, item in enumerate(request.items):
+        state = _new_item_execution_state(item, generation_index)
+        object_ids = _claim_item_execution_state(state, item, generation_index)
+        if seen_object_ids.intersection(object_ids):
+            raise ChildExecutionValidationError("state_reuse")
+        seen_object_ids.update(object_ids)
+        retained_states.append(state)
+        receipts.append(state.receipt)
+        try:
+            observation = _execute_future_item(item, state)
+        except ReleaseNotFoundError:
+            if item.source.source_kind != "release" or item.source.release_id is None:
+                raise
+            probes.append(
+                ForeignProbeObservation(
+                    execution_index=item.execution_index,
+                    scope=item.scope,
+                    release_id=item.source.release_id,
+                    future_session_id=item.future_session_id,
+                    future_run_id=item.future_run_id,
+                    future_pid=os.getpid(),
+                    future_process_instance_id=PROCESS_INSTANCE_ID,
+                    reason="release_not_found",
+                    history_length=0,
+                )
+            )
+        else:
+            observations.append(observation)
+    visible = _visible_forbidden_environment()
+    return FutureBatchResponse(
+        observations=tuple(observations),
+        foreign_probes=tuple(probes),
+        state_receipts=tuple(receipts),
+        pid=os.getpid(),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        isolated_mode=bool(sys.flags.isolated),
+        areal_module_path=_areal_module_path(),
+        visible_forbidden_environment=visible,
+        environment_clean=not visible,
+    )
+
+
 def run_isolated_child_raw(
-    request: CaptureChildRequest | FutureChildRequest,
+    request: CaptureBatchRequest
+    | CaptureChildRequest
+    | FutureBatchRequest
+    | FutureChildRequest,
     *,
     role: str,
     timeout_seconds: float,
@@ -3731,8 +4891,14 @@ def run_isolated_child_raw(
         or role not in {"capture-child", "future-child"}
         or type(timeout_seconds) not in {int, float}
         or timeout_seconds <= 0
-        or (role == "capture-child" and type(request) is not CaptureChildRequest)
-        or (role == "future-child" and type(request) is not FutureChildRequest)
+        or (
+            role == "capture-child"
+            and type(request) not in {CaptureBatchRequest, CaptureChildRequest}
+        )
+        or (
+            role == "future-child"
+            and type(request) not in {FutureBatchRequest, FutureChildRequest}
+        )
     ):
         raise WireProtocolError("closed_schema")
     script_path = str(Path(__file__).resolve())
@@ -3783,7 +4949,10 @@ def _is_canonical_uuid4(value: object) -> bool:
 
 
 def _validate_child_process_response(
-    response: CaptureChildResponse | FutureChildResponse,
+    response: CaptureBatchResponse
+    | CaptureChildResponse
+    | FutureBatchResponse
+    | FutureChildResponse,
     *,
     expected_pid: int,
 ) -> None:
@@ -3820,11 +4989,19 @@ def _validate_child_process_response(
 
 
 def run_isolated_child(
-    request: CaptureChildRequest | FutureChildRequest,
+    request: CaptureBatchRequest
+    | CaptureChildRequest
+    | FutureBatchRequest
+    | FutureChildRequest,
     *,
     role: str,
     timeout_seconds: float,
-) -> CaptureChildResponse | FutureChildResponse:
+) -> (
+    CaptureBatchResponse
+    | CaptureChildResponse
+    | FutureBatchResponse
+    | FutureChildResponse
+):
     """Run a child and reject noncanonical, wrong-role, or forged output."""
 
     completed = run_isolated_child_raw(
@@ -3839,14 +5016,34 @@ def run_isolated_child(
         raise WireProtocolError("framing")
     if type(response) is ChildFailureResponse:
         raise ChildExecutionValidationError(response.reason)
-    expected_type = (
-        CaptureChildResponse if role == "capture-child" else FutureChildResponse
-    )
+    expected_type = {
+        CaptureBatchRequest: CaptureBatchResponse,
+        CaptureChildRequest: CaptureChildResponse,
+        FutureBatchRequest: FutureBatchResponse,
+        FutureChildRequest: FutureChildResponse,
+    }[type(request)]
     if type(response) is not expected_type:
         raise WireProtocolError("closed_schema")
     _validate_child_process_response(response, expected_pid=completed.pid)
-    if type(request) is CaptureChildRequest:
+    if type(request) is CaptureBatchRequest:
+        if tuple(item.case_index for item in response.items) != tuple(
+            item.case_index for item in request.items
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+    elif type(request) is CaptureChildRequest:
         if response.case_index != request.case_index:
+            raise ChildExecutionValidationError("assignment_mismatch")
+    elif type(request) is FutureBatchRequest:
+        expected_indexes = {item.execution_index for item in request.items}
+        observed_indexes = {
+            observation.execution_index for observation in response.observations
+        } | {probe.execution_index for probe in response.foreign_probes}
+        if (
+            observed_indexes != expected_indexes
+            or len(response.observations) + len(response.foreign_probes)
+            != len(request.items)
+            or len(response.state_receipts) != len(request.items)
+        ):
             raise ChildExecutionValidationError("assignment_mismatch")
     else:
         observation = response.observation
@@ -3891,10 +5088,1041 @@ def validate_future_child_response(
     ):
         raise ChildExecutionValidationError("assignment_mismatch")
     try:
-        _validate_parent_source_contract(observation, schedule)  # type: ignore[arg-type]
-        _validate_receipts_and_acknowledge(observation, schedule)  # type: ignore[arg-type]
+        _validate_parent_source_contract(observation, schedule)
+        _validate_receipts_and_acknowledge(observation, schedule)
     except ObservationValidationError as error:
         raise ChildExecutionValidationError("assignment_mismatch") from error
+
+
+_FAST_ARMS = (
+    "current_release",
+    "raw_history",
+    "memory_off",
+    "target_masked",
+    "stale_release",
+    "oracle",
+)
+
+
+def _oracle_entries_for_case(case: CodebookCase) -> tuple[ResolvedEntry, ...]:
+    return tuple(
+        ResolvedEntry(
+            slot=slot,
+            key=entry.key,
+            value=entry.value,
+            source_kind="oracle",
+        )
+        for slot, entry in _parent_slot_entries(
+            case,
+            target_value=case.current_value,
+        )
+    ) + (
+        ResolvedEntry(
+            slot=5,
+            key=case.padding_entry.key,
+            value=case.padding_entry.value,
+            source_kind="oracle",
+        ),
+    )
+
+
+def _fast_source_spec(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+    arm: str,
+) -> WireSourceSpec:
+    if arm == "raw_history":
+        return WireSourceSpec(
+            source_kind="raw_evidence",
+            release_id=None,
+            cutoff=references.capture.raw_history_cutoff,
+            allowed_evidence_kinds=(
+                EvidenceKind.USER_MESSAGE,
+                EvidenceKind.FEEDBACK,
+            ),
+            oracle_entries=(),
+        )
+    if arm == "oracle":
+        return WireSourceSpec(
+            source_kind="oracle",
+            release_id=None,
+            cutoff=None,
+            allowed_evidence_kinds=(),
+            oracle_entries=_oracle_entries_for_case(case),
+        )
+    release_id = {
+        "current_release": references.releases.current_release_id,
+        "memory_off": references.releases.empty_release_id,
+        "target_masked": references.releases.masked_release_id,
+        "stale_release": references.releases.stale_release_id,
+    }[arm]
+    return WireSourceSpec(
+        source_kind="release",
+        release_id=release_id,
+        cutoff=None,
+        allowed_evidence_kinds=(),
+        oracle_entries=(),
+    )
+
+
+def _is_opaque_execution_token(value: object) -> bool:
+    return type(value) is int and (1 << 127) <= value < (1 << 128)
+
+
+def _generate_fast_execution_bindings() -> tuple[_FastExecutionBinding, ...]:
+    """Create per-run wire tokens unrelated to parent logical row numbers.
+
+    This enforces honest dataflow separation; it is not an adversarial security
+    boundary against a child that can derive the evaluator's fixed case corpus.
+    """
+
+    while True:
+        tokens: list[int] = []
+        seen: set[int] = set()
+        while len(tokens) < 56:
+            token = (1 << 127) | secrets.randbits(127)
+            if token not in seen:
+                seen.add(token)
+                tokens.append(token)
+        bindings = tuple(
+            _FastExecutionBinding(
+                logical_execution_index=logical_index,
+                opaque_execution_index=token,
+            )
+            for logical_index, token in enumerate(tokens)
+        )
+        logical_by_opaque = {
+            binding.opaque_execution_index: binding.logical_execution_index
+            for binding in bindings
+        }
+        logical_order = tuple(
+            logical_by_opaque[token] for token in sorted(logical_by_opaque)
+        )
+        modulo_is_ambiguous = all(
+            len(
+                {
+                    logical_index % len(_FAST_ARMS)
+                    for token, logical_index in logical_by_opaque.items()
+                    if logical_index < 48 and token % len(_FAST_ARMS) == remainder
+                }
+            )
+            >= 2
+            for remainder in range(len(_FAST_ARMS))
+        )
+        positions_mix_roles = any(
+            logical_index >= 48 for logical_index in logical_order[:48]
+        ) and any(logical_index < 48 for logical_index in logical_order[48:])
+        if modulo_is_ambiguous and positions_mix_roles:
+            return bindings
+
+
+def _opaque_future_identity(execution_token: int) -> tuple[str, str]:
+    if not _is_opaque_execution_token(execution_token):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    suffix = f"{execution_token:032x}"
+    return f"future-session-{suffix}", f"future-run-{suffix}"
+
+
+def _fast_future_request(
+    *,
+    execution_token: int,
+    database_path: str,
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+    source: WireSourceSpec,
+) -> FutureChildRequest:
+    future_session_id, future_run_id = _opaque_future_identity(execution_token)
+    return FutureChildRequest(
+        execution_index=execution_token,
+        database_path=database_path,
+        scope=references.capture.local_scope,
+        source=source,
+        query=_case_query_bytes(case).decode("ascii"),
+        future_session_id=future_session_id,
+        future_run_id=future_run_id,
+        renderer_version="memory-codebook/v1",
+        consumer_version="scripted-last-occurrence/v1",
+    )
+
+
+def _execute_fast_profile_children(
+    database_root: str | os.PathLike[str],
+    *,
+    timeout_seconds: float,
+) -> _FastProfileExecution:
+    """Launch exactly one capture child and one future child for eight cases."""
+
+    root = Path(database_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    cases = tuple(generate_case(case_index) for case_index in range(8))
+    capture_request = CaptureBatchRequest(
+        items=tuple(
+            CaptureChildRequest(
+                case_index=case.case_index,
+                database_path=str(root / f"case-{case.case_index:03d}.sqlite3"),
+            )
+            for case in cases
+        )
+    )
+    capture_response = run_isolated_child(
+        capture_request,
+        role="capture-child",
+        timeout_seconds=timeout_seconds,
+    )
+    if type(capture_response) is not CaptureBatchResponse:
+        raise ChildExecutionValidationError("process_isolation")
+    capture_by_index = {item.case_index: item for item in capture_response.items}
+    if set(capture_by_index) != set(range(8)):
+        raise ChildExecutionValidationError("assignment_mismatch")
+
+    execution_bindings = _generate_fast_execution_bindings()
+    opaque_by_logical = {
+        binding.logical_execution_index: binding.opaque_execution_index
+        for binding in execution_bindings
+    }
+    schedules: list[ParentScheduleItem] = []
+    future_items: list[FutureChildRequest] = []
+    for case in cases:
+        references = capture_by_index[case.case_index].references
+        database_path = capture_request.items[case.case_index].database_path
+        for arm_offset, arm in enumerate(_FAST_ARMS):
+            execution_index = case.case_index * len(_FAST_ARMS) + arm_offset
+            schedules.append(
+                make_parent_schedule_item(
+                    execution_index=execution_index,
+                    case=case,
+                    references=references,
+                    arm=arm,
+                )
+            )
+            future_items.append(
+                _fast_future_request(
+                    execution_token=opaque_by_logical[execution_index],
+                    database_path=database_path,
+                    case=case,
+                    references=references,
+                    source=_fast_source_spec(case, references, arm),
+                )
+            )
+    for case in cases:
+        execution_index = 48 + case.case_index
+        references = capture_by_index[case.case_index].references
+        future_items.append(
+            _fast_future_request(
+                execution_token=opaque_by_logical[execution_index],
+                database_path=capture_request.items[case.case_index].database_path,
+                case=case,
+                references=references,
+                source=WireSourceSpec(
+                    source_kind="release",
+                    release_id=references.releases.foreign_sentinel_release_id,
+                    cutoff=None,
+                    allowed_evidence_kinds=(),
+                    oracle_entries=(),
+                ),
+            )
+        )
+    future_request = FutureBatchRequest(
+        items=tuple(sorted(future_items, key=lambda item: item.execution_index))
+    )
+    future_response = run_isolated_child(
+        future_request,
+        role="future-child",
+        timeout_seconds=timeout_seconds,
+    )
+    if type(future_response) is not FutureBatchResponse:
+        raise ChildExecutionValidationError("process_isolation")
+    return _FastProfileExecution(
+        cases=cases,
+        capture_request=capture_request,
+        capture_response=capture_response,
+        future_request=future_request,
+        future_response=future_response,
+        schedule=tuple(schedules),
+        execution_bindings=execution_bindings,
+    )
+
+
+def _join_fast_observation(
+    observation: FutureExecutionObservation,
+    schedule: ParentScheduleItem,
+    capture_response: CaptureBatchResponse,
+) -> ExecutionObservation:
+    return ExecutionObservation(
+        execution_index=schedule.execution_index,
+        source_kind=observation.source_kind,
+        scope=observation.scope,
+        capture_session_ids=schedule.capture_session_ids,
+        future_session_id=observation.future_session_id,
+        future_run_id=observation.future_run_id,
+        capture_pid=capture_response.pid,
+        future_pid=observation.future_pid,
+        capture_process_instance_id=capture_response.process_instance_id,
+        future_process_instance_id=observation.future_process_instance_id,
+        release_id=observation.release_id,
+        eligible_ids=observation.eligible_ids,
+        retrieved_ids=observation.retrieved_ids,
+        returned_ids=observation.returned_ids,
+        source_evidence_ids=observation.source_evidence_ids,
+        entries=observation.entries,
+        reader_audit=observation.reader_audit,
+        rendered_context_sha256=observation.rendered_context_sha256,
+        rendered_context_utf8_bytes=observation.rendered_context_utf8_bytes,
+        rendered_context_token_count=observation.rendered_context_token_count,
+        consumer_input_receipt=observation.consumer_input_receipt,
+        model_call_receipt=observation.model_call_receipt,
+        query_sha256=observation.query_sha256,
+        history_length=observation.history_length,
+        response=observation.response,
+    )
+
+
+def _build_strict_signatures(
+    cases: tuple[CodebookCase, ...],
+    outcomes: tuple[EvaluationTrace, ...],
+) -> tuple[StrictSignature, ...]:
+    signatures: list[StrictSignature] = []
+    for case in cases:
+        case_traces = tuple(
+            trace for trace in outcomes if trace.case_id == case.case_id
+        )
+        if (
+            len(case_traces) != 6
+            or tuple(trace.arm for trace in case_traces) != _FAST_ARMS
+        ):
+            raise ObservationValidationError("execution_index_mismatch")
+        normalized_responses = (
+            case_traces[0].normalized_response,
+            case_traces[1].normalized_response,
+            case_traces[2].normalized_response,
+            case_traces[3].normalized_response,
+            case_traces[4].normalized_response,
+            case_traces[5].normalized_response,
+        )
+        expected = (
+            case.current_value,
+            case.current_value,
+            UNKNOWN,
+            UNKNOWN,
+            case.old_value,
+            case.current_value,
+        )
+        if (
+            normalized_responses != expected
+            or case_traces[0].rendered_context_sha256
+            != case_traces[5].rendered_context_sha256
+            or case_traces[0].rendered_context_utf8_bytes
+            != case_traces[5].rendered_context_utf8_bytes
+        ):
+            raise ObservationValidationError("strict_outcome_failure")
+        signatures.append(
+            StrictSignature(
+                case_index=case.case_index,
+                case_id=case.case_id,
+                normalized_responses=normalized_responses,
+                matches=True,
+            )
+        )
+    return tuple(signatures)
+
+
+def _build_leakage_traces(
+    validated_probes: tuple[
+        tuple[CodebookCase, CaseDatabaseReferences, ForeignProbeObservation], ...
+    ],
+    capture: CaptureBatchResponse,
+    future: FutureBatchResponse,
+) -> tuple[LeakageSentinelTrace, ...]:
+    return tuple(
+        LeakageSentinelTrace(
+            schema_version=SCHEMA_VERSION,
+            case_id=case.case_id,
+            case_manifest_sha256=case_manifest_sha256(case),
+            execution_index=48 + case.case_index,
+            requested_scope=probe.scope,
+            companion_scope=references.capture.foreign_scope,
+            foreign_release_id=probe.release_id,
+            foreign_evidence_id=references.capture.foreign_evidence_id,
+            future_session_id=probe.future_session_id,
+            future_run_id=probe.future_run_id,
+            capture_pid=capture.pid,
+            future_pid=future.pid,
+            capture_process_instance_id=capture.process_instance_id,
+            future_process_instance_id=future.process_instance_id,
+            reason="foreign_scope",
+            history_length=probe.history_length,
+        )
+        for case, references, probe in validated_probes
+    )
+
+
+def _write_fast_profile_artifact(
+    artifact_path: str | os.PathLike[str],
+    outcomes: tuple[EvaluationTrace, ...],
+    foreign_probes: tuple[LeakageSentinelTrace, ...],
+) -> None:
+    """Atomically publish one fully constructed canonical replay artifact."""
+
+    if (
+        len(outcomes) != 48
+        or tuple(trace.execution_index for trace in outcomes) != tuple(range(48))
+        or any(type(trace) is not EvaluationTrace for trace in outcomes)
+        or len(foreign_probes) != 8
+        or tuple(probe.execution_index for probe in foreign_probes)
+        != tuple(range(48, 56))
+        or any(type(probe) is not LeakageSentinelTrace for probe in foreign_probes)
+    ):
+        raise WireProtocolError("closed_schema")
+    header = ReplayHeader(
+        schema_version=SCHEMA_VERSION,
+        profile=FAST_PROFILE_NAME,
+        case_seed=CASE_SEED,
+        case_manifest_sha256s=tuple(
+            case_manifest_sha256(generate_case(case_index)) for case_index in range(8)
+        ),
+        outcome_count=48,
+        foreign_probe_count=8,
+    )
+    encoded = "".join(
+        wire_dumps(record) for record in (header, *outcomes, *foreign_probes)
+    ).encode("utf-8", errors="strict")
+    destination = Path(artifact_path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _expected_fast_response(case: CodebookCase, arm: str) -> str:
+    return {
+        "current_release": case.current_value,
+        "raw_history": case.current_value,
+        "memory_off": UNKNOWN,
+        "target_masked": UNKNOWN,
+        "stale_release": case.old_value,
+        "oracle": case.current_value,
+    }[arm]
+
+
+def _replayed_release_entry(trace: EvaluationTrace, slot: int) -> EntryReceipt:
+    matches = tuple(entry for entry in trace.entries if entry.slot == slot)
+    if len(matches) != 1:
+        raise WireProtocolError("closed_schema")
+    return matches[0]
+
+
+def _replayed_single_id(value: str | None) -> str:
+    if type(value) is not str or not value:
+        raise WireProtocolError("closed_schema")
+    return value
+
+
+def _replayed_single_evidence(entry: EntryReceipt) -> str:
+    if len(entry.evidence_ids) != 1:
+        raise WireProtocolError("closed_schema")
+    return entry.evidence_ids[0]
+
+
+def _replayed_case_references(
+    case: CodebookCase,
+    traces: tuple[EvaluationTrace, ...],
+    probe: LeakageSentinelTrace,
+) -> CaseDatabaseReferences:
+    by_arm = {trace.arm: trace for trace in traces}
+    if len(by_arm) != len(_FAST_ARMS) or set(by_arm) != set(_FAST_ARMS):
+        raise WireProtocolError("closed_schema")
+    current = by_arm["current_release"]
+    stale = by_arm["stale_release"]
+    masked = by_arm["target_masked"]
+    memory_off = by_arm["memory_off"]
+    stale_entries = tuple(_replayed_release_entry(stale, slot) for slot in range(6))
+    current_target = _replayed_release_entry(current, case.target_slot)
+    masked_target = _replayed_release_entry(masked, case.target_slot)
+    padding = _replayed_release_entry(stale, 5)
+    foreign_scope, _foreign_evidence, foreign_revision, _foreign_release = (
+        _parent_foreign_companion_contract(case)
+    )
+    expected_base = datetime(2026, 7, 8, tzinfo=UTC) + timedelta(days=case.case_index)
+    references = CaseDatabaseReferences(
+        capture=CaptureReferences(
+            local_scope=current.scope,
+            foreign_scope=probe.companion_scope,
+            case_base=expected_base,
+            raw_history_cutoff=expected_base + timedelta(seconds=90),
+            capture_session_ids=current.capture_session_ids,
+            old_evidence_ids=tuple(
+                _replayed_single_evidence(stale_entries[slot]) for slot in range(5)
+            ),
+            current_evidence_id=_replayed_single_evidence(current_target),
+            control_evidence_ids=(
+                _replayed_single_evidence(padding),
+                _replayed_single_evidence(masked_target),
+            ),
+            foreign_evidence_id=probe.foreign_evidence_id,
+        ),
+        revisions=RevisionReferences(
+            target_old_revision_id=_replayed_single_id(
+                stale_entries[case.target_slot].revision_id
+            ),
+            target_current_revision_id=_replayed_single_id(current_target.revision_id),
+            shared_revision_ids=tuple(
+                _replayed_single_id(stale_entries[slot].revision_id)
+                for slot in range(5)
+                if slot != case.target_slot
+            ),
+            padding_revision_id=_replayed_single_id(padding.revision_id),
+            target_masked_revision_id=_replayed_single_id(masked_target.revision_id),
+            foreign_target_revision_id=foreign_revision,
+        ),
+        releases=ReleaseAssignments(
+            stale_release_id=_replayed_single_id(stale.release_id),
+            current_release_id=_replayed_single_id(current.release_id),
+            masked_release_id=_replayed_single_id(masked.release_id),
+            empty_release_id=_replayed_single_id(memory_off.release_id),
+            foreign_sentinel_release_id=probe.foreign_release_id,
+        ),
+    )
+    try:
+        _validate_parent_foreign_companion_contract(case, references)
+        _parent_capture_catalog(case, references)
+    except (ChildExecutionValidationError, TypeError, ValueError) as error:
+        raise WireProtocolError("closed_schema") from error
+    if references.capture.foreign_scope != foreign_scope:
+        raise WireProtocolError("closed_schema")
+    return references
+
+
+def _validate_replayed_source_contract(
+    trace: EvaluationTrace,
+    expected: ParentSourceContract,
+) -> None:
+    if (
+        trace.source_evidence_ids != expected.source_evidence_ids
+        or trace.entries != expected.entries
+        or trace.reader_audit != expected.reader_audit
+        or trace.rendered_context_sha256 != expected.rendered_context_sha256
+        or trace.rendered_context_utf8_bytes != expected.rendered_context_utf8_bytes
+    ):
+        raise WireProtocolError("closed_schema")
+    if trace.source_kind == "release":
+        if (
+            trace.eligible_revision_ids != expected.eligible_ids
+            or trace.retrieved_revision_ids != expected.retrieved_ids
+            or trace.returned_revision_ids != expected.returned_ids
+            or trace.injected_revision_ids != expected.returned_ids
+        ):
+            raise WireProtocolError("closed_schema")
+        return
+    if (
+        trace.eligible_revision_ids
+        or trace.retrieved_revision_ids
+        or trace.returned_revision_ids
+        or trace.injected_revision_ids
+    ):
+        raise WireProtocolError("closed_schema")
+
+
+def _validate_replayed_fast_semantics(
+    cases: tuple[CodebookCase, ...],
+    outcomes: tuple[EvaluationTrace, ...],
+    foreign_probes: tuple[LeakageSentinelTrace, ...],
+) -> None:
+    """Check only deterministic facts derivable from an offline artifact."""
+
+    expected_sources: dict[int, ParentSourceContract] = {}
+    try:
+        for case in cases:
+            start = case.case_index * len(_FAST_ARMS)
+            case_traces = outcomes[start : start + len(_FAST_ARMS)]
+            references = _replayed_case_references(
+                case,
+                case_traces,
+                foreign_probes[case.case_index],
+            )
+            for trace in case_traces:
+                if trace.source_kind == "release":
+                    release_id = _replayed_single_id(trace.release_id)
+                    expected = _parent_release_source_contract(
+                        case,
+                        references,
+                        arm=trace.arm,
+                        release_id=release_id,
+                    )
+                elif trace.arm == "raw_history" and trace.release_id is None:
+                    expected = _parent_raw_source_contract(case, references)
+                elif trace.arm == "oracle" and trace.release_id is None:
+                    expected = _parent_oracle_source_contract(case, references)
+                else:
+                    raise WireProtocolError("closed_schema")
+                expected_sources[trace.execution_index] = expected
+    except WireProtocolError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise WireProtocolError("closed_schema") from error
+
+    identity_rows: list[tuple[int, int, str, str, str, str]] = []
+    logical_suffixes: list[str] = []
+    for trace in outcomes:
+        case = cases[trace.execution_index // len(_FAST_ARMS)]
+        arm = _FAST_ARMS[trace.execution_index % len(_FAST_ARMS)]
+        normalized = normalize_response(trace.response)
+        expected_response = _expected_fast_response(case, arm)
+        expected_source_kind = {
+            "raw_history": "raw_evidence",
+            "oracle": "oracle",
+        }.get(arm, "release")
+        expected_followed = any(
+            entry.key == case.target_key
+            and entry.value != MASKED_VALUE
+            and entry.value == normalized
+            for entry in trace.entries
+        )
+        query_sha256 = hashlib.sha256(_case_query_bytes(case)).hexdigest()
+        expected_scope = MemoryScope(
+            tenant_id="memory-eval",
+            namespace="scoped-codebook-v1",
+            subject_id=case.subject_id,
+        )
+        submitted = (
+            trace.submitted_prompt_sha256,
+            trace.submitted_prompt_context_start,
+            trace.submitted_prompt_context_end,
+            trace.submitted_prompt_context_sha256,
+            trace.submitted_input_token_ids_sha256,
+            trace.submitted_input_token_count,
+        )
+        _validate_replayed_source_contract(
+            trace,
+            expected_sources[trace.execution_index],
+        )
+        if (
+            trace.response != expected_response
+            or trace.normalized_response != normalized
+            or trace.expected_response != expected_response
+            or trace.utility != utility(normalized, current_value=case.current_value)
+            or trace.abstained != abstained(normalized)
+            or trace.followed_injected_value != expected_followed
+            or trace.source_kind != expected_source_kind
+            or trace.scope != expected_scope
+            or trace.capture_session_ids
+            != (
+                f"{case.case_id}-capture-old",
+                f"{case.case_id}-capture-new",
+                f"{case.case_id}-capture-control",
+            )
+            or trace.history_length != 0
+            or trace.query_sha256 != query_sha256
+            or trace.received_query_sha256 != query_sha256
+            or trace.received_context_sha256 != trace.rendered_context_sha256
+            or trace.received_context_utf8_bytes != trace.rendered_context_utf8_bytes
+            or trace.rendered_context_utf8_bytes < 0
+            or _SHA256_PATTERN.fullmatch(trace.rendered_context_sha256) is None
+            or trace.rendered_context_token_count is not None
+            or any(value is not None for value in submitted)
+        ):
+            raise WireProtocolError("closed_schema")
+        if not trace.future_session_id.startswith("future-session-") or not (
+            trace.future_run_id.startswith("future-run-")
+        ):
+            raise WireProtocolError("closed_schema")
+        session_suffix = trace.future_session_id.removeprefix("future-session-")
+        run_suffix = trace.future_run_id.removeprefix("future-run-")
+        if (
+            session_suffix != run_suffix
+            or _OPAQUE_TOKEN_PATTERN.fullmatch(session_suffix) is None
+        ):
+            raise WireProtocolError("closed_schema")
+        logical_suffixes.append(session_suffix)
+        identity_rows.append(
+            (
+                trace.capture_pid,
+                trace.future_pid,
+                trace.capture_process_instance_id,
+                trace.future_process_instance_id,
+                trace.future_session_id,
+                trace.future_run_id,
+            )
+        )
+    for probe in foreign_probes:
+        if not probe.future_session_id.startswith("future-session-") or not (
+            probe.future_run_id.startswith("future-run-")
+        ):
+            raise WireProtocolError("closed_schema")
+        session_suffix = probe.future_session_id.removeprefix("future-session-")
+        run_suffix = probe.future_run_id.removeprefix("future-run-")
+        if (
+            session_suffix != run_suffix
+            or _OPAQUE_TOKEN_PATTERN.fullmatch(session_suffix) is None
+        ):
+            raise WireProtocolError("closed_schema")
+        logical_suffixes.append(session_suffix)
+        identity_rows.append(
+            (
+                probe.capture_pid,
+                probe.future_pid,
+                probe.capture_process_instance_id,
+                probe.future_process_instance_id,
+                probe.future_session_id,
+                probe.future_run_id,
+            )
+        )
+    capture_pids = {row[0] for row in identity_rows}
+    future_pids = {row[1] for row in identity_rows}
+    capture_instances = {row[2] for row in identity_rows}
+    future_instances = {row[3] for row in identity_rows}
+    if (
+        len(identity_rows) != 56
+        or len(logical_suffixes) != len(set(logical_suffixes))
+        or len(capture_pids) != 1
+        or len(future_pids) != 1
+        or min(capture_pids) <= 0
+        or min(future_pids) <= 0
+        or len(capture_instances) != 1
+        or len(future_instances) != 1
+        or "" in capture_instances
+        or "" in future_instances
+        or any(not _is_canonical_uuid4(value) for value in capture_instances)
+        or any(not _is_canonical_uuid4(value) for value in future_instances)
+        or not capture_instances.isdisjoint(future_instances)
+    ):
+        raise WireProtocolError("closed_schema")
+
+
+def read_fast_profile_artifact(
+    artifact_path: str | os.PathLike[str],
+) -> ReplayedFastRun:
+    """Check 57-record semantic consistency without authenticating provenance."""
+
+    try:
+        encoded = Path(artifact_path).read_bytes().decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise WireProtocolError("framing") from error
+    parts = encoded.split("\n")
+    if len(parts) != 58 or parts[-1] != "":
+        raise WireProtocolError("framing")
+    lines = tuple(f"{part}\n" for part in parts[:-1])
+    records = tuple(wire_loads(line) for line in lines)
+    header = records[0]
+    outcomes = records[1:49]
+    foreign_probes = records[49:]
+    expected_header = ReplayHeader(
+        schema_version=SCHEMA_VERSION,
+        profile=FAST_PROFILE_NAME,
+        case_seed=CASE_SEED,
+        case_manifest_sha256s=tuple(
+            case_manifest_sha256(generate_case(case_index)) for case_index in range(8)
+        ),
+        outcome_count=48,
+        foreign_probe_count=8,
+    )
+    if (
+        type(header) is not ReplayHeader
+        or header != expected_header
+        or any(type(trace) is not EvaluationTrace for trace in outcomes)
+        or any(type(probe) is not LeakageSentinelTrace for probe in foreign_probes)
+    ):
+        raise WireProtocolError("closed_schema")
+    typed_outcomes = tuple(
+        trace for trace in outcomes if type(trace) is EvaluationTrace
+    )
+    typed_probes = tuple(
+        probe for probe in foreign_probes if type(probe) is LeakageSentinelTrace
+    )
+    cases = tuple(generate_case(case_index) for case_index in range(8))
+    if (
+        tuple(trace.execution_index for trace in typed_outcomes) != tuple(range(48))
+        or tuple(probe.execution_index for probe in typed_probes)
+        != tuple(range(48, 56))
+        or any(trace.schema_version != SCHEMA_VERSION for trace in typed_outcomes)
+        or any(probe.schema_version != SCHEMA_VERSION for probe in typed_probes)
+    ):
+        raise WireProtocolError("closed_schema")
+    for execution_index, trace in enumerate(typed_outcomes):
+        case = cases[execution_index // len(_FAST_ARMS)]
+        if (
+            trace.case_id != case.case_id
+            or trace.case_manifest_sha256
+            != expected_header.case_manifest_sha256s[case.case_index]
+            or trace.arm != _FAST_ARMS[execution_index % len(_FAST_ARMS)]
+        ):
+            raise WireProtocolError("closed_schema")
+    for case, probe in zip(cases, typed_probes, strict=True):
+        expected_local_scope = MemoryScope(
+            tenant_id="memory-eval",
+            namespace="scoped-codebook-v1",
+            subject_id=case.subject_id,
+        )
+        (
+            expected_foreign_scope,
+            expected_foreign_evidence_id,
+            _expected_foreign_revision_id,
+            expected_foreign_release_id,
+        ) = _parent_foreign_companion_contract(case)
+        if (
+            probe.case_id != case.case_id
+            or probe.case_manifest_sha256
+            != expected_header.case_manifest_sha256s[case.case_index]
+            or probe.requested_scope != expected_local_scope
+            or probe.companion_scope != expected_foreign_scope
+            or probe.foreign_release_id != expected_foreign_release_id
+            or probe.foreign_evidence_id != expected_foreign_evidence_id
+            or probe.reason != "foreign_scope"
+            or probe.history_length != 0
+        ):
+            raise WireProtocolError("closed_schema")
+    try:
+        _validate_replayed_fast_semantics(cases, typed_outcomes, typed_probes)
+        signatures = _build_strict_signatures(
+            cases,
+            typed_outcomes,
+        )
+    except ObservationValidationError as error:
+        raise WireProtocolError("closed_schema") from error
+    return ReplayedFastRun(
+        header=header,
+        outcomes=typed_outcomes,
+        foreign_probes=typed_probes,
+        signatures=signatures,
+    )
+
+
+def _finalize_fast_profile_execution(
+    execution: _FastProfileExecution,
+    *,
+    artifact_path: str | os.PathLike[str] | None,
+) -> FastProfileResult:
+    """Validate the complete batch before scoring or artifact construction."""
+
+    if type(execution) is not _FastProfileExecution:
+        raise ChildExecutionValidationError("replay_provenance")
+    capture = execution.capture_response
+    future = execution.future_response
+    _validate_child_process_response(capture, expected_pid=capture.pid)
+    _validate_child_process_response(future, expected_pid=future.pid)
+    if capture.process_instance_id == future.process_instance_id:
+        raise ChildExecutionValidationError("process_isolation")
+    bindings = execution.execution_bindings
+    logical_indexes = tuple(binding.logical_execution_index for binding in bindings)
+    opaque_indexes = tuple(binding.opaque_execution_index for binding in bindings)
+    if (
+        len(bindings) != 56
+        or any(type(binding) is not _FastExecutionBinding for binding in bindings)
+        or len(set(logical_indexes)) != 56
+        or set(logical_indexes) != set(range(56))
+        or len(set(opaque_indexes)) != 56
+        or any(not _is_opaque_execution_token(index) for index in opaque_indexes)
+        or not set(opaque_indexes).isdisjoint(range(56))
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    opaque_by_logical = {
+        binding.logical_execution_index: binding.opaque_execution_index
+        for binding in bindings
+    }
+    schedule_by_index = {item.execution_index: item for item in execution.schedule}
+    requests_by_index = {
+        item.execution_index: item for item in execution.future_request.items
+    }
+    expected_request_order = tuple(sorted(opaque_indexes))
+    if (
+        len(execution.schedule) != 48
+        or len(schedule_by_index) != 48
+        or set(schedule_by_index) != set(range(48))
+        or len(execution.future_request.items) != 56
+        or len(requests_by_index) != 56
+        or tuple(item.execution_index for item in execution.future_request.items)
+        != expected_request_order
+        or set(requests_by_index) != set(opaque_indexes)
+        or len({item.future_session_id for item in execution.future_request.items})
+        != 56
+        or len({item.future_run_id for item in execution.future_request.items}) != 56
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    for execution_token, request in requests_by_index.items():
+        expected_session_id, expected_run_id = _opaque_future_identity(execution_token)
+        if (
+            request.future_session_id != expected_session_id
+            or request.future_run_id != expected_run_id
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+
+    observations_by_index = {item.execution_index: item for item in future.observations}
+    probes_by_index = {probe.execution_index: probe for probe in future.foreign_probes}
+    receipt_by_index = {
+        receipt.execution_index: receipt for receipt in future.state_receipts
+    }
+    expected_observation_indexes = {opaque_by_logical[index] for index in range(48)}
+    expected_probe_indexes = {opaque_by_logical[index] for index in range(48, 56)}
+    all_indexes = tuple(observations_by_index) + tuple(probes_by_index)
+    if (
+        len(future.observations) != 48
+        or len(observations_by_index) != 48
+        or set(observations_by_index) != expected_observation_indexes
+        or len(future.foreign_probes) != 8
+        or len(probes_by_index) != 8
+        or set(probes_by_index) != expected_probe_indexes
+        or len(all_indexes) != 56
+        or len(set(all_indexes)) != 56
+        or len(future.state_receipts) != 56
+        or len(receipt_by_index) != 56
+        or set(receipt_by_index) != set(opaque_indexes)
+        or tuple(receipt.generation_index for receipt in future.state_receipts)
+        != tuple(range(56))
+        or tuple(receipt.execution_index for receipt in future.state_receipts)
+        != expected_request_order
+    ):
+        raise ObservationValidationError("execution_index_mismatch")
+
+    for logical_index, schedule in schedule_by_index.items():
+        execution_token = opaque_by_logical[logical_index]
+        observation = observations_by_index[execution_token]
+        request = requests_by_index[execution_token]
+        if (
+            observation.future_session_id != request.future_session_id
+            or observation.future_run_id != request.future_run_id
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        validate_future_child_response(
+            FutureChildResponse(
+                observation=observation,
+                pid=future.pid,
+                process_instance_id=future.process_instance_id,
+                isolated_mode=future.isolated_mode,
+                areal_module_path=future.areal_module_path,
+                visible_forbidden_environment=future.visible_forbidden_environment,
+                environment_clean=future.environment_clean,
+            ),
+            replace(schedule, execution_index=execution_token),
+        )
+
+    identity_fields = (
+        "store_instance_id",
+        "reader_instance_id",
+        "resolver_instance_id",
+        "renderer_instance_id",
+        "consumer_instance_id",
+        "audit_instance_id",
+        "logical_session_instance_id",
+        "history_instance_id",
+    )
+    for field_name in identity_fields:
+        identities = tuple(
+            getattr(receipt, field_name) for receipt in future.state_receipts
+        )
+        if len(set(identities)) != 56 or any(
+            _SHA256_PATTERN.fullmatch(value) is None for value in identities
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+    for execution_index, receipt in receipt_by_index.items():
+        request = requests_by_index[execution_index]
+        if (
+            receipt.logical_session_id != request.future_session_id
+            or receipt.logical_run_id != request.future_run_id
+            or receipt.history_length != 0
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+
+    capture_by_index = {item.case_index: item for item in capture.items}
+    if (
+        len(capture.items) != 8
+        or len(capture_by_index) != 8
+        or set(capture_by_index) != set(range(8))
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    for case in execution.cases:
+        _validate_parent_foreign_companion_contract(
+            case,
+            capture_by_index[case.case_index].references,
+        )
+    validated_probes: list[
+        tuple[CodebookCase, CaseDatabaseReferences, ForeignProbeObservation]
+    ] = []
+    for logical_index in range(48, 56):
+        case_index = logical_index - 48
+        case = execution.cases[case_index]
+        references = capture_by_index[case_index].references
+        execution_token = opaque_by_logical[logical_index]
+        probe = probes_by_index[execution_token]
+        request = requests_by_index[execution_token]
+        expected_session_id, expected_run_id = _opaque_future_identity(execution_token)
+        if (
+            probe.scope != references.capture.local_scope
+            or probe.release_id != references.releases.foreign_sentinel_release_id
+            or probe.reason != "release_not_found"
+            or probe.history_length != 0
+            or probe.future_pid != future.pid
+            or probe.future_process_instance_id != future.process_instance_id
+            or probe.future_session_id != expected_session_id
+            or probe.future_run_id != expected_run_id
+            or probe.future_session_id != request.future_session_id
+            or probe.future_run_id != request.future_run_id
+        ):
+            raise ChildExecutionValidationError("foreign_scope")
+        validated_probes.append((case, references, probe))
+
+    observations = tuple(
+        _join_fast_observation(
+            observations_by_index[opaque_by_logical[schedule.execution_index]],
+            schedule,
+            capture,
+        )
+        for schedule in execution.schedule
+    )
+    outcomes = parent_join_and_score(
+        observations,
+        execution.schedule,
+        enforce_scripted_outcomes=True,
+    )
+    signatures = _build_strict_signatures(execution.cases, outcomes)
+    leakage_traces = _build_leakage_traces(
+        tuple(validated_probes),
+        capture,
+        future,
+    )
+    result = FastProfileResult(
+        outcomes=outcomes,
+        foreign_probes=leakage_traces,
+        signatures=signatures,
+        state_receipts=tuple(
+            sorted(future.state_receipts, key=lambda receipt: receipt.generation_index)
+        ),
+    )
+    if artifact_path is not None:
+        _write_fast_profile_artifact(
+            artifact_path,
+            result.outcomes,
+            result.foreign_probes,
+        )
+    return result
+
+
+def run_fast_profile(
+    database_root: str | os.PathLike[str],
+    *,
+    artifact_path: str | os.PathLike[str] | None = None,
+    timeout_seconds: float = 120,
+) -> FastProfileResult:
+    execution = _execute_fast_profile_children(
+        database_root,
+        timeout_seconds=timeout_seconds,
+    )
+    return _finalize_fast_profile_execution(
+        execution,
+        artifact_path=artifact_path,
+    )
 
 
 def _write_child_response(response: object) -> None:
@@ -3911,13 +6139,19 @@ def _child_main() -> int:
         encoded = sys.stdin.buffer.read().decode("utf-8", errors="strict")
         request = wire_loads(encoded)
         if role == "capture-child":
-            if type(request) is not CaptureChildRequest:
+            if type(request) is CaptureBatchRequest:
+                response: object = execute_capture_batch_request(request)
+            elif type(request) is CaptureChildRequest:
+                response = execute_capture_child_request(request)
+            else:
                 raise WireProtocolError("closed_schema")
-            response: object = execute_capture_child_request(request)
         else:
-            if type(request) is not FutureChildRequest:
+            if type(request) is FutureBatchRequest:
+                response = execute_future_batch_request(request)
+            elif type(request) is FutureChildRequest:
+                response = execute_future_child_request(request)
+            else:
                 raise WireProtocolError("closed_schema")
-            response = execute_future_child_request(request)
         _write_child_response(response)
         return 0
     except ChildExecutionValidationError as error:
