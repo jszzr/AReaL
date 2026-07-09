@@ -55,6 +55,7 @@ _ENTRY_LINE_PATTERN = re.compile(
 _FACT_PATTERN = re.compile(
     rb"(?P<key>" + _KEY_PATTERN + rb") = (?P<value>" + _VALUE_PATTERN + rb")"
 )
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +252,128 @@ class ResolvedTreatment:
     entries: tuple[ResolvedEntry, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ModelCallReceipt:
+    """Hashes captured at the evaluator-owned local model-call boundary."""
+
+    submitted_prompt_sha256: str
+    submitted_prompt_context_start: int
+    submitted_prompt_context_end: int
+    submitted_prompt_context_sha256: str
+    submitted_input_token_ids_sha256: str
+    submitted_input_token_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionObservation:
+    """Child-side source and consumption facts without scorer-owned truth."""
+
+    execution_index: int
+    source_kind: str
+    scope: MemoryScope
+    capture_session_ids: tuple[str, str, str]
+    future_session_id: str
+    future_run_id: str
+    capture_pid: int
+    future_pid: int
+    capture_process_instance_id: str
+    future_process_instance_id: str
+    release_id: str | None
+    eligible_ids: tuple[str, ...]
+    retrieved_ids: tuple[str, ...]
+    returned_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[EntryReceipt, ...]
+    reader_audit: tuple[ReadAuditEvent, ...]
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+    rendered_context_token_count: int | None
+    consumer_input_receipt: ConsumerInputReceipt
+    model_call_receipt: ModelCallReceipt | None
+    query_sha256: str
+    history_length: int
+    response: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParentSourceContract:
+    """Parent-generated source/audit/render facts never supplied by the child."""
+
+    eligible_ids: tuple[str, ...]
+    retrieved_ids: tuple[str, ...]
+    returned_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[EntryReceipt, ...]
+    reader_audit: tuple[ReadAuditEvent, ...]
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParentScheduleItem:
+    """Private parent-owned case truth joined by opaque execution index."""
+
+    execution_index: int
+    case: CodebookCase
+    case_manifest_sha256: str
+    arm: str
+    source_kind: str
+    scope: MemoryScope
+    release_id: str | None
+    capture_session_ids: tuple[str, str, str]
+    query_sha256: str
+    expected_response: str
+    expected_source: ParentSourceContract
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationTrace:
+    """Parent-validated exposure plus scorer-owned case outcome."""
+
+    schema_version: int
+    case_id: str
+    case_manifest_sha256: str
+    execution_index: int
+    arm: str
+    source_kind: str
+    scope: MemoryScope
+    capture_session_ids: tuple[str, str, str]
+    future_session_id: str
+    future_run_id: str
+    capture_pid: int
+    future_pid: int
+    capture_process_instance_id: str
+    future_process_instance_id: str
+    release_id: str | None
+    eligible_revision_ids: tuple[str, ...]
+    retrieved_revision_ids: tuple[str, ...]
+    returned_revision_ids: tuple[str, ...]
+    injected_revision_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[EntryReceipt, ...]
+    reader_audit: tuple[ReadAuditEvent, ...]
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+    rendered_context_token_count: int | None
+    received_context_sha256: str
+    received_context_utf8_bytes: int
+    received_query_sha256: str
+    submitted_prompt_sha256: str | None
+    submitted_prompt_context_start: int | None
+    submitted_prompt_context_end: int | None
+    submitted_prompt_context_sha256: str | None
+    submitted_input_token_ids_sha256: str | None
+    submitted_input_token_count: int | None
+    query_sha256: str
+    history_length: int
+    response: str
+    normalized_response: str
+    expected_response: str
+    utility: int
+    abstained: bool
+    followed_injected_value: bool
+
+
 class CapabilityInterfaceError(AttributeError):
     """A resolver requested an operation absent from its sealed capability."""
 
@@ -261,6 +384,14 @@ class UnauthorizedReadError(PermissionError):
 
 class TreatmentValidationError(ValueError):
     """A stable pre-registered reason for rejecting source evidence."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ObservationValidationError(ValueError):
+    """A stable reason for rejecting exposure before parent scoring."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -1489,3 +1620,844 @@ def resolve_and_validate(
         audit_sink.snapshot(),
     )
     return treatment
+
+
+def make_model_call_receipt(
+    *,
+    submitted_prompt: bytes,
+    context_start: int,
+    context_end: int,
+    input_token_ids: tuple[int, ...],
+) -> ModelCallReceipt:
+    """Hash the exact prompt slice and compact integer token-ID sequence."""
+
+    if type(submitted_prompt) is not bytes:
+        raise TypeError("submitted_prompt must be bytes")
+    if type(context_start) is not int or type(context_end) is not int:
+        raise TypeError("context offsets must be integers")
+    if not 0 <= context_start <= context_end <= len(submitted_prompt):
+        raise ValueError("context offsets must select a submitted prompt slice")
+    if type(input_token_ids) is not tuple or any(
+        type(token_id) is not int for token_id in input_token_ids
+    ):
+        raise TypeError("input_token_ids must be a tuple of integers")
+    token_bytes = json.dumps(
+        list(input_token_ids),
+        separators=(",", ":"),
+    ).encode()
+    return ModelCallReceipt(
+        submitted_prompt_sha256=hashlib.sha256(submitted_prompt).hexdigest(),
+        submitted_prompt_context_start=context_start,
+        submitted_prompt_context_end=context_end,
+        submitted_prompt_context_sha256=hashlib.sha256(
+            submitted_prompt[context_start:context_end]
+        ).hexdigest(),
+        submitted_input_token_ids_sha256=hashlib.sha256(token_bytes).hexdigest(),
+        submitted_input_token_count=len(input_token_ids),
+    )
+
+
+def make_execution_observation(
+    *,
+    execution_index: int,
+    treatment: ResolvedTreatment,
+    reader_audit: tuple[ReadAuditEvent, ...],
+    rendered_context: RenderedContext,
+    query: bytes,
+    consumer_result: ConsumerResult,
+    model_call_receipt: ModelCallReceipt | None,
+    capture_session_ids: tuple[str, str, str],
+    future_session_id: str,
+    future_run_id: str,
+    capture_pid: int,
+    future_pid: int,
+    capture_process_instance_id: str,
+    future_process_instance_id: str,
+    history_length: int,
+) -> ExecutionObservation:
+    """Create a child-side observation without acknowledging or scoring exposure."""
+
+    return ExecutionObservation(
+        execution_index=execution_index,
+        source_kind=treatment.source_kind,
+        scope=treatment.scope,
+        capture_session_ids=capture_session_ids,
+        future_session_id=future_session_id,
+        future_run_id=future_run_id,
+        capture_pid=capture_pid,
+        future_pid=future_pid,
+        capture_process_instance_id=capture_process_instance_id,
+        future_process_instance_id=future_process_instance_id,
+        release_id=treatment.release_id,
+        eligible_ids=treatment.eligible_ids,
+        retrieved_ids=treatment.retrieved_ids,
+        returned_ids=treatment.returned_ids,
+        source_evidence_ids=treatment.source_evidence_ids,
+        entries=rendered_context.entry_receipts,
+        reader_audit=reader_audit,
+        rendered_context_sha256=hashlib.sha256(rendered_context.bytes).hexdigest(),
+        rendered_context_utf8_bytes=len(rendered_context.bytes),
+        rendered_context_token_count=None,
+        consumer_input_receipt=consumer_result.input_receipt,
+        model_call_receipt=model_call_receipt,
+        query_sha256=hashlib.sha256(query).hexdigest(),
+        history_length=history_length,
+        response=consumer_result.response,
+    )
+
+
+def _case_query_bytes(case: CodebookCase) -> bytes:
+    return (
+        f"What is the current code for {case.target_key}? "
+        "Reply with exactly the code or UNKNOWN."
+    ).encode()
+
+
+def _parent_slot_entries(
+    case: CodebookCase,
+    *,
+    target_value: str,
+) -> tuple[tuple[int, CodebookEntry], ...]:
+    shared = iter(case.shared_entries)
+    rows: list[tuple[int, CodebookEntry]] = []
+    for slot in range(5):
+        if slot == case.target_slot:
+            entry = CodebookEntry(case.target_key, target_value)
+        else:
+            entry = next(shared)
+        rows.append((slot, entry))
+    return tuple(rows)
+
+
+def _parent_capture_catalog(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+) -> dict[tuple[str, int], tuple[str, str, EvidenceEvent]]:
+    capture = references.capture
+    expected_base = datetime(2026, 7, 8, tzinfo=UTC) + timedelta(days=case.case_index)
+    if (
+        capture.local_scope
+        != MemoryScope("memory-eval", "scoped-codebook-v1", case.subject_id)
+        or capture.case_base != expected_base
+        or capture.raw_history_cutoff != expected_base + timedelta(seconds=90)
+        or capture.capture_session_ids
+        != (
+            f"{case.case_id}-capture-old",
+            f"{case.case_id}-capture-new",
+            f"{case.case_id}-capture-control",
+        )
+    ):
+        raise ValueError("capture references do not match parent case truth")
+
+    catalog: dict[tuple[str, int], tuple[str, str, EvidenceEvent]] = {}
+
+    def record(
+        role: str,
+        slot: int,
+        event: EvidenceEvent,
+        expected_id: str,
+    ) -> None:
+        content_hash = hashlib.sha256(event.canonical_bytes()).hexdigest()
+        evidence_id = f"evd_{content_hash[:24]}"
+        if evidence_id != expected_id:
+            raise ValueError("capture evidence address does not match parent truth")
+        catalog[(role, slot)] = (evidence_id, content_hash, event)
+
+    for slot, entry in _parent_slot_entries(case, target_value=case.old_value):
+        record(
+            "old",
+            slot,
+            EvidenceEvent(
+                scope=capture.local_scope,
+                session_id=f"{case.case_id}-capture-old",
+                run_id=f"{case.case_id}-run-old",
+                sequence_no=slot,
+                kind=EvidenceKind.USER_MESSAGE,
+                payload=f"{entry.key} = {entry.value}",
+                observed_at=expected_base + timedelta(seconds=slot),
+                idempotency_key=f"{case.case_id}-evidence-old-{slot:02d}",
+            ),
+            capture.old_evidence_ids[slot],
+        )
+    record(
+        "current",
+        case.target_slot,
+        EvidenceEvent(
+            scope=capture.local_scope,
+            session_id=f"{case.case_id}-capture-new",
+            run_id=f"{case.case_id}-run-new",
+            sequence_no=0,
+            kind=EvidenceKind.FEEDBACK,
+            payload=f"{case.target_key} = {case.current_value}",
+            observed_at=expected_base + timedelta(seconds=60),
+            idempotency_key=(f"{case.case_id}-evidence-new-{case.target_slot:02d}"),
+        ),
+        capture.current_evidence_id,
+    )
+    record(
+        "padding",
+        5,
+        EvidenceEvent(
+            scope=capture.local_scope,
+            session_id=f"{case.case_id}-capture-control",
+            run_id=f"{case.case_id}-run-control",
+            sequence_no=0,
+            kind=EvidenceKind.ENVIRONMENT,
+            payload=f"{case.padding_entry.key} = {case.padding_entry.value}",
+            observed_at=expected_base + timedelta(seconds=120),
+            idempotency_key=f"{case.case_id}-evidence-control-05",
+        ),
+        capture.control_evidence_ids[0],
+    )
+    record(
+        "masked",
+        case.target_slot,
+        EvidenceEvent(
+            scope=capture.local_scope,
+            session_id=f"{case.case_id}-capture-control",
+            run_id=f"{case.case_id}-run-control",
+            sequence_no=1,
+            kind=EvidenceKind.ENVIRONMENT,
+            payload=f"{case.target_key} = {case.masked_value}",
+            observed_at=expected_base + timedelta(seconds=121),
+            idempotency_key=(f"{case.case_id}-evidence-control-{case.target_slot:02d}"),
+        ),
+        capture.control_evidence_ids[1],
+    )
+    return catalog
+
+
+def _parent_graph_entry(
+    *,
+    case: CodebookCase,
+    scope: MemoryScope,
+    slot: int,
+    role: str,
+    content: str,
+    evidence_id: str,
+    expected_revision_id: str,
+    operation: RevisionOperation,
+    parent_revision_id: str | None,
+) -> tuple[ResolvedEntry, str, str]:
+    candidate_proposal = CandidateProposal(
+        scope=scope,
+        content=content,
+        evidence_ids=(evidence_id,),
+        idempotency_key=(f"{case.case_id}-candidate-local-{role}-{slot:02d}"),
+    )
+    candidate_hash = hashlib.sha256(candidate_proposal.canonical_bytes()).hexdigest()
+    candidate_id = f"cand_{candidate_hash[:24]}"
+    revision_proposal = RevisionProposal(
+        scope=scope,
+        candidate_id=candidate_id,
+        operation=operation,
+        parent_revision_id=parent_revision_id,
+        idempotency_key=(f"{case.case_id}-revision-local-{role}-{slot:02d}"),
+    )
+    revision_hash = hashlib.sha256(revision_proposal.canonical_bytes()).hexdigest()
+    revision_id = f"rev_{revision_hash[:24]}"
+    if revision_id != expected_revision_id:
+        raise ValueError("revision address does not match parent case truth")
+    parsed = parse_fact(content)
+    return (
+        ResolvedEntry(
+            slot=slot,
+            key=parsed.key,
+            value=parsed.value,
+            source_kind="release",
+            revision_id=revision_id,
+            candidate_id=candidate_id,
+            evidence_ids=(evidence_id,),
+        ),
+        revision_hash,
+        candidate_hash,
+    )
+
+
+def _parent_release_source_contract(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+    *,
+    arm: str,
+    release_id: str,
+) -> ParentSourceContract:
+    catalog = _parent_capture_catalog(case, references)
+    scope = references.capture.local_scope
+    revisions = references.revisions
+    rows: list[tuple[ResolvedEntry, str, str]] = []
+    if arm != "memory_off":
+        if arm == "current_release":
+            target_role = "target-current"
+            target_catalog_role = "current"
+            target_value = case.current_value
+            target_revision_id = revisions.target_current_revision_id
+            target_operation = RevisionOperation.SUPERSEDE
+            target_parent = revisions.target_old_revision_id
+        elif arm == "stale_release":
+            target_role = "target-old"
+            target_catalog_role = "old"
+            target_value = case.old_value
+            target_revision_id = revisions.target_old_revision_id
+            target_operation = RevisionOperation.ADD
+            target_parent = None
+        elif arm == "target_masked":
+            target_role = "target-masked"
+            target_catalog_role = "masked"
+            target_value = case.masked_value
+            target_revision_id = revisions.target_masked_revision_id
+            target_operation = RevisionOperation.ADD
+            target_parent = None
+        else:
+            raise ValueError("release arm is not frozen")
+        shared_revision_ids = iter(revisions.shared_revision_ids)
+        for slot, entry in _parent_slot_entries(case, target_value=target_value):
+            if slot == case.target_slot:
+                role = target_role
+                evidence_id = catalog[(target_catalog_role, slot)][0]
+                expected_revision_id = target_revision_id
+                operation = target_operation
+                parent_revision_id = target_parent
+            else:
+                role = "shared"
+                evidence_id = catalog[("old", slot)][0]
+                expected_revision_id = next(shared_revision_ids)
+                operation = RevisionOperation.ADD
+                parent_revision_id = None
+            rows.append(
+                _parent_graph_entry(
+                    case=case,
+                    scope=scope,
+                    slot=slot,
+                    role=role,
+                    content=f"{entry.key} = {entry.value}",
+                    evidence_id=evidence_id,
+                    expected_revision_id=expected_revision_id,
+                    operation=operation,
+                    parent_revision_id=parent_revision_id,
+                )
+            )
+        rows.append(
+            _parent_graph_entry(
+                case=case,
+                scope=scope,
+                slot=5,
+                role="padding",
+                content=f"{case.padding_entry.key} = {case.padding_entry.value}",
+                evidence_id=catalog[("padding", 5)][0],
+                expected_revision_id=revisions.padding_revision_id,
+                operation=RevisionOperation.ADD,
+                parent_revision_id=None,
+            )
+        )
+
+    revision_ids = tuple(row[0].revision_id for row in rows)
+    if any(revision_id is None for revision_id in revision_ids):
+        raise AssertionError("parent release rows require revision IDs")
+    typed_revision_ids = tuple(
+        revision_id for revision_id in revision_ids if revision_id is not None
+    )
+    manifest = ReleaseManifest(scope=scope, revision_ids=typed_revision_ids)
+    release_hash = hashlib.sha256(manifest.canonical_bytes()).hexdigest()
+    if f"rel_{release_hash[:24]}" != release_id:
+        raise ValueError("release address does not match parent case truth")
+    audit: list[ReadAuditEvent] = [
+        _allowed_audit_event(
+            operation="get_assigned_release",
+            scope=scope,
+            requested_ids=(release_id,),
+            returned_record_ids=(release_id,),
+            returned_content_hashes=(release_hash,),
+        )
+    ]
+    evidence_ids: list[str] = []
+    for entry, revision_hash, candidate_hash in rows:
+        assert entry.revision_id is not None
+        assert entry.candidate_id is not None
+        audit.extend(
+            (
+                _allowed_audit_event(
+                    operation="get_revision",
+                    scope=scope,
+                    requested_ids=(entry.revision_id,),
+                    returned_record_ids=(entry.revision_id,),
+                    returned_content_hashes=(revision_hash,),
+                ),
+                _allowed_audit_event(
+                    operation="get_candidate",
+                    scope=scope,
+                    requested_ids=(entry.candidate_id,),
+                    returned_record_ids=(entry.candidate_id,),
+                    returned_content_hashes=(candidate_hash,),
+                ),
+            )
+        )
+        evidence_ids.extend(entry.evidence_ids)
+    rendered = render_context(tuple(row[0] for row in rows))
+    return ParentSourceContract(
+        eligible_ids=typed_revision_ids,
+        retrieved_ids=typed_revision_ids,
+        returned_ids=typed_revision_ids,
+        source_evidence_ids=tuple(evidence_ids),
+        entries=rendered.entry_receipts,
+        reader_audit=tuple(audit),
+        rendered_context_sha256=hashlib.sha256(rendered.bytes).hexdigest(),
+        rendered_context_utf8_bytes=len(rendered.bytes),
+    )
+
+
+def _parent_raw_source_contract(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+) -> ParentSourceContract:
+    catalog = _parent_capture_catalog(case, references)
+    records = tuple(catalog[("old", slot)] for slot in range(5)) + (
+        catalog[("current", case.target_slot)],
+    )
+    entries: list[ResolvedEntry] = []
+    slots_by_key: dict[str, int] = {}
+    for evidence_id, _content_hash, event in records:
+        parsed = parse_fact(event.payload)
+        slot = slots_by_key.setdefault(parsed.key, event.sequence_no)
+        entries.append(
+            ResolvedEntry(
+                slot=slot,
+                key=parsed.key,
+                value=parsed.value,
+                source_kind="raw_evidence",
+                evidence_ids=(evidence_id,),
+            )
+        )
+    evidence_ids = tuple(record[0] for record in records)
+    audit = (
+        _allowed_audit_event(
+            operation="list_eligible_evidence",
+            scope=references.capture.local_scope,
+            requested_ids=(),
+            returned_record_ids=evidence_ids,
+            returned_content_hashes=tuple(record[1] for record in records),
+        ),
+    )
+    rendered = render_context(tuple(entries))
+    return ParentSourceContract(
+        eligible_ids=evidence_ids,
+        retrieved_ids=evidence_ids,
+        returned_ids=evidence_ids,
+        source_evidence_ids=evidence_ids,
+        entries=rendered.entry_receipts,
+        reader_audit=audit,
+        rendered_context_sha256=hashlib.sha256(rendered.bytes).hexdigest(),
+        rendered_context_utf8_bytes=len(rendered.bytes),
+    )
+
+
+def _parent_oracle_source_contract(
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+) -> ParentSourceContract:
+    entries = tuple(
+        ResolvedEntry(
+            slot=slot,
+            key=entry.key,
+            value=entry.value,
+            source_kind="oracle",
+        )
+        for slot, entry in _parent_slot_entries(
+            case,
+            target_value=case.current_value,
+        )
+    ) + (
+        ResolvedEntry(
+            slot=5,
+            key=case.padding_entry.key,
+            value=case.padding_entry.value,
+            source_kind="oracle",
+        ),
+    )
+    audit = (
+        _allowed_audit_event(
+            operation="entries",
+            scope=references.capture.local_scope,
+            requested_ids=(),
+            returned_record_ids=(),
+            returned_content_hashes=tuple(
+                _semantic_entry_hash(entry) for entry in entries
+            ),
+        ),
+    )
+    rendered = render_context(entries)
+    return ParentSourceContract(
+        eligible_ids=(),
+        retrieved_ids=(),
+        returned_ids=(),
+        source_evidence_ids=(),
+        entries=rendered.entry_receipts,
+        reader_audit=audit,
+        rendered_context_sha256=hashlib.sha256(rendered.bytes).hexdigest(),
+        rendered_context_utf8_bytes=len(rendered.bytes),
+    )
+
+
+def make_parent_schedule_item(
+    *,
+    execution_index: int,
+    case: CodebookCase,
+    references: CaseDatabaseReferences,
+    arm: str,
+) -> ParentScheduleItem:
+    """Create one private schedule row without exposing it to child execution."""
+
+    source_kind: str
+    release_id: str | None
+    expected_response: str
+    expected_source: ParentSourceContract
+    if arm == "current_release":
+        source_kind = "release"
+        release_id = references.releases.current_release_id
+        expected_response = case.current_value
+        expected_source = _parent_release_source_contract(
+            case,
+            references,
+            arm=arm,
+            release_id=release_id,
+        )
+    elif arm == "raw_history":
+        source_kind = "raw_evidence"
+        release_id = None
+        expected_response = case.current_value
+        expected_source = _parent_raw_source_contract(case, references)
+    elif arm == "memory_off":
+        source_kind = "release"
+        release_id = references.releases.empty_release_id
+        expected_response = UNKNOWN
+        expected_source = _parent_release_source_contract(
+            case,
+            references,
+            arm=arm,
+            release_id=release_id,
+        )
+    elif arm == "target_masked":
+        source_kind = "release"
+        release_id = references.releases.masked_release_id
+        expected_response = UNKNOWN
+        expected_source = _parent_release_source_contract(
+            case,
+            references,
+            arm=arm,
+            release_id=release_id,
+        )
+    elif arm == "stale_release":
+        source_kind = "release"
+        release_id = references.releases.stale_release_id
+        expected_response = case.old_value
+        expected_source = _parent_release_source_contract(
+            case,
+            references,
+            arm=arm,
+            release_id=release_id,
+        )
+    elif arm == "oracle":
+        source_kind = "oracle"
+        release_id = None
+        expected_response = case.current_value
+        expected_source = _parent_oracle_source_contract(case, references)
+    else:
+        raise ValueError("arm is not part of the frozen six-arm schedule")
+    return ParentScheduleItem(
+        execution_index=execution_index,
+        case=case,
+        case_manifest_sha256=case_manifest_sha256(case),
+        arm=arm,
+        source_kind=source_kind,
+        scope=references.capture.local_scope,
+        release_id=release_id,
+        capture_session_ids=references.capture.capture_session_ids,
+        query_sha256=hashlib.sha256(_case_query_bytes(case)).hexdigest(),
+        expected_response=expected_response,
+        expected_source=expected_source,
+    )
+
+
+def _validate_receipts_and_acknowledge(
+    observation: ExecutionObservation,
+    schedule: ParentScheduleItem,
+) -> tuple[str, ...]:
+    receipt = observation.consumer_input_receipt
+    if (
+        receipt.received_context_sha256 != observation.rendered_context_sha256
+        or receipt.received_context_utf8_bytes
+        != observation.rendered_context_utf8_bytes
+    ):
+        raise ObservationValidationError("received_context_mismatch")
+    if (
+        observation.query_sha256 != schedule.query_sha256
+        or receipt.received_query_sha256 != observation.query_sha256
+    ):
+        raise ObservationValidationError("received_query_mismatch")
+
+    model_receipt = observation.model_call_receipt
+    if model_receipt is not None:
+        if (
+            model_receipt.submitted_prompt_context_start < 0
+            or model_receipt.submitted_prompt_context_end
+            < model_receipt.submitted_prompt_context_start
+            or model_receipt.submitted_prompt_context_end
+            - model_receipt.submitted_prompt_context_start
+            != observation.rendered_context_utf8_bytes
+            or model_receipt.submitted_prompt_context_sha256
+            != observation.rendered_context_sha256
+        ):
+            raise ObservationValidationError("call_boundary_context_mismatch")
+        if (
+            _SHA256_PATTERN.fullmatch(model_receipt.submitted_prompt_sha256) is None
+            or _SHA256_PATTERN.fullmatch(model_receipt.submitted_prompt_context_sha256)
+            is None
+            or _SHA256_PATTERN.fullmatch(model_receipt.submitted_input_token_ids_sha256)
+            is None
+            or model_receipt.submitted_input_token_count < 0
+        ):
+            raise ObservationValidationError("call_boundary_token_mismatch")
+
+    last_end = 0
+    for entry in observation.entries:
+        if (
+            entry.rendered_start < last_end
+            or entry.rendered_start < 0
+            or entry.rendered_end <= entry.rendered_start
+            or entry.rendered_end > observation.rendered_context_utf8_bytes
+            or entry.content_sha256
+            != hashlib.sha256(f"{entry.key}\t{entry.value}".encode()).hexdigest()
+        ):
+            raise ObservationValidationError("injection_provenance_mismatch")
+        last_end = entry.rendered_end
+
+    if observation.source_kind == "release":
+        injected_revision_ids: list[str] = []
+        evidence_ids: list[str] = []
+        for entry in observation.entries:
+            if entry.revision_id is None or entry.candidate_id is None:
+                raise ObservationValidationError("injection_provenance_mismatch")
+            injected_revision_ids.append(entry.revision_id)
+            evidence_ids.extend(entry.evidence_ids)
+        if (
+            tuple(injected_revision_ids) != observation.returned_ids
+            or tuple(evidence_ids) != observation.source_evidence_ids
+        ):
+            raise ObservationValidationError("injection_provenance_mismatch")
+        return tuple(injected_revision_ids)
+    if observation.source_kind == "raw_evidence":
+        evidence_ids = []
+        for entry in observation.entries:
+            if (
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or not entry.evidence_ids
+            ):
+                raise ObservationValidationError("injection_provenance_mismatch")
+            evidence_ids.extend(entry.evidence_ids)
+        if (
+            tuple(evidence_ids) != observation.returned_ids
+            or tuple(evidence_ids) != observation.source_evidence_ids
+        ):
+            raise ObservationValidationError("injection_provenance_mismatch")
+        return ()
+    if observation.source_kind == "oracle":
+        if (
+            observation.returned_ids
+            or observation.source_evidence_ids
+            or any(
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or entry.evidence_ids
+                for entry in observation.entries
+            )
+        ):
+            raise ObservationValidationError("injection_provenance_mismatch")
+        return ()
+    raise ObservationValidationError("assignment_mismatch")
+
+
+def _validate_parent_source_contract(
+    observation: ExecutionObservation,
+    schedule: ParentScheduleItem,
+) -> None:
+    expected = schedule.expected_source
+    if observation.reader_audit != expected.reader_audit:
+        raise ObservationValidationError("source_or_audit_mismatch")
+    if (
+        observation.eligible_ids != expected.eligible_ids
+        or observation.retrieved_ids != expected.retrieved_ids
+        or observation.returned_ids != expected.returned_ids
+        or observation.source_evidence_ids != expected.source_evidence_ids
+    ):
+        raise ObservationValidationError("provenance_mismatch")
+    if observation.entries != expected.entries:
+        raise ObservationValidationError("injection_provenance_mismatch")
+    if (
+        observation.rendered_context_sha256 != expected.rendered_context_sha256
+        or observation.rendered_context_utf8_bytes
+        != expected.rendered_context_utf8_bytes
+    ):
+        raise ObservationValidationError("received_context_mismatch")
+
+
+def _trace_from_observation(
+    observation: ExecutionObservation,
+    schedule: ParentScheduleItem,
+    *,
+    injected_revision_ids: tuple[str, ...],
+    normalized_response: str,
+) -> EvaluationTrace:
+    model = observation.model_call_receipt
+    release_ids = (
+        observation.eligible_ids if observation.source_kind == "release" else ()
+    )
+    retrieved_ids = (
+        observation.retrieved_ids if observation.source_kind == "release" else ()
+    )
+    returned_ids = (
+        observation.returned_ids if observation.source_kind == "release" else ()
+    )
+    followed = any(
+        entry.key == schedule.case.target_key
+        and entry.value != MASKED_VALUE
+        and entry.value == normalized_response
+        for entry in observation.entries
+    )
+    return EvaluationTrace(
+        schema_version=SCHEMA_VERSION,
+        case_id=schedule.case.case_id,
+        case_manifest_sha256=schedule.case_manifest_sha256,
+        execution_index=observation.execution_index,
+        arm=schedule.arm,
+        source_kind=observation.source_kind,
+        scope=observation.scope,
+        capture_session_ids=observation.capture_session_ids,
+        future_session_id=observation.future_session_id,
+        future_run_id=observation.future_run_id,
+        capture_pid=observation.capture_pid,
+        future_pid=observation.future_pid,
+        capture_process_instance_id=observation.capture_process_instance_id,
+        future_process_instance_id=observation.future_process_instance_id,
+        release_id=observation.release_id,
+        eligible_revision_ids=release_ids,
+        retrieved_revision_ids=retrieved_ids,
+        returned_revision_ids=returned_ids,
+        injected_revision_ids=injected_revision_ids,
+        source_evidence_ids=observation.source_evidence_ids,
+        entries=observation.entries,
+        reader_audit=observation.reader_audit,
+        rendered_context_sha256=observation.rendered_context_sha256,
+        rendered_context_utf8_bytes=observation.rendered_context_utf8_bytes,
+        rendered_context_token_count=observation.rendered_context_token_count,
+        received_context_sha256=(
+            observation.consumer_input_receipt.received_context_sha256
+        ),
+        received_context_utf8_bytes=(
+            observation.consumer_input_receipt.received_context_utf8_bytes
+        ),
+        received_query_sha256=(
+            observation.consumer_input_receipt.received_query_sha256
+        ),
+        submitted_prompt_sha256=(
+            None if model is None else model.submitted_prompt_sha256
+        ),
+        submitted_prompt_context_start=(
+            None if model is None else model.submitted_prompt_context_start
+        ),
+        submitted_prompt_context_end=(
+            None if model is None else model.submitted_prompt_context_end
+        ),
+        submitted_prompt_context_sha256=(
+            None if model is None else model.submitted_prompt_context_sha256
+        ),
+        submitted_input_token_ids_sha256=(
+            None if model is None else model.submitted_input_token_ids_sha256
+        ),
+        submitted_input_token_count=(
+            None if model is None else model.submitted_input_token_count
+        ),
+        query_sha256=observation.query_sha256,
+        history_length=observation.history_length,
+        response=observation.response,
+        normalized_response=normalized_response,
+        expected_response=schedule.expected_response,
+        utility=utility(
+            normalized_response,
+            current_value=schedule.case.current_value,
+        ),
+        abstained=abstained(normalized_response),
+        followed_injected_value=followed,
+    )
+
+
+def parent_join_and_score(
+    observations: tuple[ExecutionObservation, ...],
+    schedule: tuple[ParentScheduleItem, ...],
+    *,
+    enforce_scripted_outcomes: bool,
+) -> tuple[EvaluationTrace, ...]:
+    """Validate exposure, privately join case truth, then normalize and score."""
+
+    expected_indexes = tuple(item.execution_index for item in schedule)
+    observed_indexes = tuple(item.execution_index for item in observations)
+    if (
+        len(set(expected_indexes)) != len(expected_indexes)
+        or len(set(observed_indexes)) != len(observed_indexes)
+        or set(observed_indexes) != set(expected_indexes)
+    ):
+        raise ObservationValidationError("execution_index_mismatch")
+    observations_by_index = {
+        observation.execution_index: observation for observation in observations
+    }
+    acknowledged: list[
+        tuple[ExecutionObservation, ParentScheduleItem, tuple[str, ...]]
+    ] = []
+    for scheduled in schedule:
+        observation = observations_by_index[scheduled.execution_index]
+        if (
+            observation.source_kind != scheduled.source_kind
+            or observation.scope != scheduled.scope
+            or observation.release_id != scheduled.release_id
+            or observation.capture_session_ids != scheduled.capture_session_ids
+        ):
+            raise ObservationValidationError("assignment_mismatch")
+        _validate_parent_source_contract(observation, scheduled)
+        injected_revision_ids = _validate_receipts_and_acknowledge(
+            observation,
+            scheduled,
+        )
+        acknowledged.append((observation, scheduled, injected_revision_ids))
+
+    normalized_rows: list[
+        tuple[
+            ExecutionObservation,
+            ParentScheduleItem,
+            tuple[str, ...],
+            str,
+        ]
+    ] = []
+    for observation, scheduled, injected_revision_ids in acknowledged:
+        normalized = normalize_response(observation.response)
+        if enforce_scripted_outcomes and normalized != scheduled.expected_response:
+            reason = (
+                "raw_order_failure"
+                if scheduled.arm == "raw_history"
+                and normalized == scheduled.case.old_value
+                else "strict_outcome_failure"
+            )
+            raise ObservationValidationError(reason)
+        normalized_rows.append(
+            (observation, scheduled, injected_revision_ids, normalized)
+        )
+
+    traces: list[EvaluationTrace] = []
+    for observation, scheduled, injected_revision_ids, normalized in normalized_rows:
+        traces.append(
+            _trace_from_observation(
+                observation,
+                scheduled,
+                injected_revision_ids=injected_revision_ids,
+                normalized_response=normalized,
+            )
+        )
+    return tuple(traces)

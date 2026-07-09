@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from collections import Counter
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -1586,3 +1586,632 @@ def test_source_mutants_fail_for_pre_registered_reason(
             audit_sink=audit,
         )
     assert error.value.reason == reason
+
+
+def _task5_bundle(tmp_path: Path, *, arm: str, execution_index: int = 0):
+    case, path, references, store = _build_case_graph(tmp_path)
+    audit = helpfulness.ReadAuditSink()
+    if arm == "raw_history":
+        assignment = helpfulness.RawSourceAssignment(
+            scope=references.capture.local_scope,
+            cutoff=references.capture.raw_history_cutoff,
+        )
+        capability = helpfulness.RawEvidenceReadCapability(store, assignment, audit)
+    elif arm == "oracle":
+        assignment = helpfulness.OracleSourceAssignment(
+            scope=references.capture.local_scope,
+            entries=_case_entries(
+                case,
+                target_value=case.current_value,
+                source_kind="oracle",
+            ),
+        )
+        capability = helpfulness.OracleEntryCapability(assignment, audit)
+    else:
+        release_id = {
+            "current_release": references.releases.current_release_id,
+            "memory_off": references.releases.empty_release_id,
+            "target_masked": references.releases.masked_release_id,
+            "stale_release": references.releases.stale_release_id,
+        }[arm]
+        assignment = helpfulness.ReleaseSourceAssignment(
+            scope=references.capture.local_scope,
+            release_id=release_id,
+        )
+        capability = helpfulness.ReleaseReadCapability(store, assignment, audit)
+    treatment = helpfulness.resolve_treatment(capability)
+    helpfulness.validate_resolved_treatment(
+        path,
+        assignment,
+        treatment,
+        audit.snapshot(),
+    )
+    rendered = helpfulness.render_context(treatment.entries)
+    query = _query(case)
+    consumer_result = helpfulness.consume_scripted(query, rendered.bytes)
+    observation = helpfulness.make_execution_observation(
+        execution_index=execution_index,
+        treatment=treatment,
+        reader_audit=audit.snapshot(),
+        rendered_context=rendered,
+        query=query,
+        consumer_result=consumer_result,
+        model_call_receipt=None,
+        capture_session_ids=references.capture.capture_session_ids,
+        future_session_id=f"{case.case_id}-future-session-{execution_index:03d}",
+        future_run_id=f"{case.case_id}-future-run-{execution_index:03d}",
+        capture_pid=101,
+        future_pid=202,
+        capture_process_instance_id="capture-instance",
+        future_process_instance_id="future-instance",
+        history_length=0,
+    )
+    schedule = helpfulness.make_parent_schedule_item(
+        execution_index=execution_index,
+        case=case,
+        references=references,
+        arm=arm,
+    )
+    return {
+        "case": case,
+        "path": path,
+        "references": references,
+        "assignment": assignment,
+        "audit": audit.snapshot(),
+        "treatment": treatment,
+        "rendered": rendered,
+        "query": query,
+        "consumer_result": consumer_result,
+        "observation": observation,
+        "schedule": schedule,
+    }
+
+
+def _observation_with_rendered(bundle, rendered, consumer_result, *, model=None):
+    original = bundle["observation"]
+    return helpfulness.make_execution_observation(
+        execution_index=original.execution_index,
+        treatment=bundle["treatment"],
+        reader_audit=bundle["audit"],
+        rendered_context=rendered,
+        query=bundle["query"],
+        consumer_result=consumer_result,
+        model_call_receipt=model,
+        capture_session_ids=original.capture_session_ids,
+        future_session_id=original.future_session_id,
+        future_run_id=original.future_run_id,
+        capture_pid=original.capture_pid,
+        future_pid=original.future_pid,
+        capture_process_instance_id=original.capture_process_instance_id,
+        future_process_instance_id=original.future_process_instance_id,
+        history_length=original.history_length,
+    )
+
+
+def test_ids_are_not_injected_before_consumer_receipt_matches(tmp_path: Path) -> None:
+    bundle = _task5_bundle(tmp_path, arm="current_release")
+    observation = bundle["observation"]
+
+    observation_fields = {field.name for field in fields(observation)}
+    assert "injected_ids" not in observation_fields
+    assert "injected_revision_ids" not in observation_fields
+
+    (trace,) = helpfulness.parent_join_and_score(
+        (observation,),
+        (bundle["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+    assert trace.injected_revision_ids == observation.returned_ids
+
+
+@pytest.mark.parametrize(
+    ("receipt_field", "reason"),
+    (
+        ("received_context_sha256", "received_context_mismatch"),
+        ("received_context_utf8_bytes", "received_context_mismatch"),
+        ("received_query_sha256", "received_query_mismatch"),
+    ),
+)
+def test_context_or_query_receipt_mismatch_invalidates_before_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_field: str,
+    reason: str,
+) -> None:
+    bundle = _task5_bundle(tmp_path, arm="current_release")
+    observation = bundle["observation"]
+    receipt = observation.consumer_input_receipt
+    wrong_value = (
+        receipt.received_context_utf8_bytes + 1
+        if receipt_field == "received_context_utf8_bytes"
+        else "0" * 64
+    )
+    wrong_observation = replace(
+        observation,
+        consumer_input_receipt=replace(receipt, **{receipt_field: wrong_value}),
+    )
+
+    def scoring_must_not_run(_response: str) -> str:
+        raise AssertionError("normalization ran before receipt validation")
+
+    monkeypatch.setattr(helpfulness, "normalize_response", scoring_must_not_run)
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (wrong_observation,),
+            (bundle["schedule"],),
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == reason
+
+
+def test_model_call_receipt_binds_exact_memory_slice_and_token_ids(
+    tmp_path: Path,
+) -> None:
+    bundle = _task5_bundle(tmp_path, arm="current_release")
+    rendered = bundle["rendered"]
+    prefix = b"system\n"
+    suffix = b"\nuser"
+    prompt = prefix + rendered.bytes + suffix
+    token_ids = (101, 202, 303)
+    receipt = helpfulness.make_model_call_receipt(
+        submitted_prompt=prompt,
+        context_start=len(prefix),
+        context_end=len(prefix) + len(rendered.bytes),
+        input_token_ids=token_ids,
+    )
+
+    assert receipt.submitted_prompt_sha256 == sha256(prompt).hexdigest()
+    assert receipt.submitted_prompt_context_sha256 == sha256(rendered.bytes).hexdigest()
+    assert (
+        receipt.submitted_input_token_ids_sha256 == sha256(b"[101,202,303]").hexdigest()
+    )
+    assert receipt.submitted_input_token_count == 3
+    observation = replace(bundle["observation"], model_call_receipt=receipt)
+    (trace,) = helpfulness.parent_join_and_score(
+        (observation,),
+        (bundle["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+    assert trace.submitted_prompt_sha256 == receipt.submitted_prompt_sha256
+    assert trace.submitted_prompt_context_start == len(prefix)
+    assert trace.submitted_prompt_context_end == len(prefix) + len(rendered.bytes)
+    assert (
+        trace.submitted_input_token_ids_sha256
+        == receipt.submitted_input_token_ids_sha256
+    )
+
+    invalid_receipt = replace(
+        receipt,
+        submitted_input_token_ids_sha256="z" * 64,
+    )
+    invalid_observation = replace(
+        bundle["observation"],
+        model_call_receipt=invalid_receipt,
+    )
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (invalid_observation,),
+            (bundle["schedule"],),
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == "call_boundary_token_mismatch"
+
+
+def test_child_observation_has_no_arm_expected_response_or_utility(
+    tmp_path: Path,
+) -> None:
+    observation = _task5_bundle(tmp_path, arm="current_release")["observation"]
+    names = {field.name for field in fields(observation)}
+
+    assert names.isdisjoint(
+        {
+            "arm",
+            "case_id",
+            "expected_response",
+            "normalized_response",
+            "utility",
+            "abstained",
+            "followed_injected_value",
+            "injected_revision_ids",
+        }
+    )
+
+
+def test_parent_rejects_missing_duplicate_or_swapped_execution_indexes(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    current = _task5_bundle(first_dir, arm="current_release", execution_index=0)
+    stale = _task5_bundle(second_dir, arm="stale_release", execution_index=1)
+    observations = (current["observation"], stale["observation"])
+    schedule = (current["schedule"], stale["schedule"])
+
+    assert (
+        len(
+            helpfulness.parent_join_and_score(
+                observations,
+                schedule,
+                enforce_scripted_outcomes=True,
+            )
+        )
+        == 2
+    )
+    invalid = (
+        ((observations[0],), "execution_index_mismatch"),
+        ((observations[0], observations[0]), "execution_index_mismatch"),
+        (
+            (*observations, replace(observations[0], execution_index=99)),
+            "execution_index_mismatch",
+        ),
+        (
+            (
+                replace(observations[0], execution_index=1),
+                replace(observations[1], execution_index=0),
+            ),
+            "assignment_mismatch",
+        ),
+        (
+            (replace(observations[0], source_kind="raw_evidence"), observations[1]),
+            "assignment_mismatch",
+        ),
+        (
+            (
+                replace(
+                    observations[0],
+                    release_id=observations[1].release_id,
+                ),
+                observations[1],
+            ),
+            "assignment_mismatch",
+        ),
+    )
+    for candidate_observations, reason in invalid:
+        with pytest.raises(helpfulness.ObservationValidationError) as error:
+            helpfulness.parent_join_and_score(
+                candidate_observations,
+                schedule,
+                enforce_scripted_outcomes=False,
+            )
+        assert error.value.reason == reason
+
+
+def test_parent_validates_entire_batch_before_any_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = _task5_bundle(first_dir, arm="current_release", execution_index=0)
+    second = _task5_bundle(second_dir, arm="stale_release", execution_index=1)
+    second_observation = second["observation"]
+    invalid_second = replace(
+        second_observation,
+        consumer_input_receipt=replace(
+            second_observation.consumer_input_receipt,
+            received_context_sha256="0" * 64,
+        ),
+    )
+
+    def normalization_must_not_run(_response: str) -> str:
+        raise AssertionError("normalization ran before whole-batch validity")
+
+    monkeypatch.setattr(helpfulness, "normalize_response", normalization_must_not_run)
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (first["observation"], invalid_second),
+            (first["schedule"], second["schedule"]),
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == "received_context_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("audit_order", "source_or_audit_mismatch"),
+        ("audit_hash", "source_or_audit_mismatch"),
+        ("returned_ids", "provenance_mismatch"),
+        ("source_evidence", "provenance_mismatch"),
+        ("entry_same_context", "injection_provenance_mismatch"),
+    ),
+)
+def test_parent_independently_rejects_same_length_forged_source_contracts(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    bundle = _task5_bundle(tmp_path, arm="current_release")
+    observation = bundle["observation"]
+    if mutation == "audit_order":
+        audit = observation.reader_audit
+        observation = replace(
+            observation,
+            reader_audit=(audit[0], audit[2], audit[1], *audit[3:]),
+        )
+    elif mutation == "audit_hash":
+        audit = observation.reader_audit
+        observation = replace(
+            observation,
+            reader_audit=(
+                audit[0],
+                replace(audit[1], returned_content_hashes=("0" * 64,)),
+                *audit[2:],
+            ),
+        )
+    elif mutation == "returned_ids":
+        observation = replace(
+            observation,
+            returned_ids=(
+                observation.returned_ids[1],
+                observation.returned_ids[0],
+                *observation.returned_ids[2:],
+            ),
+        )
+    elif mutation == "source_evidence":
+        observation = replace(
+            observation,
+            source_evidence_ids=(
+                observation.source_evidence_ids[1],
+                observation.source_evidence_ids[0],
+                *observation.source_evidence_ids[2:],
+            ),
+        )
+    else:
+        first = observation.entries[0]
+        forged_value = bundle["case"].old_value
+        forged = replace(
+            first,
+            value=forged_value,
+            content_sha256=sha256(f"{first.key}\t{forged_value}".encode()).hexdigest(),
+        )
+        observation = replace(
+            observation,
+            entries=(forged, *observation.entries[1:]),
+        )
+
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (observation,),
+            (bundle["schedule"],),
+            enforce_scripted_outcomes=False,
+        )
+    assert error.value.reason == reason
+
+
+def test_parent_adds_normalization_expected_response_and_utility_after_join(
+    tmp_path: Path,
+) -> None:
+    bundle = _task5_bundle(tmp_path, arm="current_release")
+    observation = replace(
+        bundle["observation"],
+        response=f"  {bundle['case'].current_value.lower()}  ",
+    )
+
+    (trace,) = helpfulness.parent_join_and_score(
+        (observation,),
+        (bundle["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+
+    assert trace.arm == "current_release"
+    assert trace.expected_response == bundle["case"].current_value
+    assert trace.normalized_response == bundle["case"].current_value
+    assert trace.utility == 1
+    assert trace.abstained is False
+
+
+def test_followed_injected_value_requires_acknowledged_target_entry(
+    tmp_path: Path,
+) -> None:
+    current_dir = tmp_path / "current"
+    masked_dir = tmp_path / "masked"
+    current_dir.mkdir()
+    masked_dir.mkdir()
+    current = _task5_bundle(current_dir, arm="current_release")
+    masked = _task5_bundle(masked_dir, arm="target_masked")
+
+    (current_trace,) = helpfulness.parent_join_and_score(
+        (current["observation"],),
+        (current["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+    (masked_trace,) = helpfulness.parent_join_and_score(
+        (masked["observation"],),
+        (masked["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+    shared_value = next(
+        entry.value
+        for entry in current["treatment"].entries
+        if entry.key != current["case"].target_key
+    )
+    shared_observation = replace(current["observation"], response=shared_value)
+    (shared_trace,) = helpfulness.parent_join_and_score(
+        (shared_observation,),
+        (current["schedule"],),
+        enforce_scripted_outcomes=False,
+    )
+
+    assert current_trace.followed_injected_value is True
+    assert masked_trace.followed_injected_value is False
+    assert shared_trace.followed_injected_value is False
+
+
+@pytest.mark.parametrize(
+    ("mutant", "reason"),
+    (
+        ("retrieved_equals_injected", "injection_provenance_mismatch"),
+        ("drop_masked", "received_context_mismatch"),
+        ("swap_context", "call_boundary_context_mismatch"),
+        ("ignore_memory", "strict_outcome_failure"),
+        ("first_occurrence_raw", "raw_order_failure"),
+    ),
+)
+def test_exposure_mutants_fail_for_pre_registered_reason(
+    tmp_path: Path,
+    mutant: str,
+    reason: str,
+) -> None:
+    arm = (
+        "target_masked"
+        if mutant == "drop_masked"
+        else "raw_history"
+        if mutant == "first_occurrence_raw"
+        else "current_release"
+    )
+    bundle = _task5_bundle(tmp_path, arm=arm)
+    observation = bundle["observation"]
+    if mutant == "retrieved_equals_injected":
+        rendered = helpfulness.render_context(bundle["treatment"].entries[:-1])
+        result = helpfulness.consume_scripted(bundle["query"], rendered.bytes)
+        observation = _observation_with_rendered(bundle, rendered, result)
+    elif mutant == "drop_masked":
+        rendered = helpfulness.render_context(
+            tuple(
+                entry
+                for entry in bundle["treatment"].entries
+                if entry.key != bundle["case"].target_key
+            )
+        )
+        result = helpfulness.consume_scripted(bundle["query"], rendered.bytes)
+        observation = replace(
+            observation,
+            consumer_input_receipt=result.input_receipt,
+            response=result.response,
+        )
+    elif mutant == "swap_context":
+        rendered = bundle["rendered"]
+        swapped = b"X" * len(rendered.bytes)
+        prefix = b"system\n"
+        receipt = helpfulness.make_model_call_receipt(
+            submitted_prompt=prefix + swapped,
+            context_start=len(prefix),
+            context_end=len(prefix) + len(swapped),
+            input_token_ids=(7, 8, 9),
+        )
+        observation = replace(observation, model_call_receipt=receipt)
+    elif mutant == "ignore_memory":
+        observation = replace(observation, response="UNKNOWN")
+    else:
+        observation = replace(observation, response=bundle["case"].old_value)
+
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (observation,),
+            (bundle["schedule"],),
+            enforce_scripted_outcomes=True,
+        )
+    assert error.value.reason == reason
+
+
+@pytest.mark.parametrize(
+    (
+        "arm",
+        "expected_source_kind",
+        "expected_utility",
+        "expected_followed",
+    ),
+    (
+        ("current_release", "release", 1, True),
+        ("raw_history", "raw_evidence", 1, True),
+        ("memory_off", "release", 0, False),
+        ("target_masked", "release", 0, False),
+        ("stale_release", "release", -1, True),
+        ("oracle", "oracle", 1, True),
+    ),
+)
+def test_case_derived_six_arm_happy_paths_are_exact(
+    tmp_path: Path,
+    arm: str,
+    expected_source_kind: str,
+    expected_utility: int,
+    expected_followed: bool,
+) -> None:
+    bundle = _task5_bundle(tmp_path, arm=arm)
+    case = bundle["case"]
+    references = bundle["references"]
+    target_revision_id = {
+        "current_release": references.revisions.target_current_revision_id,
+        "target_masked": references.revisions.target_masked_revision_id,
+        "stale_release": references.revisions.target_old_revision_id,
+    }.get(arm)
+    if target_revision_id is None:
+        expected_injected_revision_ids = ()
+    else:
+        shared = iter(references.revisions.shared_revision_ids)
+        expected_injected_revision_ids = tuple(
+            target_revision_id if slot == case.target_slot else next(shared)
+            for slot in range(5)
+        ) + (references.revisions.padding_revision_id,)
+    expected_release_id = {
+        "current_release": references.releases.current_release_id,
+        "raw_history": None,
+        "memory_off": references.releases.empty_release_id,
+        "target_masked": references.releases.masked_release_id,
+        "stale_release": references.releases.stale_release_id,
+        "oracle": None,
+    }[arm]
+    expected_response = {
+        "current_release": case.current_value,
+        "raw_history": case.current_value,
+        "memory_off": "UNKNOWN",
+        "target_masked": "UNKNOWN",
+        "stale_release": case.old_value,
+        "oracle": case.current_value,
+    }[arm]
+
+    (trace,) = helpfulness.parent_join_and_score(
+        (bundle["observation"],),
+        (bundle["schedule"],),
+        enforce_scripted_outcomes=True,
+    )
+
+    assert trace.source_kind == expected_source_kind
+    assert trace.release_id == expected_release_id
+    assert trace.expected_response == expected_response
+    assert trace.normalized_response == expected_response
+    assert trace.utility == expected_utility
+    assert trace.injected_revision_ids == expected_injected_revision_ids
+    assert trace.followed_injected_value is expected_followed
+    assert (
+        trace.submitted_prompt_sha256,
+        trace.submitted_prompt_context_start,
+        trace.submitted_prompt_context_end,
+        trace.submitted_prompt_context_sha256,
+        trace.submitted_input_token_ids_sha256,
+        trace.submitted_input_token_count,
+    ) == (None, None, None, None, None, None)
+
+
+def test_later_strict_failure_prevents_all_trace_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = _task5_bundle(first_dir, arm="current_release", execution_index=0)
+    second = _task5_bundle(second_dir, arm="stale_release", execution_index=1)
+    invalid_second = replace(second["observation"], response="UNKNOWN")
+
+    def trace_must_not_be_constructed(*_args, **_kwargs):
+        raise AssertionError("trace construction ran before all strict outcomes passed")
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_trace_from_observation",
+        trace_must_not_be_constructed,
+    )
+    with pytest.raises(helpfulness.ObservationValidationError) as error:
+        helpfulness.parent_join_and_score(
+            (first["observation"], invalid_second),
+            (first["schedule"], second["schedule"]),
+            enforce_scripted_outcomes=True,
+        )
+    assert error.value.reason == "strict_outcome_failure"
