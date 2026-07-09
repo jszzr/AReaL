@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
+import os
+import subprocess
+import sys
 from collections import Counter
 from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime, timedelta
@@ -1644,7 +1648,6 @@ def _task5_bundle(tmp_path: Path, *, arm: str, execution_index: int = 0):
         future_pid=202,
         capture_process_instance_id="capture-instance",
         future_process_instance_id="future-instance",
-        history_length=0,
     )
     schedule = helpfulness.make_parent_schedule_item(
         execution_index=execution_index,
@@ -1684,7 +1687,6 @@ def _observation_with_rendered(bundle, rendered, consumer_result, *, model=None)
         future_pid=original.future_pid,
         capture_process_instance_id=original.capture_process_instance_id,
         future_process_instance_id=original.future_process_instance_id,
-        history_length=original.history_length,
     )
 
 
@@ -2215,3 +2217,730 @@ def test_later_strict_failure_prevents_all_trace_construction(
             enforce_scripted_outcomes=True,
         )
     assert error.value.reason == "strict_outcome_failure"
+
+
+def _wire_future_setup(tmp_path: Path):
+    case, database_path, references, _store = _build_case_graph(tmp_path)
+    source = helpfulness.WireSourceSpec(
+        source_kind="release",
+        release_id=references.releases.current_release_id,
+        cutoff=None,
+        allowed_evidence_kinds=(),
+        oracle_entries=(),
+    )
+    request = helpfulness.FutureChildRequest(
+        execution_index=0,
+        database_path=str(database_path),
+        scope=references.capture.local_scope,
+        source=source,
+        query=_query(case).decode(),
+        future_session_id=f"{case.case_id}-future-session-000",
+        future_run_id=f"{case.case_id}-future-run-000",
+        renderer_version="memory-codebook/v1",
+        consumer_version="scripted-last-occurrence/v1",
+    )
+    schedule = helpfulness.make_parent_schedule_item(
+        execution_index=0,
+        case=case,
+        references=references,
+        arm="current_release",
+    )
+    return case, references, request, schedule
+
+
+def test_wire_round_trip_is_compact_sorted_and_exact_typed() -> None:
+    request = helpfulness.FutureChildRequest(
+        execution_index=7,
+        database_path="/tmp/记忆.sqlite3",
+        scope=MemoryScope("tenant", "namespace", "subject"),
+        source=helpfulness.WireSourceSpec(
+            source_kind="raw_evidence",
+            release_id=None,
+            cutoff=datetime(2026, 7, 9, 1, 2, 3, tzinfo=UTC),
+            allowed_evidence_kinds=(
+                EvidenceKind.USER_MESSAGE,
+                EvidenceKind.FEEDBACK,
+            ),
+            oracle_entries=(),
+        ),
+        query="What is the current code for project-abcdef?",
+        future_session_id="future-session",
+        future_run_id="future-run",
+        renderer_version="memory-codebook/v1",
+        consumer_version="scripted-last-occurrence/v1",
+    )
+
+    encoded = helpfulness.wire_dumps(request)
+
+    assert encoded.endswith("\n")
+    assert encoded.count("\n") == 1
+    assert ": " not in encoded and ", " not in encoded
+    parsed = json.loads(encoded)
+    assert (
+        encoded
+        == json.dumps(
+            parsed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    decoded = helpfulness.wire_loads(encoded)
+    assert type(decoded) is helpfulness.FutureChildRequest
+    assert decoded == request
+    assert type(decoded.execution_index) is int
+    assert type(decoded.scope) is MemoryScope
+    assert type(decoded.source.cutoff) is datetime
+    assert type(decoded.source.allowed_evidence_kinds) is tuple
+    assert all(
+        type(kind) is EvidenceKind for kind in decoded.source.allowed_evidence_kinds
+    )
+    assert type(decoded.source.oracle_entries) is tuple
+
+
+def test_wire_rejects_unknown_missing_and_wrong_type_fields() -> None:
+    request = helpfulness.FutureChildRequest(
+        execution_index=7,
+        database_path="/tmp/memory.sqlite3",
+        scope=MemoryScope("tenant", "namespace", "subject"),
+        source=helpfulness.WireSourceSpec(
+            source_kind="raw_evidence",
+            release_id=None,
+            cutoff=datetime(2026, 7, 9, tzinfo=UTC),
+            allowed_evidence_kinds=(
+                EvidenceKind.USER_MESSAGE,
+                EvidenceKind.FEEDBACK,
+            ),
+            oracle_entries=(),
+        ),
+        query="query",
+        future_session_id="session",
+        future_run_id="run",
+        renderer_version="renderer",
+        consumer_version="consumer",
+    )
+    valid = json.loads(helpfulness.wire_dumps(request))
+    variants = []
+    unknown = json.loads(json.dumps(valid))
+    unknown["payload"]["expected_response"] = "SECRET"
+    variants.append(unknown)
+    missing = json.loads(json.dumps(valid))
+    del missing["payload"]["query"]
+    variants.append(missing)
+    bool_index = json.loads(json.dumps(valid))
+    bool_index["payload"]["execution_index"] = True
+    variants.append(bool_index)
+    wrong_scope = json.loads(json.dumps(valid))
+    wrong_scope["payload"]["scope"]["tenant_id"] = 3
+    variants.append(wrong_scope)
+    wrong_datetime = json.loads(json.dumps(valid))
+    wrong_datetime["payload"]["source"]["cutoff"] = "not-a-datetime"
+    variants.append(wrong_datetime)
+    wrong_enum = json.loads(json.dumps(valid))
+    wrong_enum["payload"]["source"]["allowed_evidence_kinds"] = ["made_up"]
+    variants.append(wrong_enum)
+    smuggled_release = json.loads(json.dumps(valid))
+    smuggled_release["payload"]["source"]["source_kind"] = "release"
+    smuggled_release["payload"]["source"]["release_id"] = "release-id"
+    variants.append(smuggled_release)
+
+    for value in variants:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        with pytest.raises(helpfulness.WireProtocolError) as error:
+            helpfulness.wire_loads(encoded)
+        assert error.value.reason == "closed_schema"
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    (
+        '{"payload":{},"payload":{},"schema_version":1,"type":"x"}\n',
+        '{"payload":{},"schema_version":NaN,"type":"x"}\n',
+        '{"payload":{},"schema_version":Infinity,"type":"x"}\n',
+        '{"payload":{},"schema_version":1,"type":"x"}\n\n',
+    ),
+)
+def test_wire_rejects_duplicate_keys_nonfinite_numbers_and_extra_framing(
+    encoded: str,
+) -> None:
+    with pytest.raises(helpfulness.WireProtocolError):
+        helpfulness.wire_loads(encoded)
+
+
+def test_wire_normalizes_deep_json_recursion() -> None:
+    depth = 10_000
+    encoded = (
+        '{"payload":'
+        + "[" * depth
+        + "0"
+        + "]" * depth
+        + ',"schema_version":1,"type":"capture_child_request"}\n'
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(encoded)
+    assert error.value.reason == "closed_schema"
+
+
+def test_wire_rejects_valid_but_noncanonical_json() -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path="/tmp/capture.sqlite3",
+    )
+    parsed = json.loads(helpfulness.wire_dumps(request))
+    noncanonical = json.dumps(parsed, ensure_ascii=True) + "\n"
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(noncanonical)
+    assert error.value.reason == "framing"
+
+
+def test_wire_rejects_wrong_fixed_tuple_lengths(tmp_path: Path) -> None:
+    _case, _path, references, _store = _build_case_graph(tmp_path)
+    response = helpfulness.CaptureChildResponse(
+        case_index=0,
+        references=references,
+        pid=123,
+        process_instance_id="00000000-0000-4000-8000-000000000000",
+        isolated_mode=True,
+        areal_module_path=str(
+            Path(helpfulness.__file__).resolve().parents[2] / "areal" / "__init__.py"
+        ),
+        visible_forbidden_environment=(),
+        environment_clean=True,
+    )
+    valid = json.loads(helpfulness.wire_dumps(response))
+    variants = []
+    short_sessions = json.loads(json.dumps(valid))
+    short_sessions["payload"]["references"]["capture"]["capture_session_ids"] = [
+        "one",
+        "two",
+    ]
+    variants.append(short_sessions)
+    short_controls = json.loads(json.dumps(valid))
+    short_controls["payload"]["references"]["capture"]["control_evidence_ids"] = ["one"]
+    variants.append(short_controls)
+
+    for value in variants:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        with pytest.raises(helpfulness.WireProtocolError) as error:
+            helpfulness.wire_loads(encoded)
+        assert error.value.reason == "closed_schema"
+
+
+def test_wire_normalizes_value_object_validation_failures() -> None:
+    request = helpfulness.FutureChildRequest(
+        execution_index=0,
+        database_path="/tmp/memory.sqlite3",
+        scope=MemoryScope("tenant", "namespace", "subject"),
+        source=helpfulness.WireSourceSpec(
+            source_kind="release",
+            release_id="release",
+            cutoff=None,
+            allowed_evidence_kinds=(),
+            oracle_entries=(),
+        ),
+        query="query",
+        future_session_id="session",
+        future_run_id="run",
+        renderer_version="renderer",
+        consumer_version="consumer",
+    )
+    value = json.loads(helpfulness.wire_dumps(request))
+    value["payload"]["scope"]["tenant_id"] = ""
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(encoded)
+    assert error.value.reason == "closed_schema"
+
+
+def test_wire_normalizes_datetime_overflow() -> None:
+    request = helpfulness.FutureChildRequest(
+        execution_index=0,
+        database_path="/tmp/memory.sqlite3",
+        scope=MemoryScope("tenant", "namespace", "subject"),
+        source=helpfulness.WireSourceSpec(
+            source_kind="raw_evidence",
+            release_id=None,
+            cutoff=datetime(2026, 7, 9, tzinfo=UTC),
+            allowed_evidence_kinds=(
+                EvidenceKind.USER_MESSAGE,
+                EvidenceKind.FEEDBACK,
+            ),
+            oracle_entries=(),
+        ),
+        query="query",
+        future_session_id="session",
+        future_run_id="run",
+        renderer_version="renderer",
+        consumer_version="consumer",
+    )
+    value = json.loads(helpfulness.wire_dumps(request))
+    value["payload"]["source"]["cutoff"] = "0001-01-01T00:00:00+14:00"
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(encoded)
+    assert error.value.reason == "closed_schema"
+
+    overflowing_request = replace(
+        request,
+        source=replace(
+            request.source,
+            cutoff=datetime.fromisoformat("0001-01-01T00:00:00+14:00"),
+        ),
+    )
+    with pytest.raises(helpfulness.WireProtocolError) as encode_error:
+        helpfulness.wire_dumps(overflowing_request)
+    assert encode_error.value.reason == "closed_schema"
+
+
+def test_scripted_consumer_receipts_actual_history_length() -> None:
+    case = helpfulness.generate_case(0)
+    rendered = helpfulness.render_context(
+        _case_entries(
+            case,
+            target_value=case.current_value,
+            source_kind="oracle",
+        )
+    )
+
+    result = helpfulness.consume_scripted(
+        _query(case),
+        rendered.bytes,
+        history=(b"capture-only prior turn",),
+    )
+
+    assert result.input_receipt.received_history_length == 1
+
+
+def test_future_wire_contains_no_capture_owned_metadata(tmp_path: Path) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+
+    assert {field.name for field in fields(request)}.isdisjoint(
+        {
+            "capture_pid",
+            "capture_process_instance_id",
+            "capture_session_ids",
+            "case_id",
+            "expected_response",
+        }
+    )
+    assert "capture_" not in helpfulness.wire_dumps(request)
+
+    response = helpfulness.run_isolated_child(
+        request,
+        role="future-child",
+        timeout_seconds=20,
+    )
+
+    assert {field.name for field in fields(response.observation)}.isdisjoint(
+        {
+            "capture_pid",
+            "capture_process_instance_id",
+            "capture_session_ids",
+            "case_id",
+            "expected_response",
+        }
+    )
+    assert "capture_" not in helpfulness.wire_dumps(response)
+
+
+def test_child_runs_with_isolated_flag_and_checkout_areal_import(
+    tmp_path: Path,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+
+    completed = helpfulness.run_isolated_child_raw(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+    response = helpfulness.wire_loads(completed.stdout)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.args == [
+        sys.executable,
+        "-I",
+        str(Path(helpfulness.__file__).resolve()),
+        "capture-child",
+    ]
+    assert response.isolated_mode is True
+    assert (
+        Path(response.areal_module_path)
+        .resolve()
+        .is_relative_to(Path(helpfulness.__file__).resolve().parents[2])
+    )
+    assert response.pid != os.getpid()
+    assert response.pid == completed.pid
+    assert response.process_instance_id != helpfulness.PROCESS_INSTANCE_ID
+
+
+def test_child_environment_drops_pythonpath_pythonhome_and_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "PYTHONPATH": "/tmp/injected",
+        "PYTHONHOME": "/tmp/fake-home",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "AZURE_OPENAI_API_KEY": "secret",
+        "GOOGLE_API_KEY": "secret",
+        "OPENAI_API_KEY": "secret",
+        "ANTHROPIC_API_KEY": "secret",
+        "HF_TOKEN": "secret",
+        "GITHUB_TOKEN": "secret",
+        "GH_TOKEN": "secret",
+        "AREAL_TASK6_UNKNOWN_CANARY": "must-not-cross-exec",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+
+    response = helpfulness.run_isolated_child(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+
+    assert response.visible_forbidden_environment == ()
+    assert response.environment_clean is True
+
+
+def test_child_stdout_contains_one_json_envelope(tmp_path: Path) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+
+    completed = helpfulness.run_isolated_child_raw(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.count("\n") == 1
+    assert completed.stdout.endswith("\n")
+    assert type(completed.stderr) is str
+    response = helpfulness.wire_loads(completed.stdout)
+    assert type(response) is helpfulness.CaptureChildResponse
+    assert completed.stdout == helpfulness.wire_dumps(response)
+
+
+def test_capture_launcher_rejects_forged_process_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+    completed = helpfulness.run_isolated_child_raw(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+    response = helpfulness.wire_loads(completed.stdout)
+    assert type(response) is helpfulness.CaptureChildResponse
+    mutants = (
+        replace(response, isolated_mode=False),
+        replace(
+            response,
+            visible_forbidden_environment=("OPENAI_API_KEY",),
+            environment_clean=False,
+        ),
+        replace(response, process_instance_id=""),
+        replace(response, process_instance_id="00000000-0000-0000-0000-000000000000"),
+        replace(response, areal_module_path="/tmp/foreign-checkout/areal/__init__.py"),
+    )
+
+    for mutant in mutants:
+        forged = replace(completed, stdout=helpfulness.wire_dumps(mutant))
+        monkeypatch.setattr(
+            helpfulness,
+            "run_isolated_child_raw",
+            lambda *_args, _forged=forged, **_kwargs: _forged,
+        )
+        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+            helpfulness.run_isolated_child(
+                request,
+                role="capture-child",
+                timeout_seconds=20,
+            )
+        assert error.value.reason == "process_isolation"
+
+
+def test_parent_rejects_nonzero_exit_even_with_valid_child_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+    completed = helpfulness.run_isolated_child_raw(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "run_isolated_child_raw",
+        lambda *_args, **_kwargs: replace(completed, returncode=9),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child(
+            request,
+            role="capture-child",
+            timeout_seconds=20,
+        )
+    assert error.value.reason == "child_nonzero_exit"
+
+
+def test_parent_rejects_extra_stdout_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+    completed = helpfulness.run_isolated_child_raw(
+        request,
+        role="capture-child",
+        timeout_seconds=20,
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "run_isolated_child_raw",
+        lambda *_args, **_kwargs: replace(
+            completed,
+            stdout=completed.stdout + "unexpected",
+        ),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child(
+            request,
+            role="capture-child",
+            timeout_seconds=20,
+        )
+    assert error.value.reason == "framing"
+
+
+def test_child_timeout_has_stable_protocol_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingProcess:
+        def __init__(self) -> None:
+            self.pid = 12345
+            self.returncode = -9
+            self.communicate_calls = 0
+            self.killed = False
+            self.reaped = False
+
+        def communicate(self, *, input=None, timeout=None):
+            self.communicate_calls += 1
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("child", timeout)
+            self.reaped = True
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = HangingProcess()
+    monkeypatch.setattr(
+        helpfulness.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    request = helpfulness.CaptureChildRequest(
+        case_index=0,
+        database_path=str(tmp_path / "capture.sqlite3"),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child_raw(
+            request,
+            role="capture-child",
+            timeout_seconds=0.01,
+        )
+    assert error.value.reason == "child_timeout"
+    assert process.communicate_calls == 2
+    assert process.killed is True
+    assert process.reaped is True
+
+
+def test_ground_truth_child_payload_is_rejected(tmp_path: Path) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    value = json.loads(helpfulness.wire_dumps(request))
+    value["payload"]["expected_response"] = "LEAKED-TRUTH"
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(encoded)
+    assert error.value.reason == "closed_schema"
+
+
+def test_missing_local_release_is_not_misclassified_as_foreign_scope(
+    tmp_path: Path,
+) -> None:
+    _case, _references, request, _schedule = _wire_future_setup(tmp_path)
+    missing = replace(
+        request,
+        source=replace(request.source, release_id="missing-local-release"),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.run_isolated_child(
+            missing,
+            role="future-child",
+            timeout_seconds=20,
+        )
+    assert error.value.reason == "child_nonzero_exit"
+
+
+@pytest.mark.parametrize(
+    ("mutant", "reason"),
+    (
+        ("in_process", "process_isolation"),
+        ("identity", "process_isolation"),
+        ("history", "history_nonzero"),
+        ("assignment", "assignment_mismatch"),
+        ("foreign", "foreign_scope"),
+    ),
+)
+def test_child_execution_mutants_fail_for_pre_registered_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutant: str,
+    reason: str,
+) -> None:
+    case, references, request, schedule = _wire_future_setup(tmp_path)
+    if mutant == "in_process":
+        response = helpfulness.execute_future_child_request(request)
+    elif mutant == "foreign":
+        foreign_request = replace(
+            request,
+            source=replace(
+                request.source,
+                release_id=references.releases.foreign_sentinel_release_id,
+            ),
+        )
+        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+            helpfulness.run_isolated_child(
+                foreign_request,
+                role="future-child",
+                timeout_seconds=20,
+            )
+        assert error.value.reason == reason
+        return
+    else:
+        response = helpfulness.run_isolated_child(
+            request,
+            role="future-child",
+            timeout_seconds=20,
+        )
+        if mutant == "identity":
+            response = replace(
+                response,
+                process_instance_id="",
+                observation=replace(
+                    response.observation,
+                    future_process_instance_id="",
+                ),
+            )
+        elif mutant == "history":
+            isolated_response = response
+            consume_without_leak = helpfulness.consume_scripted
+
+            def consume_with_hidden_history(query, rendered_context, *, history=()):
+                return consume_without_leak(
+                    query,
+                    rendered_context,
+                    history=(b"capture-only prior turn",),
+                )
+
+            monkeypatch.setattr(
+                helpfulness,
+                "consume_scripted",
+                consume_with_hidden_history,
+            )
+            leaky_response = helpfulness.execute_future_child_request(request)
+            assert leaky_response.observation.history_length == 1
+            assert (
+                leaky_response.observation.consumer_input_receipt.received_history_length
+                == 1
+            )
+            response = replace(
+                isolated_response,
+                observation=replace(
+                    leaky_response.observation,
+                    future_pid=isolated_response.pid,
+                    future_process_instance_id=(isolated_response.process_instance_id),
+                ),
+            )
+        elif mutant == "assignment":
+            schedule = helpfulness.make_parent_schedule_item(
+                execution_index=request.execution_index,
+                case=case,
+                references=references,
+                arm="stale_release",
+            )
+
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+        helpfulness.validate_future_child_response(response, schedule)
+    assert error.value.reason == reason
