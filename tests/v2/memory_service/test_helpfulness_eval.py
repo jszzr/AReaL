@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import json
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -55,6 +57,15 @@ FIRST_EIGHT_MANIFEST_SHA256 = (
     "db2365cc5d809576bba3c3940e9dead142949e7d87122ec715b2b96d7c3d6b97",
     "f9ca0208b6a6b485404b39a66d9215d95d8c566b9d0124514aae5cbac9b222f7",
     "1f6c8caa43ffe41463613b6601ef4c4796bdef03b868666a1a06d449d9236ea1",
+)
+
+MODEL_ARMS = (
+    "current_release",
+    "raw_history",
+    "memory_off",
+    "target_masked",
+    "stale_release",
+    "oracle",
 )
 
 
@@ -5367,3 +5378,1278 @@ def test_full_profile_rejects_unknown_child_fields_before_derived_work(
     assert error.value.reason == "closed_schema"
     assert raw_calls == 64
     assert derived_calls == Counter()
+
+
+def _model_process_instance(case_index: int, arm_offset: int | None) -> str:
+    value = (
+        10_000 + case_index
+        if arm_offset is None
+        else 100_000 + case_index * 6 + arm_offset
+    )
+    return str(uuid.UUID(int=value, version=4))
+
+
+def _model_leakage_process_instance(case_index: int) -> str:
+    return str(uuid.UUID(int=200_000 + case_index, version=4))
+
+
+def _model_audit(
+    *,
+    scope: MemoryScope,
+    source_kind: str,
+    release_id: str | None,
+    entries: tuple[helpfulness.EntryReceipt, ...],
+) -> tuple[helpfulness.ReadAuditEvent, ...]:
+    if source_kind == "raw_evidence":
+        return (
+            helpfulness.ReadAuditEvent(
+                operation="list_eligible_evidence",
+                requested_scope=scope,
+                requested_ids=(),
+                allowed=True,
+                returned_record_ids=tuple(
+                    evidence_id
+                    for entry in entries
+                    for evidence_id in entry.evidence_ids
+                ),
+                returned_content_hashes=tuple(
+                    entry.content_sha256 for entry in entries
+                ),
+            ),
+        )
+    if source_kind == "oracle":
+        return (
+            helpfulness.ReadAuditEvent(
+                operation="entries",
+                requested_scope=scope,
+                requested_ids=(),
+                allowed=True,
+                returned_record_ids=(),
+                returned_content_hashes=tuple(
+                    entry.content_sha256 for entry in entries
+                ),
+            ),
+        )
+    assert source_kind == "release"
+    assert release_id is not None
+    events = [
+        helpfulness.ReadAuditEvent(
+            operation="get_assigned_release",
+            requested_scope=scope,
+            requested_ids=(release_id,),
+            allowed=True,
+            returned_record_ids=(release_id,),
+            returned_content_hashes=(sha256(release_id.encode()).hexdigest(),),
+        )
+    ]
+    for entry in entries:
+        assert entry.revision_id is not None
+        assert entry.candidate_id is not None
+        events.extend(
+            (
+                helpfulness.ReadAuditEvent(
+                    operation="get_revision",
+                    requested_scope=scope,
+                    requested_ids=(entry.revision_id,),
+                    allowed=True,
+                    returned_record_ids=(entry.revision_id,),
+                    returned_content_hashes=(entry.content_sha256,),
+                ),
+                helpfulness.ReadAuditEvent(
+                    operation="get_candidate",
+                    requested_scope=scope,
+                    requested_ids=(entry.candidate_id,),
+                    allowed=True,
+                    returned_record_ids=(entry.candidate_id,),
+                    returned_content_hashes=(entry.content_sha256,),
+                ),
+            )
+        )
+    return tuple(events)
+
+
+def _model_trace(
+    case: helpfulness.CodebookCase,
+    arm: str,
+    response: str,
+) -> helpfulness.EvaluationTrace:
+    arm_offset = MODEL_ARMS.index(arm)
+    references = helpfulness.derive_case_database_references(case)
+    schedule = helpfulness.make_parent_schedule_item(
+        execution_index=arm_offset,
+        case=case,
+        references=references,
+        arm=arm,
+    )
+    expected_source = schedule.expected_source
+    rendered = helpfulness.render_context(
+        tuple(
+            helpfulness.ResolvedEntry(
+                slot=entry.slot,
+                key=entry.key,
+                value=entry.value,
+                source_kind=entry.source_kind,
+                revision_id=entry.revision_id,
+                candidate_id=entry.candidate_id,
+                evidence_ids=entry.evidence_ids,
+            )
+            for entry in expected_source.entries
+        )
+    )
+    entries = expected_source.entries
+    source_kind = schedule.source_kind
+    query = _query(case)
+    prompt = b"SYS\n" + rendered.bytes + b"\n" + query
+    prompt_context_start = len(b"SYS\n")
+    prompt_context_end = prompt_context_start + len(rendered.bytes)
+    token_ids = list(prompt)
+    token_hash = sha256(
+        json.dumps(token_ids, separators=(",", ":")).encode()
+    ).hexdigest()
+    release_id = schedule.release_id
+    revision_ids = expected_source.eligible_ids if source_kind == "release" else ()
+    source_evidence_ids = expected_source.source_evidence_ids
+    scope = schedule.scope
+    query_hash = sha256(query).hexdigest()
+    context_hash = sha256(rendered.bytes).hexdigest()
+    return helpfulness.EvaluationTrace(
+        schema_version=1,
+        case_id=case.case_id,
+        case_manifest_sha256=helpfulness.case_manifest_sha256(case),
+        execution_index=case.case_index * 6 + arm_offset,
+        arm=arm,
+        source_kind=source_kind,
+        scope=scope,
+        capture_session_ids=(
+            f"{case.case_id}-capture-old",
+            f"{case.case_id}-capture-new",
+            f"{case.case_id}-capture-control",
+        ),
+        future_session_id=f"{case.case_id}-{arm}-session",
+        future_run_id=f"{case.case_id}-{arm}-run",
+        capture_pid=20_000 + case.case_index,
+        future_pid=30_000 + case.case_index * 6 + arm_offset,
+        capture_process_instance_id=_model_process_instance(case.case_index, None),
+        future_process_instance_id=_model_process_instance(case.case_index, arm_offset),
+        release_id=release_id,
+        eligible_revision_ids=revision_ids,
+        retrieved_revision_ids=revision_ids,
+        returned_revision_ids=revision_ids,
+        injected_revision_ids=revision_ids,
+        source_evidence_ids=source_evidence_ids,
+        entries=entries,
+        reader_audit=expected_source.reader_audit,
+        rendered_context_sha256=context_hash,
+        rendered_context_utf8_bytes=len(rendered.bytes),
+        rendered_context_token_count=len(rendered.bytes),
+        received_context_sha256=context_hash,
+        received_context_utf8_bytes=len(rendered.bytes),
+        received_query_sha256=query_hash,
+        submitted_prompt_sha256=sha256(prompt).hexdigest(),
+        submitted_prompt_context_start=prompt_context_start,
+        submitted_prompt_context_end=prompt_context_end,
+        submitted_prompt_context_sha256=context_hash,
+        submitted_input_token_ids_sha256=token_hash,
+        submitted_input_token_count=len(token_ids),
+        query_sha256=query_hash,
+        history_length=0,
+        response=response,
+        normalized_response="CALLER-SUPPLIED-NORMALIZATION-IS-UNTRUSTED",
+        expected_response="CALLER-SUPPLIED-EXPECTED-IS-UNTRUSTED",
+        utility=-999,
+        abstained=False,
+        followed_injected_value=False,
+    )
+
+
+def _model_identity(
+    case: helpfulness.CodebookCase,
+) -> helpfulness.ModelCaseIdentity:
+    return helpfulness.ModelCaseIdentity(
+        case=case,
+        case_manifest_sha256=helpfulness.case_manifest_sha256(case),
+        references=helpfulness.derive_case_database_references(case),
+    )
+
+
+def _model_outcomes(
+    responses: Callable[[helpfulness.CodebookCase, str], str],
+) -> tuple[helpfulness.ModelArmOutcome, ...]:
+    outcomes = []
+    for case_index in range(64):
+        case = helpfulness.generate_case(case_index)
+        for execution_offset, arm in enumerate(_model_arm_order(case.case_id)):
+            trace = replace(
+                _model_trace(case, arm, responses(case, arm)),
+                execution_index=case_index * 6 + execution_offset,
+            )
+            outcomes.append(
+                helpfulness.ModelArmOutcome(
+                    case_index=case_index,
+                    arm=arm,
+                    trace=trace,
+                )
+            )
+    return tuple(outcomes)
+
+
+def _model_arm_order(case_id: str) -> tuple[str, ...]:
+    prefix = "areal-memory-arm-order-v1-20260708|"
+    return tuple(
+        sorted(
+            MODEL_ARMS,
+            key=lambda arm: (
+                sha256(f"{prefix}{case_id}|{arm}".encode()).digest(),
+                arm,
+            ),
+        )
+    )
+
+
+def _model_manifest() -> tuple[helpfulness.ModelCaseIdentity, ...]:
+    return tuple(
+        _model_identity(helpfulness.generate_case(index)) for index in range(64)
+    )
+
+
+def _frozen_model_hashes() -> tuple[str, ...]:
+    return tuple(
+        helpfulness.case_manifest_sha256(helpfulness.generate_case(index))
+        for index in range(64)
+    )
+
+
+def _model_leakage_sentinels() -> tuple[helpfulness.LeakageSentinelTrace, ...]:
+    traces = []
+    for case_index in range(64):
+        case = helpfulness.generate_case(case_index)
+        references = helpfulness.derive_case_database_references(case)
+        traces.append(
+            helpfulness.LeakageSentinelTrace(
+                schema_version=1,
+                case_id=case.case_id,
+                case_manifest_sha256=helpfulness.case_manifest_sha256(case),
+                execution_index=384 + case_index,
+                requested_scope=MemoryScope(
+                    "memory-eval", "scoped-codebook-v1", case.subject_id
+                ),
+                companion_scope=MemoryScope(
+                    "memory-eval", "scoped-codebook-v1", f"{case.subject_id}-foreign"
+                ),
+                foreign_release_id=references.releases.foreign_sentinel_release_id,
+                foreign_evidence_id=references.capture.foreign_evidence_id,
+                future_session_id=f"{case.case_id}-foreign-session",
+                future_run_id=f"{case.case_id}-foreign-run",
+                capture_pid=20_000 + case_index,
+                future_pid=40_000 + case_index,
+                capture_process_instance_id=_model_process_instance(case_index, None),
+                future_process_instance_id=_model_leakage_process_instance(case_index),
+                reason="foreign_scope",
+                history_length=0,
+            )
+        )
+    return tuple(traces)
+
+
+def _strict_model_response(case: helpfulness.CodebookCase, arm: str) -> str:
+    return {
+        "current_release": case.current_value,
+        "raw_history": case.current_value,
+        "memory_off": helpfulness.UNKNOWN,
+        "target_masked": helpfulness.UNKNOWN,
+        "stale_release": case.old_value,
+        "oracle": case.current_value,
+    }[arm]
+
+
+def _analyze_model_fixture(
+    responses: Callable[[helpfulness.CodebookCase, str], str] = _strict_model_response,
+    *,
+    manifest: tuple[helpfulness.ModelCaseIdentity, ...] | None = None,
+    outcomes: tuple[helpfulness.ModelArmOutcome, ...] | None = None,
+    attrition: tuple[helpfulness.ModelRunAttrition, ...] = (),
+    leakage_sentinels: tuple[helpfulness.LeakageSentinelTrace, ...] | None = None,
+) -> helpfulness.ModelEvaluationResult:
+    return helpfulness.analyze_model_run(
+        manifest=_model_manifest() if manifest is None else manifest,
+        outcomes=_model_outcomes(responses) if outcomes is None else outcomes,
+        attrition=attrition,
+        leakage_sentinels=(
+            _model_leakage_sentinels()
+            if leakage_sentinels is None
+            else leakage_sentinels
+        ),
+        frozen_case_manifest_sha256s=_frozen_model_hashes(),
+    )
+
+
+def _replace_model_trace(
+    outcomes: tuple[helpfulness.ModelArmOutcome, ...],
+    case_index: int,
+    arm: str,
+    **changes: object,
+) -> tuple[helpfulness.ModelArmOutcome, ...]:
+    replaced = []
+    for outcome in outcomes:
+        if (outcome.case_index, outcome.arm) == (case_index, arm):
+            outcome = replace(outcome, trace=replace(outcome.trace, **changes))
+        replaced.append(outcome)
+    return tuple(replaced)
+
+
+def _forbid_numpy_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "numpy":
+            raise AssertionError("bootstrap must not run after structural failure")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+
+def test_metrics_preserve_paired_rows_and_compute_all_deltas() -> None:
+    result = _analyze_model_fixture()
+
+    assert result.validity == "valid"
+    assert result.efficacy == "helpful"
+    assert result.safety == "non-increased"
+    assert result.stale_susceptibility == "stale-sensitive"
+    assert result.invalid_reasons == ()
+    assert result.summary is not None
+    summary = result.summary
+    expected = {
+        "strict_signature_rate": 1.0,
+        "oracle_success_rate": 1.0,
+        "masked_abstention_rate": 1.0,
+        "delta_help": 1.0,
+        "delta_masked": 1.0,
+        "delta_masked_off": 0.0,
+        "delta_raw": 0.0,
+        "delta_current_stale": 2.0,
+        "delta_harm": -1.0,
+        "delta_confident_error": 0.0,
+        "oracle_gap": 0.0,
+        "stale_value_follow_rate": 1.0,
+    }
+    for name, point in expected.items():
+        estimate = getattr(summary, name)
+        assert estimate.point == point
+        assert len(estimate.per_case_values) == 64
+        assert all(type(value) is float for value in estimate.per_case_values)
+        assert type(estimate.point) is float
+        assert type(estimate.ci_lower) is float
+        assert type(estimate.ci_upper) is float
+
+    assert tuple(arm.arm for arm in summary.arm_summaries) == MODEL_ARMS
+    assert summary.arm_summaries[2].assigned_target_coverage is None
+    assert summary.arm_summaries[2].returned_target_coverage is None
+    assert summary.arm_summaries[2].injected_target_coverage is None
+    assert summary.access_denial_count == 0
+    assert summary.provenance_validation_failure_count == 0
+    assert summary.cross_scope_false_positive_count == 0
+
+
+def test_model_rows_join_hashed_execution_order_by_arm_name() -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+
+    assert tuple(outcome.arm for outcome in outcomes[:6]) == _model_arm_order(
+        "nonce-000"
+    )
+    assert tuple(outcome.arm for outcome in outcomes[6:12]) == _model_arm_order(
+        "nonce-001"
+    )
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "valid"
+    assert result.summary is not None
+    assert result.summary.strict_signature_rate.point == 1.0
+
+
+def test_bootstrap_is_exactly_reproducible_with_pcg64_seed() -> None:
+    first = _analyze_model_fixture()
+    second = _analyze_model_fixture()
+
+    assert first.summary == second.summary
+    assert first.summary is not None
+    assert first.summary.bootstrap_matrix_sha256 == (
+        "46a4e23fc152366486fae4d1eeb33186fbd5ee6cabb6928f2cf40c8e73d68de8"
+    )
+    assert first.summary.bootstrap_first_indexes == (56, 4, 40, 42, 20, 30, 12, 48)
+
+
+def test_poisoned_mask_control_is_invalid_but_retains_diagnostics() -> None:
+    def poisoned(case: helpfulness.CodebookCase, arm: str) -> str:
+        if arm == "target_masked":
+            return case.masked_value
+        return _strict_model_response(case, arm)
+
+    result = _analyze_model_fixture(poisoned)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("masked_control",)
+    assert result.efficacy == "not-assessed"
+    assert result.safety == "not-assessed"
+    assert result.stale_susceptibility == "not-assessed"
+    assert result.summary is not None
+    assert result.summary.masked_abstention_rate.point == 0.0
+    assert result.summary.delta_masked_off.point == -1.0
+
+
+def test_current_oracle_same_utility_different_wrong_nonce_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mismatched(case: helpfulness.CodebookCase, arm: str) -> str:
+        if arm == "current_release":
+            return case.old_value
+        if arm == "oracle":
+            return case.padding_entry.value
+        return helpfulness.UNKNOWN
+
+    outcomes = _model_outcomes(mismatched)
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("oracle_response_mismatch",)
+    assert result.summary is None
+    assert result.efficacy == "not-assessed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("submitted_prompt_sha256", "f" * 64),
+        ("submitted_input_token_ids_sha256", "e" * 64),
+        ("submitted_input_token_count", 99_999),
+    ],
+)
+def test_current_oracle_prompt_and_token_receipts_must_match(
+    field: str,
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _replace_model_trace(
+        _model_outcomes(_strict_model_response),
+        0,
+        "oracle",
+        **{field: value},
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("oracle_receipt_mismatch",)
+    assert result.summary is None
+    assert result.efficacy == "not-assessed"
+
+
+def test_oracle_success_is_efficacy_not_validity() -> None:
+    result = _analyze_model_fixture(lambda _case, _arm: helpfulness.UNKNOWN)
+
+    assert result.validity == "valid"
+    assert result.efficacy == "null-inconclusive"
+    assert result.safety == "non-increased"
+    assert result.stale_susceptibility == "stale-robust"
+    assert result.summary is not None
+    assert result.summary.oracle_success_rate.point == 0.0
+    assert result.summary.delta_help.point == 0.0
+
+
+def test_delta_raw_is_reported_but_does_not_gate_helpfulness() -> None:
+    def raw_better(case: helpfulness.CodebookCase, arm: str) -> str:
+        if case.case_index < 6:
+            if arm == "raw_history":
+                return case.current_value
+            return helpfulness.UNKNOWN
+        if arm == "stale_release":
+            return helpfulness.UNKNOWN
+        return _strict_model_response(case, arm)
+
+    result = _analyze_model_fixture(raw_better)
+
+    assert result.validity == "valid"
+    assert result.efficacy == "helpful"
+    assert result.stale_susceptibility == "stale-robust"
+    assert result.summary is not None
+    assert result.summary.oracle_success_rate.point == 58 / 64
+    assert result.summary.delta_raw.point == -6 / 64
+    assert result.summary.delta_raw.ci_upper < 0.0
+
+
+def test_six_error_helpful_fixture_is_safety_inconclusive() -> None:
+    def six_errors(case: helpfulness.CodebookCase, arm: str) -> str:
+        if case.case_index < 6:
+            if arm in {"current_release", "raw_history", "oracle"}:
+                return case.padding_entry.value
+            return helpfulness.UNKNOWN
+        if arm == "stale_release":
+            return helpfulness.UNKNOWN
+        return _strict_model_response(case, arm)
+
+    result = _analyze_model_fixture(six_errors)
+
+    assert result.validity == "valid"
+    assert result.efficacy == "helpful"
+    assert result.safety == "inconclusive"
+    assert result.stale_susceptibility == "stale-robust"
+    assert result.summary is not None
+    assert result.summary.delta_confident_error.point == 0.09375
+    assert result.summary.delta_confident_error.ci_lower == 0.03125
+    assert result.summary.delta_confident_error.ci_upper == 0.171875
+
+
+def test_valid_negative_run_can_have_increased_safety_risk() -> None:
+    def negative(case: helpfulness.CodebookCase, arm: str) -> str:
+        if arm in {"current_release", "raw_history", "oracle"}:
+            return case.padding_entry.value
+        return helpfulness.UNKNOWN
+
+    result = _analyze_model_fixture(negative)
+
+    assert result.validity == "valid"
+    assert result.efficacy == "negative"
+    assert result.safety == "increased"
+    assert result.stale_susceptibility == "stale-robust"
+    assert result.summary is not None
+    assert result.summary.delta_help.point == -1.0
+    assert result.summary.delta_confident_error.point == 1.0
+
+
+def test_preaggregation_receipt_failure_stops_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _replace_model_trace(
+        _model_outcomes(_strict_model_response),
+        0,
+        "current_release",
+        received_context_sha256="0" * 64,
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("receipt_mismatch",)
+    assert result.summary is None
+    assert result.efficacy == "not-assessed"
+    assert result.safety == "not-assessed"
+    assert result.stale_susceptibility == "not-assessed"
+
+
+def test_model_attrition_is_case_arm_specific_and_never_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    missing = outcomes[17]
+    retained = (*outcomes[:17], *outcomes[18:])
+    loss = helpfulness.ModelRunAttrition(
+        case_index=missing.case_index,
+        arm=missing.arm,
+        reason="timeout",
+        attempted=True,
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=retained, attrition=(loss,))
+
+    assert len(retained) == 383
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("attrition",)
+    assert result.attrition == (loss,)
+    assert result.summary is None
+
+
+def test_manifest_rejects_duplicate_or_replaced_case_before_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _model_manifest()
+    malformed = (*manifest[:-1], manifest[-2])
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(manifest=malformed)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("manifest_mismatch",)
+    assert result.summary is None
+
+
+def test_cross_scope_failure_is_structural_and_evidence_derived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinels = _model_leakage_sentinels()
+    malformed = (
+        replace(sentinels[0], reason="unexpected_success"),
+        *sentinels[1:],
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(leakage_sentinels=malformed)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("cross_scope_leakage",)
+    assert result.summary is None
+
+
+def test_forged_audit_ids_and_hashes_fail_before_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    current = next(
+        outcome
+        for outcome in outcomes
+        if (outcome.case_index, outcome.arm) == (0, "current_release")
+    )
+    forged_first = replace(
+        current.trace.reader_audit[0],
+        requested_ids=("forged-release",),
+        returned_record_ids=("forged-release",),
+        returned_content_hashes=("f" * 64,),
+    )
+    outcomes = _replace_model_trace(
+        outcomes,
+        0,
+        "current_release",
+        reader_audit=(forged_first, *current.trace.reader_audit[1:]),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("audit_failure",)
+    assert result.summary is None
+
+
+def test_execution_index_is_bound_to_hashed_case_arm_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    current_index = next(
+        index
+        for index, outcome in enumerate(outcomes)
+        if (outcome.case_index, outcome.arm) == (0, "current_release")
+    )
+    raw_index = next(
+        index
+        for index, outcome in enumerate(outcomes)
+        if (outcome.case_index, outcome.arm) == (0, "raw_history")
+    )
+    current = outcomes[current_index]
+    raw = outcomes[raw_index]
+    swapped = list(outcomes)
+    swapped[current_index] = replace(
+        current,
+        trace=replace(current.trace, execution_index=raw.trace.execution_index),
+    )
+    swapped[raw_index] = replace(
+        raw,
+        trace=replace(raw.trace, execution_index=current.trace.execution_index),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=tuple(swapped))
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None
+
+
+def test_foreign_graph_ids_are_derived_for_each_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinels = _model_leakage_sentinels()
+    forged = tuple(
+        replace(
+            sentinel,
+            foreign_release_id=sentinels[0].foreign_release_id,
+            foreign_evidence_id=sentinels[0].foreign_evidence_id,
+        )
+        for sentinel in sentinels
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(leakage_sentinels=forged)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("leakage_sentinel",)
+    assert result.summary is None
+
+
+def test_self_consistent_forged_treatment_ids_fail_parent_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    current = next(
+        outcome
+        for outcome in outcomes
+        if (outcome.case_index, outcome.arm) == (0, "current_release")
+    )
+    forged_entries = tuple(
+        replace(
+            entry,
+            revision_id=f"forged-{entry.revision_id}",
+            candidate_id=f"forged-{entry.candidate_id}",
+            evidence_ids=tuple(f"forged-{value}" for value in entry.evidence_ids),
+        )
+        for entry in current.trace.entries
+    )
+    revision_ids = tuple(entry.revision_id for entry in forged_entries)
+    evidence_ids = tuple(
+        value for entry in forged_entries for value in entry.evidence_ids
+    )
+    forged_trace = replace(
+        current.trace,
+        eligible_revision_ids=revision_ids,
+        retrieved_revision_ids=revision_ids,
+        returned_revision_ids=revision_ids,
+        injected_revision_ids=revision_ids,
+        source_evidence_ids=evidence_ids,
+        entries=forged_entries,
+        reader_audit=_model_audit(
+            scope=current.trace.scope,
+            source_kind="release",
+            release_id=current.trace.release_id,
+            entries=forged_entries,
+        ),
+    )
+    forged = tuple(
+        replace(outcome, trace=forged_trace) if outcome is current else outcome
+        for outcome in outcomes
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=forged)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("treatment_contract",)
+    assert result.summary is None
+
+
+def test_capture_pid_is_consistent_across_case_arms_and_leakage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _replace_model_trace(
+        _model_outcomes(_strict_model_response),
+        0,
+        "current_release",
+        capture_pid=999_999,
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=outcomes)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None
+
+
+def test_derived_references_match_persisted_first_eight_cases(
+    tmp_path: Path,
+) -> None:
+    for case_index in range(8):
+        case = helpfulness.generate_case(case_index)
+
+        derived = helpfulness.derive_case_database_references(case)
+        persisted = helpfulness.build_case_database(
+            case,
+            tmp_path / f"case-{case_index:03d}.sqlite",
+        )
+
+        assert derived == persisted
+
+
+def test_model_wire_round_trip_is_closed_deterministic_and_exact_typed() -> None:
+    result = _analyze_model_fixture()
+    identity = _model_manifest()[0]
+    outcome = _model_outcomes(_strict_model_response)[0]
+    attrition = helpfulness.ModelRunAttrition(
+        case_index=0,
+        arm=_model_arm_order("nonce-000")[0],
+        reason="timeout",
+        attempted=True,
+    )
+
+    for value in (identity, outcome, attrition, result):
+        encoded = helpfulness.wire_dumps(value)
+
+        assert encoded == helpfulness.wire_dumps(value)
+        assert encoded.endswith("\n")
+        assert helpfulness.wire_loads(encoded) == value
+        assert (
+            json.dumps(
+                json.loads(encoded),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            == encoded
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("arm", "memory_off"), ("case_index", 63)],
+)
+def test_model_arm_outcome_wire_rejects_outer_trace_contradictions(
+    field: str,
+    value: object,
+) -> None:
+    outcome = _model_outcomes(_strict_model_response)[0]
+    encoded = json.loads(helpfulness.wire_dumps(outcome))
+    assert encoded["payload"][field] != value
+    encoded["payload"][field] = value
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_loads(
+            json.dumps(encoded, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+    assert error.value.reason == "closed_schema"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "same_old_and_current",
+        "duplicate_key",
+        "wrong_mask",
+        "invalid_key",
+        "invalid_value",
+    ],
+)
+def test_model_case_identity_wire_reuses_analysis_case_schema(
+    mutation: str,
+) -> None:
+    case = helpfulness.generate_case(0)
+    if mutation == "same_old_and_current":
+        case = replace(case, old_value=case.current_value)
+    elif mutation == "duplicate_key":
+        case = replace(
+            case,
+            shared_entries=(
+                replace(case.shared_entries[0], key=case.target_key),
+                *case.shared_entries[1:],
+            ),
+        )
+    elif mutation == "wrong_mask":
+        case = replace(case, masked_value="BAD")
+    elif mutation == "invalid_key":
+        case = replace(case, target_key="bad")
+    else:
+        assert mutation == "invalid_value"
+        case = replace(case, old_value="bad")
+    identity = helpfulness.ModelCaseIdentity(
+        case=case,
+        case_manifest_sha256=helpfulness.case_manifest_sha256(case),
+        references=helpfulness.derive_case_database_references(case),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_dumps(identity)
+
+    assert error.value.reason == "closed_schema"
+
+
+def test_model_wire_rejects_unknown_nonfinite_bool_and_numpy_scalars() -> None:
+    import numpy as np
+
+    result = _analyze_model_fixture()
+    assert result.summary is not None
+    encoded = json.loads(helpfulness.wire_dumps(result))
+    encoded["payload"]["unknown"] = "forbidden"
+
+    with pytest.raises(helpfulness.WireProtocolError) as unknown:
+        helpfulness.wire_loads(
+            json.dumps(encoded, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+    assert unknown.value.reason == "closed_schema"
+
+    malformed_points = (float("nan"), float("inf"), True, np.float64(1.0))
+    for malformed in malformed_points:
+        estimate = replace(result.summary.delta_help, point=malformed)
+        summary = replace(result.summary, delta_help=estimate)
+        malformed_result = replace(result, summary=summary)
+
+        with pytest.raises(helpfulness.WireProtocolError) as scalar:
+            helpfulness.wire_dumps(malformed_result)
+        assert scalar.value.reason == "closed_schema"
+
+    malformed_attrition = helpfulness.ModelRunAttrition(
+        case_index=True,
+        arm="current_release",
+        reason="timeout",
+        attempted=True,
+    )
+    with pytest.raises(helpfulness.WireProtocolError) as boolean_integer:
+        helpfulness.wire_dumps(malformed_attrition)
+    assert boolean_integer.value.reason == "closed_schema"
+
+
+def test_malformed_nested_references_fail_closed_before_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _model_manifest()
+    malformed_identity = replace(
+        manifest[0],
+        references=replace(manifest[0].references, capture=object()),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(
+        manifest=(malformed_identity, *manifest[1:]),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("closed_schema",)
+    assert result.summary is None
+    assert result.attrition == ()
+
+
+def test_malformed_nested_model_case_fails_closed_before_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _model_manifest()
+    malformed_case = replace(
+        manifest[0].case,
+        shared_entries=(object(),) * 4,
+    )
+    malformed_identity = replace(manifest[0], case=malformed_case)
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(
+        manifest=(malformed_identity, *manifest[1:]),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("closed_schema",)
+    assert result.summary is None
+    assert result.attrition == ()
+
+
+def test_malformed_attrition_is_not_reflected_in_typed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_numpy_import(monkeypatch)
+
+    result = helpfulness.analyze_model_run(
+        manifest=_model_manifest(),
+        outcomes=_model_outcomes(_strict_model_response),
+        attrition=(object(),),
+        leakage_sentinels=_model_leakage_sentinels(),
+        frozen_case_manifest_sha256s=_frozen_model_hashes(),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("closed_schema",)
+    assert result.summary is None
+    assert result.attrition == ()
+    assert helpfulness.wire_loads(helpfulness.wire_dumps(result)) == result
+
+
+def test_masked_equivalence_can_fail_after_abstention_gate_passes() -> None:
+    def six_masked_answers(case: helpfulness.CodebookCase, arm: str) -> str:
+        if case.case_index < 6 and arm == "target_masked":
+            return case.current_value
+        return _strict_model_response(case, arm)
+
+    result = _analyze_model_fixture(six_masked_answers)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("masked_control",)
+    assert result.efficacy == "not-assessed"
+    assert result.safety == "not-assessed"
+    assert result.stale_susceptibility == "not-assessed"
+    assert result.summary is not None
+    assert result.summary.masked_abstention_rate.point == 58 / 64
+    assert result.summary.delta_masked_off.point == 0.09375
+    assert result.summary.delta_masked_off.ci_lower == 0.03125
+    assert result.summary.delta_masked_off.ci_upper == 0.171875
+
+
+def test_model_result_wire_rejects_semantic_contradictions() -> None:
+    valid = _analyze_model_fixture()
+    masked_invalid = _analyze_model_fixture(
+        lambda case, arm: (
+            case.masked_value
+            if arm == "target_masked"
+            else _strict_model_response(case, arm)
+        )
+    )
+    loss = helpfulness.ModelRunAttrition(
+        case_index=0,
+        arm=_model_arm_order("nonce-000")[0],
+        reason="timeout",
+        attempted=True,
+    )
+    malformed_results = (
+        replace(valid, attrition=(loss,)),
+        replace(valid, efficacy="not-assessed"),
+        replace(valid, efficacy="negative"),
+        replace(
+            valid,
+            summary=replace(valid.summary, access_denial_count=1),
+        ),
+        replace(masked_invalid, invalid_reasons=("made_up",)),
+        replace(masked_invalid, invalid_reasons=("receipt_mismatch",)),
+        replace(masked_invalid, efficacy="helpful"),
+    )
+
+    for malformed in malformed_results:
+        with pytest.raises(helpfulness.WireProtocolError) as error:
+            helpfulness.wire_dumps(malformed)
+        assert error.value.reason == "closed_schema"
+
+
+def test_model_wire_recomputes_bootstrap_and_cross_metric_invariants() -> None:
+    valid = _analyze_model_fixture()
+    assert valid.summary is not None
+    forged_ci = replace(valid.summary.delta_help, ci_lower=-1.0, ci_upper=1.0)
+    forged_ci_result = replace(
+        valid,
+        efficacy="null-inconclusive",
+        summary=replace(valid.summary, delta_help=forged_ci),
+    )
+    nonbinary_strict = helpfulness.MetricEstimate(
+        per_case_values=(0.5,) * 64,
+        point=0.5,
+        ci_lower=0.5,
+        ci_upper=0.5,
+    )
+    nonbinary_result = replace(
+        valid,
+        summary=replace(valid.summary, strict_signature_rate=nonbinary_strict),
+    )
+    forged_gap = helpfulness.MetricEstimate(
+        per_case_values=(1.0, -1.0, *(0.0,) * 62),
+        point=0.0,
+        ci_lower=-0.1,
+        ci_upper=0.1,
+    )
+    forged_gap_result = replace(
+        valid,
+        summary=replace(valid.summary, oracle_gap=forged_gap),
+    )
+    forged_masked = helpfulness.MetricEstimate(
+        per_case_values=(0.0,) * 64,
+        point=0.0,
+        ci_lower=0.0,
+        ci_upper=0.0,
+    )
+    forged_masked_summary = replace(
+        valid.summary,
+        masked_abstention_rate=forged_masked,
+    )
+    forged_masked_result = helpfulness.ModelEvaluationResult(
+        validity="invalid",
+        efficacy="not-assessed",
+        safety="not-assessed",
+        stale_susceptibility="not-assessed",
+        invalid_reasons=("masked_control",),
+        summary=forged_masked_summary,
+        attrition=(),
+    )
+
+    for malformed in (
+        forged_ci_result,
+        nonbinary_result,
+        forged_gap_result,
+        forged_masked_result,
+    ):
+        with pytest.raises(helpfulness.WireProtocolError) as error:
+            helpfulness.wire_dumps(malformed)
+        assert error.value.reason == "closed_schema"
+
+
+def test_model_wire_rejects_coverage_utility_and_attrition_forgery() -> None:
+    valid = _analyze_model_fixture()
+    assert valid.summary is not None
+    zero = helpfulness.MetricEstimate(
+        per_case_values=(0.0,) * 64,
+        point=0.0,
+        ci_lower=0.0,
+        ci_upper=0.0,
+    )
+    current = valid.summary.arm_summaries[0]
+    forged_current = replace(
+        current,
+        assigned_target_coverage=zero,
+        returned_target_coverage=zero,
+        injected_target_coverage=zero,
+    )
+    coverage_forgery = replace(
+        valid,
+        summary=replace(
+            valid.summary,
+            arm_summaries=(forged_current, *valid.summary.arm_summaries[1:]),
+        ),
+    )
+    half_delta = helpfulness.MetricEstimate(
+        per_case_values=(0.5,) * 64,
+        point=0.5,
+        ci_lower=0.5,
+        ci_upper=0.5,
+    )
+    utility_forgery = replace(
+        valid,
+        summary=replace(valid.summary, delta_raw=half_delta),
+    )
+    wrong_metric_type = replace(
+        valid,
+        summary=replace(valid.summary, delta_help=object()),
+    )
+    loss = helpfulness.ModelRunAttrition(
+        case_index=0,
+        arm=_model_arm_order("nonce-000")[0],
+        reason="timeout",
+        attempted=True,
+    )
+    duplicate_attrition = helpfulness.ModelEvaluationResult(
+        validity="invalid",
+        efficacy="not-assessed",
+        safety="not-assessed",
+        stale_susceptibility="not-assessed",
+        invalid_reasons=("attrition",),
+        summary=None,
+        attrition=(loss, loss),
+    )
+
+    for malformed in (
+        coverage_forgery,
+        utility_forgery,
+        wrong_metric_type,
+        duplicate_attrition,
+    ):
+        with pytest.raises(helpfulness.WireProtocolError) as error:
+            helpfulness.wire_dumps(malformed)
+        assert error.value.reason == "closed_schema"
+
+
+def test_model_result_wire_requires_canonical_attrition_order() -> None:
+    losses = tuple(
+        helpfulness.ModelRunAttrition(
+            case_index=case_index,
+            arm=_model_arm_order(f"nonce-{case_index:03d}")[0],
+            reason="timeout",
+            attempted=True,
+        )
+        for case_index in range(2)
+    )
+    reversed_result = helpfulness.ModelEvaluationResult(
+        validity="invalid",
+        efficacy="not-assessed",
+        safety="not-assessed",
+        stale_susceptibility="not-assessed",
+        invalid_reasons=("attrition",),
+        summary=None,
+        attrition=tuple(reversed(losses)),
+    )
+
+    with pytest.raises(helpfulness.WireProtocolError) as error:
+        helpfulness.wire_dumps(reversed_result)
+
+    assert error.value.reason == "closed_schema"
+
+
+@pytest.mark.parametrize("field", ["future_session_id", "future_run_id"])
+def test_leakage_probe_identity_is_disjoint_from_outcomes(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    sentinels = _model_leakage_sentinels()
+    collision = getattr(outcomes[0].trace, field)
+    malformed = (
+        replace(sentinels[0], **{field: collision}),
+        *sentinels[1:],
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(
+        outcomes=outcomes,
+        leakage_sentinels=malformed,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None
+
+
+@pytest.mark.parametrize(
+    ("field", "collision"),
+    [
+        ("future_session_id", "nonce-000-capture-old"),
+        ("future_run_id", "nonce-000-run-old"),
+    ],
+)
+def test_future_identity_is_disjoint_from_local_capture(
+    field: str,
+    collision: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    current = next(
+        outcome
+        for outcome in outcomes
+        if (outcome.case_index, outcome.arm) == (0, "current_release")
+    )
+    malformed_trace = replace(current.trace, **{field: collision})
+    malformed = tuple(
+        replace(outcome, trace=malformed_trace) if outcome is current else outcome
+        for outcome in outcomes
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(outcomes=malformed)
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None
+
+
+@pytest.mark.parametrize("collision_owner", ["outcome", "probe"])
+@pytest.mark.parametrize(
+    ("field", "collision"),
+    [
+        ("future_session_id", "nonce-000-capture-foreign"),
+        ("future_run_id", "nonce-000-run-foreign"),
+    ],
+)
+def test_future_identity_is_disjoint_from_foreign_capture(
+    collision_owner: str,
+    field: str,
+    collision: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _model_outcomes(_strict_model_response)
+    sentinels = _model_leakage_sentinels()
+    if collision_owner == "outcome":
+        current = next(
+            outcome
+            for outcome in outcomes
+            if (outcome.case_index, outcome.arm) == (0, "current_release")
+        )
+        malformed_trace = replace(current.trace, **{field: collision})
+        outcomes = tuple(
+            replace(outcome, trace=malformed_trace) if outcome is current else outcome
+            for outcome in outcomes
+        )
+    else:
+        sentinels = (
+            replace(sentinels[0], **{field: collision}),
+            *sentinels[1:],
+        )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_model_fixture(
+        outcomes=outcomes,
+        leakage_sentinels=sentinels,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None

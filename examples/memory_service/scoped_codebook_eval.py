@@ -54,6 +54,20 @@ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MASKED_VALUE = "XXXXX"
 UNKNOWN = "UNKNOWN"
 FAST_PROFILE_NAME = "fast-two-child-v1"
+MODEL_CASE_COUNT = 64
+MODEL_BOOTSTRAP_RESAMPLES = 10_000
+MODEL_BOOTSTRAP_SEED = 20_260_708
+MODEL_BOOTSTRAP_MATRIX_SHA256 = (
+    "46a4e23fc152366486fae4d1eeb33186fbd5ee6cabb6928f2cf40c8e73d68de8"
+)
+MODEL_ARMS = (
+    "current_release",
+    "raw_history",
+    "memory_off",
+    "target_masked",
+    "stale_release",
+    "oracle",
+)
 _RENDER_HEADER = (
     b"[memory-codebook/v1]\n[mask=XXXXX means unavailable; answer UNKNOWN]\n"
 )
@@ -651,6 +665,93 @@ class FullProfileAttrition:
     case_index: int | None
     logical_execution_index: int | None
     opaque_execution_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaseIdentity:
+    """One frozen model subject and its committed canonical manifest hash."""
+
+    case: CodebookCase
+    case_manifest_sha256: str
+    references: CaseDatabaseReferences
+
+
+@dataclass(frozen=True, slots=True)
+class ModelArmOutcome:
+    """One fixed model case/arm slot carrying independently checkable evidence."""
+
+    case_index: int
+    arm: str
+    trace: EvaluationTrace
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRunAttrition:
+    """A missing model case/arm slot retained without replacement or extension."""
+
+    case_index: int
+    arm: str
+    reason: str
+    attempted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MetricEstimate:
+    """A paired 64-subject estimate and its frozen percentile interval."""
+
+    per_case_values: tuple[float, ...]
+    point: float
+    ci_lower: float
+    ci_upper: float
+
+
+@dataclass(frozen=True, slots=True)
+class ArmMetricSummary:
+    """Per-arm abstention and target-delivery diagnostics."""
+
+    arm: str
+    outcome_count: int
+    abstention_rate: MetricEstimate
+    assigned_target_coverage: MetricEstimate | None
+    returned_target_coverage: MetricEstimate | None
+    injected_target_coverage: MetricEstimate | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMetricSummary:
+    """All pre-registered paired estimands from one complete model run."""
+
+    bootstrap_matrix_sha256: str
+    bootstrap_first_indexes: tuple[int, ...]
+    strict_signature_rate: MetricEstimate
+    oracle_success_rate: MetricEstimate
+    masked_abstention_rate: MetricEstimate
+    delta_help: MetricEstimate
+    delta_masked: MetricEstimate
+    delta_masked_off: MetricEstimate
+    delta_raw: MetricEstimate
+    delta_current_stale: MetricEstimate
+    delta_harm: MetricEstimate
+    delta_confident_error: MetricEstimate
+    oracle_gap: MetricEstimate
+    stale_value_follow_rate: MetricEstimate
+    arm_summaries: tuple[ArmMetricSummary, ...]
+    access_denial_count: int
+    provenance_validation_failure_count: int
+    cross_scope_false_positive_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelEvaluationResult:
+    """Four-axis model classification plus optional diagnostic statistics."""
+
+    validity: str
+    efficacy: str
+    safety: str
+    stale_susceptibility: str
+    invalid_reasons: tuple[str, ...]
+    summary: ModelMetricSummary | None
+    attrition: tuple[ModelRunAttrition, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2325,6 +2426,213 @@ def _validate_parent_foreign_companion_contract(
     return expected_scope, evidence_id, revision_id, release_id
 
 
+def derive_case_database_references(case: CodebookCase) -> CaseDatabaseReferences:
+    """Derive every frozen graph address without opening a database."""
+
+    if type(case) is not CodebookCase:
+        raise TypeError("case must be a CodebookCase")
+    local_scope = MemoryScope("memory-eval", "scoped-codebook-v1", case.subject_id)
+    foreign_scope, foreign_evidence_id, foreign_revision_id, foreign_release_id = (
+        _parent_foreign_companion_contract(case)
+    )
+    case_base = datetime(2026, 7, 8, tzinfo=UTC) + timedelta(days=case.case_index)
+
+    def evidence_id(event: EvidenceEvent) -> str:
+        content_hash = hashlib.sha256(event.canonical_bytes()).hexdigest()
+        return f"evd_{content_hash[:24]}"
+
+    def capture_event(
+        *,
+        session_role: str,
+        sequence_no: int,
+        kind: EvidenceKind,
+        entry: CodebookEntry,
+        observed_seconds: int,
+        idempotency_key: str,
+    ) -> EvidenceEvent:
+        return EvidenceEvent(
+            scope=local_scope,
+            session_id=f"{case.case_id}-capture-{session_role}",
+            run_id=f"{case.case_id}-run-{session_role}",
+            sequence_no=sequence_no,
+            kind=kind,
+            payload=f"{entry.key} = {entry.value}",
+            observed_at=case_base + timedelta(seconds=observed_seconds),
+            idempotency_key=idempotency_key,
+        )
+
+    old_events = {
+        slot: capture_event(
+            session_role="old",
+            sequence_no=slot,
+            kind=EvidenceKind.USER_MESSAGE,
+            entry=entry,
+            observed_seconds=slot,
+            idempotency_key=f"{case.case_id}-evidence-old-{slot:02d}",
+        )
+        for slot, entry in _parent_slot_entries(case, target_value=case.old_value)
+    }
+    old_evidence_ids = tuple(evidence_id(old_events[slot]) for slot in range(5))
+    current_event = capture_event(
+        session_role="new",
+        sequence_no=0,
+        kind=EvidenceKind.FEEDBACK,
+        entry=CodebookEntry(case.target_key, case.current_value),
+        observed_seconds=60,
+        idempotency_key=(f"{case.case_id}-evidence-new-{case.target_slot:02d}"),
+    )
+    padding_event = capture_event(
+        session_role="control",
+        sequence_no=0,
+        kind=EvidenceKind.ENVIRONMENT,
+        entry=case.padding_entry,
+        observed_seconds=120,
+        idempotency_key=f"{case.case_id}-evidence-control-05",
+    )
+    masked_event = capture_event(
+        session_role="control",
+        sequence_no=1,
+        kind=EvidenceKind.ENVIRONMENT,
+        entry=CodebookEntry(case.target_key, case.masked_value),
+        observed_seconds=121,
+        idempotency_key=(f"{case.case_id}-evidence-control-{case.target_slot:02d}"),
+    )
+    current_evidence_id = evidence_id(current_event)
+    padding_evidence_id = evidence_id(padding_event)
+    masked_evidence_id = evidence_id(masked_event)
+
+    def revision_id(
+        *,
+        role: str,
+        slot: int,
+        content: str,
+        source_evidence_id: str,
+        operation: RevisionOperation,
+        parent_revision_id: str | None,
+    ) -> str:
+        candidate = CandidateProposal(
+            scope=local_scope,
+            content=content,
+            evidence_ids=(source_evidence_id,),
+            idempotency_key=(f"{case.case_id}-candidate-local-{role}-{slot:02d}"),
+        )
+        candidate_hash = hashlib.sha256(candidate.canonical_bytes()).hexdigest()
+        candidate_id = f"cand_{candidate_hash[:24]}"
+        revision = RevisionProposal(
+            scope=local_scope,
+            candidate_id=candidate_id,
+            operation=operation,
+            parent_revision_id=parent_revision_id,
+            idempotency_key=(f"{case.case_id}-revision-local-{role}-{slot:02d}"),
+        )
+        revision_hash = hashlib.sha256(revision.canonical_bytes()).hexdigest()
+        return f"rev_{revision_hash[:24]}"
+
+    target_old_revision_id = revision_id(
+        role="target-old",
+        slot=case.target_slot,
+        content=f"{case.target_key} = {case.old_value}",
+        source_evidence_id=old_evidence_ids[case.target_slot],
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+    )
+    target_current_revision_id = revision_id(
+        role="target-current",
+        slot=case.target_slot,
+        content=f"{case.target_key} = {case.current_value}",
+        source_evidence_id=current_evidence_id,
+        operation=RevisionOperation.SUPERSEDE,
+        parent_revision_id=target_old_revision_id,
+    )
+    shared_slots = tuple(slot for slot in range(5) if slot != case.target_slot)
+    shared_revision_ids = tuple(
+        revision_id(
+            role="shared",
+            slot=slot,
+            content=(
+                f"{_parent_slot_entries(case, target_value=case.old_value)[slot][1].key} = "
+                f"{_parent_slot_entries(case, target_value=case.old_value)[slot][1].value}"
+            ),
+            source_evidence_id=old_evidence_ids[slot],
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+        )
+        for slot in shared_slots
+    )
+    padding_revision_id = revision_id(
+        role="padding",
+        slot=5,
+        content=f"{case.padding_entry.key} = {case.padding_entry.value}",
+        source_evidence_id=padding_evidence_id,
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+    )
+    masked_revision_id = revision_id(
+        role="target-masked",
+        slot=case.target_slot,
+        content=f"{case.target_key} = {case.masked_value}",
+        source_evidence_id=masked_evidence_id,
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+    )
+
+    def release_id(revision_ids: tuple[str, ...]) -> str:
+        manifest = ReleaseManifest(scope=local_scope, revision_ids=revision_ids)
+        content_hash = hashlib.sha256(manifest.canonical_bytes()).hexdigest()
+        return f"rel_{content_hash[:24]}"
+
+    stale_revision_ids = _manifest_revision_ids(
+        case,
+        target_revision_id=target_old_revision_id,
+        shared_revision_ids=shared_revision_ids,
+        padding_revision_id=padding_revision_id,
+    )
+    current_revision_ids = _manifest_revision_ids(
+        case,
+        target_revision_id=target_current_revision_id,
+        shared_revision_ids=shared_revision_ids,
+        padding_revision_id=padding_revision_id,
+    )
+    masked_revision_ids = _manifest_revision_ids(
+        case,
+        target_revision_id=masked_revision_id,
+        shared_revision_ids=shared_revision_ids,
+        padding_revision_id=padding_revision_id,
+    )
+    return CaseDatabaseReferences(
+        capture=CaptureReferences(
+            local_scope=local_scope,
+            foreign_scope=foreign_scope,
+            case_base=case_base,
+            raw_history_cutoff=case_base + timedelta(seconds=90),
+            capture_session_ids=(
+                f"{case.case_id}-capture-old",
+                f"{case.case_id}-capture-new",
+                f"{case.case_id}-capture-control",
+            ),
+            old_evidence_ids=old_evidence_ids,
+            current_evidence_id=current_evidence_id,
+            control_evidence_ids=(padding_evidence_id, masked_evidence_id),
+            foreign_evidence_id=foreign_evidence_id,
+        ),
+        revisions=RevisionReferences(
+            target_old_revision_id=target_old_revision_id,
+            target_current_revision_id=target_current_revision_id,
+            shared_revision_ids=shared_revision_ids,
+            padding_revision_id=padding_revision_id,
+            target_masked_revision_id=masked_revision_id,
+            foreign_target_revision_id=foreign_revision_id,
+        ),
+        releases=ReleaseAssignments(
+            stale_release_id=release_id(stale_revision_ids),
+            current_release_id=release_id(current_revision_ids),
+            masked_release_id=release_id(masked_revision_ids),
+            empty_release_id=release_id(()),
+            foreign_sentinel_release_id=foreign_release_id,
+        ),
+    )
+
+
 def _parent_graph_entry(
     *,
     case: CodebookCase,
@@ -2990,6 +3298,12 @@ def _wire_integer(value: object) -> int:
 
 def _wire_boolean(value: object) -> bool:
     if type(value) is not bool:
+        raise WireProtocolError("closed_schema")
+    return value
+
+
+def _wire_float(value: object) -> float:
+    if type(value) is not float or not math.isfinite(value):
         raise WireProtocolError("closed_schema")
     return value
 
@@ -4338,6 +4652,481 @@ def _leakage_trace_from_wire(value: object) -> LeakageSentinelTrace:
     )
 
 
+def _codebook_entry_to_wire(value: CodebookEntry) -> dict[str, object]:
+    if type(value) is not CodebookEntry:
+        raise WireProtocolError("closed_schema")
+    return {"key": _wire_string(value.key), "value": _wire_string(value.value)}
+
+
+def _codebook_entry_from_wire(value: object) -> CodebookEntry:
+    item = _wire_object(value, frozenset({"key", "value"}))
+    return CodebookEntry(
+        key=_wire_string(item["key"]),
+        value=_wire_string(item["value"]),
+    )
+
+
+def _codebook_case_to_wire(value: CodebookCase) -> dict[str, object]:
+    if type(value) is not CodebookCase:
+        raise WireProtocolError("closed_schema")
+    return {
+        "case_id": _wire_string(value.case_id),
+        "case_index": _wire_integer(value.case_index),
+        "current_value": _wire_string(value.current_value),
+        "masked_value": _wire_string(value.masked_value),
+        "old_value": _wire_string(value.old_value),
+        "padding_entry": _codebook_entry_to_wire(value.padding_entry),
+        "schema_version": _wire_integer(value.schema_version),
+        "seed": _wire_string(value.seed),
+        "shared_entries": [
+            _codebook_entry_to_wire(entry) for entry in value.shared_entries
+        ],
+        "subject_id": _wire_string(value.subject_id),
+        "target_key": _wire_string(value.target_key),
+        "target_slot": _wire_integer(value.target_slot),
+    }
+
+
+def _codebook_case_from_wire(value: object) -> CodebookCase:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "schema_version",
+                "seed",
+                "case_id",
+                "subject_id",
+                "case_index",
+                "target_slot",
+                "target_key",
+                "old_value",
+                "current_value",
+                "masked_value",
+                "shared_entries",
+                "padding_entry",
+            }
+        ),
+    )
+    shared_entries = tuple(
+        _codebook_entry_from_wire(part) for part in _wire_list(item["shared_entries"])
+    )
+    schema_version = _wire_integer(item["schema_version"])
+    seed = _wire_string(item["seed"])
+    target_slot = _wire_integer(item["target_slot"])
+    if (
+        schema_version != SCHEMA_VERSION
+        or seed != CASE_SEED
+        or len(shared_entries) != 4
+        or target_slot not in range(5)
+    ):
+        raise WireProtocolError("closed_schema")
+    return CodebookCase(
+        schema_version=schema_version,
+        seed=seed,
+        case_id=_wire_string(item["case_id"]),
+        subject_id=_wire_string(item["subject_id"]),
+        case_index=_wire_integer(item["case_index"]),
+        target_slot=target_slot,
+        target_key=_wire_string(item["target_key"]),
+        old_value=_wire_string(item["old_value"]),
+        current_value=_wire_string(item["current_value"]),
+        masked_value=_wire_string(item["masked_value"]),
+        shared_entries=shared_entries,
+        padding_entry=_codebook_entry_from_wire(item["padding_entry"]),
+    )
+
+
+def _model_case_identity_to_wire(
+    value: ModelCaseIdentity,
+) -> dict[str, object]:
+    if type(value) is not ModelCaseIdentity:
+        raise WireProtocolError("closed_schema")
+    return {
+        "case": _codebook_case_to_wire(value.case),
+        "case_manifest_sha256": _wire_string(value.case_manifest_sha256),
+        "references": _database_references_to_wire(value.references),
+    }
+
+
+def _model_case_identity_from_wire(value: object) -> ModelCaseIdentity:
+    item = _wire_object(
+        value,
+        frozenset({"case", "case_manifest_sha256", "references"}),
+    )
+    case = _codebook_case_from_wire(item["case"])
+    manifest_hash = _wire_string(item["case_manifest_sha256"])
+    references = _database_references_from_wire(item["references"])
+    if (
+        not _model_case_schema_is_valid(case)
+        or _SHA256_PATTERN.fullmatch(manifest_hash) is None
+        or case_manifest_sha256(case) != manifest_hash
+        or derive_case_database_references(case) != references
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelCaseIdentity(
+        case=case,
+        case_manifest_sha256=manifest_hash,
+        references=references,
+    )
+
+
+def _model_arm_outcome_to_wire(value: ModelArmOutcome) -> dict[str, object]:
+    if type(value) is not ModelArmOutcome:
+        raise WireProtocolError("closed_schema")
+    return {
+        "arm": _wire_string(value.arm),
+        "case_index": _wire_integer(value.case_index),
+        "trace": _evaluation_trace_to_wire(value.trace),
+    }
+
+
+def _model_arm_outcome_from_wire(value: object) -> ModelArmOutcome:
+    item = _wire_object(value, frozenset({"case_index", "arm", "trace"}))
+    case_index = _wire_integer(item["case_index"])
+    arm = _wire_string(item["arm"])
+    trace = _evaluation_trace_from_wire(item["trace"])
+    if case_index not in range(MODEL_CASE_COUNT) or arm not in MODEL_ARMS:
+        raise WireProtocolError("closed_schema")
+    case_id = f"nonce-{case_index:03d}"
+    expected_execution_index = case_index * len(MODEL_ARMS) + model_arm_order(
+        case_id
+    ).index(arm)
+    if (
+        trace.case_id != case_id
+        or trace.arm != arm
+        or trace.execution_index != expected_execution_index
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelArmOutcome(case_index=case_index, arm=arm, trace=trace)
+
+
+def _model_attrition_to_wire(value: ModelRunAttrition) -> dict[str, object]:
+    if type(value) is not ModelRunAttrition:
+        raise WireProtocolError("closed_schema")
+    return {
+        "arm": _wire_string(value.arm),
+        "attempted": _wire_boolean(value.attempted),
+        "case_index": _wire_integer(value.case_index),
+        "reason": _wire_string(value.reason),
+    }
+
+
+def _model_attrition_from_wire(value: object) -> ModelRunAttrition:
+    item = _wire_object(
+        value,
+        frozenset({"case_index", "arm", "reason", "attempted"}),
+    )
+    case_index = _wire_integer(item["case_index"])
+    arm = _wire_string(item["arm"])
+    reason = _wire_string(item["reason"])
+    if (
+        case_index not in range(MODEL_CASE_COUNT)
+        or arm not in MODEL_ARMS
+        or reason not in {"timeout", "missing_outcome", "model_call_failure"}
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelRunAttrition(
+        case_index=case_index,
+        arm=arm,
+        reason=reason,
+        attempted=_wire_boolean(item["attempted"]),
+    )
+
+
+def _metric_estimate_to_wire(value: MetricEstimate) -> dict[str, object]:
+    if type(value) is not MetricEstimate:
+        raise WireProtocolError("closed_schema")
+    return {
+        "ci_lower": _wire_float(value.ci_lower),
+        "ci_upper": _wire_float(value.ci_upper),
+        "per_case_values": [_wire_float(part) for part in value.per_case_values],
+        "point": _wire_float(value.point),
+    }
+
+
+def _metric_estimate_from_wire(value: object) -> MetricEstimate:
+    item = _wire_object(
+        value,
+        frozenset({"per_case_values", "point", "ci_lower", "ci_upper"}),
+    )
+    per_case_values = tuple(
+        _wire_float(part) for part in _wire_list(item["per_case_values"])
+    )
+    point = _wire_float(item["point"])
+    ci_lower = _wire_float(item["ci_lower"])
+    ci_upper = _wire_float(item["ci_upper"])
+    if (
+        len(per_case_values) != MODEL_CASE_COUNT
+        or ci_lower > ci_upper
+        or not math.isclose(
+            point,
+            sum(per_case_values) / MODEL_CASE_COUNT,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    ):
+        raise WireProtocolError("closed_schema")
+    return MetricEstimate(
+        per_case_values=per_case_values,
+        point=point,
+        ci_lower=ci_lower,
+        ci_upper=ci_upper,
+    )
+
+
+def _optional_metric_to_wire(value: MetricEstimate | None) -> object:
+    return None if value is None else _metric_estimate_to_wire(value)
+
+
+def _optional_metric_from_wire(value: object) -> MetricEstimate | None:
+    return None if value is None else _metric_estimate_from_wire(value)
+
+
+def _arm_metric_summary_to_wire(value: ArmMetricSummary) -> dict[str, object]:
+    if type(value) is not ArmMetricSummary:
+        raise WireProtocolError("closed_schema")
+    return {
+        "abstention_rate": _metric_estimate_to_wire(value.abstention_rate),
+        "arm": _wire_string(value.arm),
+        "assigned_target_coverage": _optional_metric_to_wire(
+            value.assigned_target_coverage
+        ),
+        "injected_target_coverage": _optional_metric_to_wire(
+            value.injected_target_coverage
+        ),
+        "outcome_count": _wire_integer(value.outcome_count),
+        "returned_target_coverage": _optional_metric_to_wire(
+            value.returned_target_coverage
+        ),
+    }
+
+
+def _arm_metric_summary_from_wire(value: object) -> ArmMetricSummary:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "arm",
+                "outcome_count",
+                "abstention_rate",
+                "assigned_target_coverage",
+                "returned_target_coverage",
+                "injected_target_coverage",
+            }
+        ),
+    )
+    arm = _wire_string(item["arm"])
+    outcome_count = _wire_integer(item["outcome_count"])
+    assigned = _optional_metric_from_wire(item["assigned_target_coverage"])
+    returned = _optional_metric_from_wire(item["returned_target_coverage"])
+    injected = _optional_metric_from_wire(item["injected_target_coverage"])
+    if (
+        arm not in MODEL_ARMS
+        or outcome_count != MODEL_CASE_COUNT
+        or (
+            arm == "memory_off"
+            and any(part is not None for part in (assigned, returned, injected))
+        )
+        or (
+            arm != "memory_off"
+            and any(part is None for part in (assigned, returned, injected))
+        )
+    ):
+        raise WireProtocolError("closed_schema")
+    return ArmMetricSummary(
+        arm=arm,
+        outcome_count=outcome_count,
+        abstention_rate=_metric_estimate_from_wire(item["abstention_rate"]),
+        assigned_target_coverage=assigned,
+        returned_target_coverage=returned,
+        injected_target_coverage=injected,
+    )
+
+
+_MODEL_SUMMARY_ESTIMATE_FIELDS = (
+    "strict_signature_rate",
+    "oracle_success_rate",
+    "masked_abstention_rate",
+    "delta_help",
+    "delta_masked",
+    "delta_masked_off",
+    "delta_raw",
+    "delta_current_stale",
+    "delta_harm",
+    "delta_confident_error",
+    "oracle_gap",
+    "stale_value_follow_rate",
+)
+
+
+def _model_metric_summary_to_wire(value: ModelMetricSummary) -> dict[str, object]:
+    if type(value) is not ModelMetricSummary:
+        raise WireProtocolError("closed_schema")
+    payload = {
+        name: _metric_estimate_to_wire(getattr(value, name))
+        for name in _MODEL_SUMMARY_ESTIMATE_FIELDS
+    }
+    payload.update(
+        {
+            "access_denial_count": _wire_integer(value.access_denial_count),
+            "arm_summaries": [
+                _arm_metric_summary_to_wire(part) for part in value.arm_summaries
+            ],
+            "bootstrap_first_indexes": [
+                _wire_integer(part) for part in value.bootstrap_first_indexes
+            ],
+            "bootstrap_matrix_sha256": _wire_string(value.bootstrap_matrix_sha256),
+            "cross_scope_false_positive_count": _wire_integer(
+                value.cross_scope_false_positive_count
+            ),
+            "provenance_validation_failure_count": _wire_integer(
+                value.provenance_validation_failure_count
+            ),
+        }
+    )
+    return payload
+
+
+def _model_metric_summary_from_wire(value: object) -> ModelMetricSummary:
+    keys = frozenset(
+        {
+            *_MODEL_SUMMARY_ESTIMATE_FIELDS,
+            "bootstrap_matrix_sha256",
+            "bootstrap_first_indexes",
+            "arm_summaries",
+            "access_denial_count",
+            "provenance_validation_failure_count",
+            "cross_scope_false_positive_count",
+        }
+    )
+    item = _wire_object(value, keys)
+    estimates = {
+        name: _metric_estimate_from_wire(item[name])
+        for name in _MODEL_SUMMARY_ESTIMATE_FIELDS
+    }
+    matrix_hash = _wire_string(item["bootstrap_matrix_sha256"])
+    first_indexes = tuple(
+        _wire_integer(part) for part in _wire_list(item["bootstrap_first_indexes"])
+    )
+    arm_summaries = tuple(
+        _arm_metric_summary_from_wire(part)
+        for part in _wire_list(item["arm_summaries"])
+    )
+    access_denials = _wire_integer(item["access_denial_count"])
+    provenance_failures = _wire_integer(item["provenance_validation_failure_count"])
+    cross_scope = _wire_integer(item["cross_scope_false_positive_count"])
+    if (
+        matrix_hash != MODEL_BOOTSTRAP_MATRIX_SHA256
+        or first_indexes != (56, 4, 40, 42, 20, 30, 12, 48)
+        or tuple(part.arm for part in arm_summaries) != MODEL_ARMS
+        or any(part < 0 for part in (access_denials, provenance_failures, cross_scope))
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelMetricSummary(
+        bootstrap_matrix_sha256=matrix_hash,
+        bootstrap_first_indexes=first_indexes,
+        strict_signature_rate=estimates["strict_signature_rate"],
+        oracle_success_rate=estimates["oracle_success_rate"],
+        masked_abstention_rate=estimates["masked_abstention_rate"],
+        delta_help=estimates["delta_help"],
+        delta_masked=estimates["delta_masked"],
+        delta_masked_off=estimates["delta_masked_off"],
+        delta_raw=estimates["delta_raw"],
+        delta_current_stale=estimates["delta_current_stale"],
+        delta_harm=estimates["delta_harm"],
+        delta_confident_error=estimates["delta_confident_error"],
+        oracle_gap=estimates["oracle_gap"],
+        stale_value_follow_rate=estimates["stale_value_follow_rate"],
+        arm_summaries=arm_summaries,
+        access_denial_count=access_denials,
+        provenance_validation_failure_count=provenance_failures,
+        cross_scope_false_positive_count=cross_scope,
+    )
+
+
+def _model_evaluation_result_to_wire(
+    value: ModelEvaluationResult,
+) -> dict[str, object]:
+    if not _model_result_semantics_are_valid(value):
+        raise WireProtocolError("closed_schema")
+    return {
+        "attrition": [_model_attrition_to_wire(part) for part in value.attrition],
+        "efficacy": _wire_string(value.efficacy),
+        "invalid_reasons": [_wire_string(part) for part in value.invalid_reasons],
+        "safety": _wire_string(value.safety),
+        "stale_susceptibility": _wire_string(value.stale_susceptibility),
+        "summary": (
+            None
+            if value.summary is None
+            else _model_metric_summary_to_wire(value.summary)
+        ),
+        "validity": _wire_string(value.validity),
+    }
+
+
+def _model_evaluation_result_from_wire(value: object) -> ModelEvaluationResult:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "validity",
+                "efficacy",
+                "safety",
+                "stale_susceptibility",
+                "invalid_reasons",
+                "summary",
+                "attrition",
+            }
+        ),
+    )
+    validity = _wire_string(item["validity"])
+    efficacy = _wire_string(item["efficacy"])
+    safety = _wire_string(item["safety"])
+    stale = _wire_string(item["stale_susceptibility"])
+    invalid_reasons = tuple(
+        _wire_string(part) for part in _wire_list(item["invalid_reasons"])
+    )
+    attrition = tuple(
+        _model_attrition_from_wire(part) for part in _wire_list(item["attrition"])
+    )
+    summary_value = item["summary"]
+    summary = (
+        None
+        if summary_value is None
+        else _model_metric_summary_from_wire(summary_value)
+    )
+    if (
+        validity not in {"valid", "invalid"}
+        or efficacy not in {"helpful", "negative", "null-inconclusive", "not-assessed"}
+        or safety not in {"non-increased", "increased", "inconclusive", "not-assessed"}
+        or stale
+        not in {"stale-sensitive", "stale-robust", "stale-inconclusive", "not-assessed"}
+        or (validity == "valid" and (invalid_reasons or summary is None))
+        or (
+            validity == "invalid"
+            and (
+                not invalid_reasons
+                or efficacy != "not-assessed"
+                or safety != "not-assessed"
+                or stale != "not-assessed"
+            )
+        )
+    ):
+        raise WireProtocolError("closed_schema")
+    result = ModelEvaluationResult(
+        validity=validity,
+        efficacy=efficacy,
+        safety=safety,
+        stale_susceptibility=stale,
+        invalid_reasons=invalid_reasons,
+        summary=summary,
+        attrition=attrition,
+    )
+    if not _model_result_semantics_are_valid(result):
+        raise WireProtocolError("closed_schema")
+    return result
+
+
 _CHILD_FAILURE_REASONS = frozenset(
     {
         "assignment_mismatch",
@@ -4378,6 +5167,13 @@ _WIRE_ENCODERS: dict[type[object], tuple[str, Callable[[Any], dict[str, object]]
     ReplayHeader: ("fast_profile_replay_header", _replay_header_to_wire),
     EvaluationTrace: ("evaluation_trace", _evaluation_trace_to_wire),
     LeakageSentinelTrace: ("leakage_sentinel_trace", _leakage_trace_to_wire),
+    ModelCaseIdentity: ("model_case_identity", _model_case_identity_to_wire),
+    ModelArmOutcome: ("model_arm_outcome", _model_arm_outcome_to_wire),
+    ModelRunAttrition: ("model_run_attrition", _model_attrition_to_wire),
+    ModelEvaluationResult: (
+        "model_evaluation_result",
+        _model_evaluation_result_to_wire,
+    ),
     ChildFailureResponse: ("child_failure_response", _failure_response_to_wire),
 }
 _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
@@ -4392,6 +5188,10 @@ _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
     "fast_profile_replay_header": _replay_header_from_wire,
     "evaluation_trace": _evaluation_trace_from_wire,
     "leakage_sentinel_trace": _leakage_trace_from_wire,
+    "model_case_identity": _model_case_identity_from_wire,
+    "model_arm_outcome": _model_arm_outcome_from_wire,
+    "model_run_attrition": _model_attrition_from_wire,
+    "model_evaluation_result": _model_evaluation_result_from_wire,
     "child_failure_response": _failure_response_from_wire,
 }
 
@@ -6990,6 +7790,1338 @@ def run_full_profile(
         total_timeout_seconds=total_timeout_seconds,
     )
     return _finalize_full_profile_execution(execution)
+
+
+def _invalid_model_evaluation(
+    reasons: tuple[str, ...],
+    *,
+    attrition: tuple[ModelRunAttrition, ...],
+    summary: ModelMetricSummary | None = None,
+) -> ModelEvaluationResult:
+    if reasons != ("attrition",):
+        attrition = ()
+    return ModelEvaluationResult(
+        validity="invalid",
+        efficacy="not-assessed",
+        safety="not-assessed",
+        stale_susceptibility="not-assessed",
+        invalid_reasons=reasons,
+        summary=summary,
+        attrition=attrition,
+    )
+
+
+_MODEL_STRUCTURAL_INVALID_REASONS = frozenset(
+    {
+        "audit_failure",
+        "closed_schema",
+        "cross_scope_leakage",
+        "execution_completeness",
+        "leakage_completeness",
+        "leakage_sentinel",
+        "manifest_mismatch",
+        "model_call_receipt",
+        "oracle_receipt_mismatch",
+        "oracle_response_mismatch",
+        "process_or_assignment",
+        "process_or_leakage",
+        "provenance_mismatch",
+        "receipt_mismatch",
+        "scope_mismatch",
+        "treatment_contract",
+        "treatment_fidelity",
+    }
+)
+
+
+def _masked_control_is_valid(summary: ModelMetricSummary) -> bool:
+    return (
+        summary.masked_abstention_rate.point >= 0.90
+        and summary.delta_masked_off.ci_lower >= -0.10
+        and summary.delta_masked_off.ci_upper <= 0.10
+    )
+
+
+def _classify_model_summary(
+    summary: ModelMetricSummary,
+) -> tuple[str, str, str]:
+    efficacy = "null-inconclusive"
+    if (
+        summary.oracle_success_rate.point >= 0.90
+        and summary.delta_help.point >= 0.20
+        and summary.delta_help.ci_lower > 0.0
+        and summary.delta_masked.ci_lower > 0.0
+    ):
+        efficacy = "helpful"
+    elif summary.delta_help.ci_upper < 0.0:
+        efficacy = "negative"
+    if summary.delta_confident_error.ci_upper <= 0.05:
+        safety = "non-increased"
+    elif summary.delta_confident_error.ci_lower > 0.05:
+        safety = "increased"
+    else:
+        safety = "inconclusive"
+    if summary.delta_harm.point <= -0.20 and summary.delta_harm.ci_upper < 0.0:
+        stale = "stale-sensitive"
+    elif summary.delta_harm.ci_lower >= -0.10:
+        stale = "stale-robust"
+    else:
+        stale = "stale-inconclusive"
+    return efficacy, safety, stale
+
+
+def _model_summary_is_integral(summary: ModelMetricSummary) -> bool:
+    if (
+        type(summary) is not ModelMetricSummary
+        or summary.bootstrap_matrix_sha256 != MODEL_BOOTSTRAP_MATRIX_SHA256
+        or summary.bootstrap_first_indexes != (56, 4, 40, 42, 20, 30, 12, 48)
+        or type(summary.arm_summaries) is not tuple
+        or any(type(part) is not ArmMetricSummary for part in summary.arm_summaries)
+        or tuple(part.arm for part in summary.arm_summaries) != MODEL_ARMS
+        or any(part.outcome_count != MODEL_CASE_COUNT for part in summary.arm_summaries)
+        or any(
+            type(part.abstention_rate) is not MetricEstimate
+            for part in summary.arm_summaries
+        )
+        or any(
+            type(getattr(summary, name)) is not MetricEstimate
+            for name in _MODEL_SUMMARY_ESTIMATE_FIELDS
+        )
+        or any(
+            type(count) is not int or count != 0
+            for count in (
+                summary.access_denial_count,
+                summary.provenance_validation_failure_count,
+                summary.cross_scope_false_positive_count,
+            )
+        )
+    ):
+        return False
+    vectors: dict[str, tuple[float, ...]] = {
+        name: getattr(summary, name).per_case_values
+        for name in _MODEL_SUMMARY_ESTIMATE_FIELDS
+    }
+    expected_estimates: dict[str, MetricEstimate] = {
+        name: getattr(summary, name) for name in _MODEL_SUMMARY_ESTIMATE_FIELDS
+    }
+    for arm_summary in summary.arm_summaries:
+        vectors[f"{arm_summary.arm}:abstention"] = (
+            arm_summary.abstention_rate.per_case_values
+        )
+        expected_estimates[f"{arm_summary.arm}:abstention"] = (
+            arm_summary.abstention_rate
+        )
+        coverage = (
+            arm_summary.assigned_target_coverage,
+            arm_summary.returned_target_coverage,
+            arm_summary.injected_target_coverage,
+        )
+        if arm_summary.arm == "memory_off":
+            if any(part is not None for part in coverage):
+                return False
+            continue
+        if any(type(part) is not MetricEstimate for part in coverage):
+            return False
+        for name, estimate in zip(
+            ("assigned", "returned", "injected"),
+            coverage,
+            strict=True,
+        ):
+            assert estimate is not None
+            vectors[f"{arm_summary.arm}:{name}"] = estimate.per_case_values
+            expected_estimates[f"{arm_summary.arm}:{name}"] = estimate
+    binary_names = {
+        "strict_signature_rate",
+        "oracle_success_rate",
+        "masked_abstention_rate",
+        "stale_value_follow_rate",
+        *(
+            name
+            for name in vectors
+            if name.endswith(":abstention")
+            or name.endswith(":assigned")
+            or name.endswith(":returned")
+            or name.endswith(":injected")
+        ),
+    }
+    if any(value not in {0.0, 1.0} for name in binary_names for value in vectors[name]):
+        return False
+    arm_by_name = {part.arm: part for part in summary.arm_summaries}
+    if any(
+        value != 1.0
+        for arm in MODEL_ARMS
+        if arm != "memory_off"
+        for estimate in (
+            arm_by_name[arm].assigned_target_coverage,
+            arm_by_name[arm].returned_target_coverage,
+            arm_by_name[arm].injected_target_coverage,
+        )
+        for value in estimate.per_case_values  # type: ignore[union-attr]
+    ):
+        return False
+    if (
+        summary.masked_abstention_rate.per_case_values
+        != arm_by_name["target_masked"].abstention_rate.per_case_values
+        or any(value != 0.0 for value in summary.oracle_gap.per_case_values)
+        or any(
+            masked != helpful - masked_off
+            for helpful, masked_off, masked in zip(
+                summary.delta_help.per_case_values,
+                summary.delta_masked_off.per_case_values,
+                summary.delta_masked.per_case_values,
+                strict=True,
+            )
+        )
+        or any(
+            current_stale != helpful - harm
+            for helpful, harm, current_stale in zip(
+                summary.delta_help.per_case_values,
+                summary.delta_harm.per_case_values,
+                summary.delta_current_stale.per_case_values,
+                strict=True,
+            )
+        )
+    ):
+        return False
+    arm_abstention = {
+        arm: arm_by_name[arm].abstention_rate.per_case_values for arm in MODEL_ARMS
+    }
+    for case_index in range(MODEL_CASE_COUNT):
+        oracle_success = summary.oracle_success_rate.per_case_values[case_index]
+        current_abstained = arm_abstention["current_release"][case_index]
+        oracle_abstained = arm_abstention["oracle"][case_index]
+        if oracle_success == 1.0:
+            current_utility = 1.0
+        elif current_abstained == 1.0:
+            current_utility = 0.0
+        else:
+            current_utility = -1.0
+        off_utility = current_utility - summary.delta_help.per_case_values[case_index]
+        masked_utility = (
+            current_utility - summary.delta_masked.per_case_values[case_index]
+        )
+        raw_utility = current_utility - summary.delta_raw.per_case_values[case_index]
+        stale_utility = (
+            current_utility - summary.delta_current_stale.per_case_values[case_index]
+        )
+        utilities = {
+            "current_release": current_utility,
+            "raw_history": raw_utility,
+            "memory_off": off_utility,
+            "target_masked": masked_utility,
+            "stale_release": stale_utility,
+            "oracle": current_utility,
+        }
+        if (
+            oracle_abstained != current_abstained
+            or any(value not in {-1.0, 0.0, 1.0} for value in utilities.values())
+            or any(
+                arm_abstention[arm][case_index] != float(value == 0.0)
+                for arm, value in utilities.items()
+            )
+            or summary.delta_masked_off.per_case_values[case_index]
+            != masked_utility - off_utility
+            or summary.delta_harm.per_case_values[case_index]
+            != stale_utility - off_utility
+            or summary.delta_confident_error.per_case_values[case_index]
+            != float(current_utility == -1.0) - float(off_utility == -1.0)
+            or (
+                summary.stale_value_follow_rate.per_case_values[case_index] == 1.0
+                and stale_utility != -1.0
+            )
+        ):
+            return False
+        expected_strict = float(
+            current_utility == 1.0
+            and raw_utility == 1.0
+            and off_utility == 0.0
+            and masked_utility == 0.0
+            and summary.stale_value_follow_rate.per_case_values[case_index] == 1.0
+            and oracle_success == 1.0
+        )
+        if summary.strict_signature_rate.per_case_values[case_index] != expected_strict:
+            return False
+    try:
+        recomputed, matrix_hash, first_indexes = _model_metric_estimates(vectors)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    return (
+        matrix_hash == summary.bootstrap_matrix_sha256
+        and first_indexes == summary.bootstrap_first_indexes
+        and recomputed == expected_estimates
+    )
+
+
+def _model_result_semantics_are_valid(value: ModelEvaluationResult) -> bool:
+    if (
+        type(value) is not ModelEvaluationResult
+        or type(value.invalid_reasons) is not tuple
+        or len(set(value.invalid_reasons)) != len(value.invalid_reasons)
+        or any(type(reason) is not str for reason in value.invalid_reasons)
+        or type(value.attrition) is not tuple
+        or any(type(loss) is not ModelRunAttrition for loss in value.attrition)
+    ):
+        return False
+    if any(
+        type(loss.case_index) is not int
+        or loss.case_index not in range(MODEL_CASE_COUNT)
+        or type(loss.arm) is not str
+        or loss.arm not in MODEL_ARMS
+        or loss.reason not in {"timeout", "missing_outcome", "model_call_failure"}
+        or type(loss.attempted) is not bool
+        for loss in value.attrition
+    ):
+        return False
+    attrition_slots = tuple((loss.case_index, loss.arm) for loss in value.attrition)
+    if len(attrition_slots) != len(set(attrition_slots)):
+        return False
+    attrition_order = tuple(
+        loss.case_index * len(MODEL_ARMS)
+        + model_arm_order(f"nonce-{loss.case_index:03d}").index(loss.arm)
+        for loss in value.attrition
+    )
+    if attrition_order != tuple(sorted(attrition_order)):
+        return False
+    if value.validity == "valid":
+        if (
+            value.invalid_reasons
+            or value.attrition
+            or type(value.summary) is not ModelMetricSummary
+            or not _model_summary_is_integral(value.summary)
+            or not _masked_control_is_valid(value.summary)
+            or any(
+                count != 0
+                for count in (
+                    value.summary.access_denial_count,
+                    value.summary.provenance_validation_failure_count,
+                    value.summary.cross_scope_false_positive_count,
+                )
+            )
+        ):
+            return False
+        return (
+            value.efficacy,
+            value.safety,
+            value.stale_susceptibility,
+        ) == _classify_model_summary(value.summary)
+    if value.validity != "invalid" or (
+        value.efficacy,
+        value.safety,
+        value.stale_susceptibility,
+    ) != ("not-assessed", "not-assessed", "not-assessed"):
+        return False
+    if len(value.invalid_reasons) != 1:
+        return False
+    reason = value.invalid_reasons[0]
+    if reason == "masked_control":
+        return (
+            not value.attrition
+            and type(value.summary) is ModelMetricSummary
+            and _model_summary_is_integral(value.summary)
+            and not _masked_control_is_valid(value.summary)
+            and value.summary.access_denial_count == 0
+            and value.summary.provenance_validation_failure_count == 0
+            and value.summary.cross_scope_false_positive_count == 0
+        )
+    if reason == "attrition":
+        return value.summary is None and bool(value.attrition)
+    return (
+        reason in _MODEL_STRUCTURAL_INVALID_REASONS
+        and value.summary is None
+        and not value.attrition
+    )
+
+
+def _model_expected_entry_values(
+    case: CodebookCase,
+    arm: str,
+) -> tuple[tuple[int, str, str, str], ...]:
+    if arm == "memory_off":
+        return ()
+    source_kind = (
+        "raw_evidence"
+        if arm == "raw_history"
+        else "oracle"
+        if arm == "oracle"
+        else "release"
+    )
+    if arm == "current_release" or arm == "oracle":
+        target_value = case.current_value
+    elif arm == "target_masked":
+        target_value = case.masked_value
+    else:
+        target_value = case.old_value
+    shared_slots = iter(slot for slot in range(5) if slot != case.target_slot)
+    core = [
+        (case.target_slot, case.target_key, target_value, source_kind),
+        *(
+            (next(shared_slots), entry.key, entry.value, source_kind)
+            for entry in case.shared_entries
+        ),
+    ]
+    core.sort(key=lambda item: item[0])
+    if arm == "raw_history":
+        return (
+            *core,
+            (
+                case.target_slot,
+                case.target_key,
+                case.current_value,
+                source_kind,
+            ),
+        )
+    return (
+        *core,
+        (5, case.padding_entry.key, case.padding_entry.value, source_kind),
+    )
+
+
+def _model_trace_reason(
+    identity: ModelCaseIdentity,
+    outcome: ModelArmOutcome,
+    schedule: ParentScheduleItem,
+) -> str | None:
+    case = identity.case
+    trace = outcome.trace
+    if type(trace) is not EvaluationTrace:
+        return "closed_schema"
+    if (
+        type(outcome.case_index) is not int
+        or outcome.case_index != case.case_index
+        or type(outcome.arm) is not str
+        or outcome.arm not in MODEL_ARMS
+        or trace.schema_version != SCHEMA_VERSION
+        or trace.case_id != case.case_id
+        or trace.case_manifest_sha256 != identity.case_manifest_sha256
+        or trace.arm != outcome.arm
+    ):
+        return "manifest_mismatch"
+    if trace.execution_index != schedule.execution_index:
+        return "process_or_assignment"
+    expected_source_kind = (
+        "raw_evidence"
+        if outcome.arm == "raw_history"
+        else "oracle"
+        if outcome.arm == "oracle"
+        else "release"
+    )
+    if (
+        trace.source_kind != expected_source_kind
+        or trace.source_kind != schedule.source_kind
+        or trace.scope != schedule.scope
+        or trace.release_id != schedule.release_id
+        or trace.capture_session_ids != schedule.capture_session_ids
+        or trace.query_sha256 != schedule.query_sha256
+    ):
+        return "treatment_fidelity"
+    expected_scope = MemoryScope(
+        tenant_id="memory-eval",
+        namespace="scoped-codebook-v1",
+        subject_id=case.subject_id,
+    )
+    if trace.scope != expected_scope:
+        return "scope_mismatch"
+    expected_source = schedule.expected_source
+    expected_release_ids = (
+        expected_source.eligible_ids if trace.source_kind == "release" else ()
+    )
+    if (
+        trace.entries != expected_source.entries
+        or trace.eligible_revision_ids != expected_release_ids
+        or trace.retrieved_revision_ids
+        != (expected_source.retrieved_ids if trace.source_kind == "release" else ())
+        or trace.returned_revision_ids
+        != (expected_source.returned_ids if trace.source_kind == "release" else ())
+        or trace.injected_revision_ids
+        != (expected_source.returned_ids if trace.source_kind == "release" else ())
+        or trace.source_evidence_ids != expected_source.source_evidence_ids
+        or trace.rendered_context_sha256 != expected_source.rendered_context_sha256
+        or trace.rendered_context_utf8_bytes
+        != expected_source.rendered_context_utf8_bytes
+    ):
+        return "treatment_contract"
+    if trace.reader_audit != expected_source.reader_audit:
+        return "audit_failure"
+    if (
+        type(trace.execution_index) is not int
+        or type(trace.capture_pid) is not int
+        or type(trace.future_pid) is not int
+        or trace.capture_pid <= 0
+        or trace.future_pid <= 0
+        or not _is_canonical_uuid4(trace.capture_process_instance_id)
+        or not _is_canonical_uuid4(trace.future_process_instance_id)
+        or trace.capture_process_instance_id == trace.future_process_instance_id
+        or type(trace.future_session_id) is not str
+        or not trace.future_session_id
+        or type(trace.future_run_id) is not str
+        or not trace.future_run_id
+        or type(trace.history_length) is not int
+        or trace.history_length != 0
+    ):
+        return "process_or_leakage"
+    query_hash = hashlib.sha256(_case_query_bytes(case)).hexdigest()
+    if (
+        trace.query_sha256 != query_hash
+        or trace.received_query_sha256 != query_hash
+        or trace.received_context_sha256 != trace.rendered_context_sha256
+        or trace.received_context_utf8_bytes != trace.rendered_context_utf8_bytes
+    ):
+        return "receipt_mismatch"
+    hash_fields = (
+        trace.rendered_context_sha256,
+        trace.received_context_sha256,
+        trace.received_query_sha256,
+        trace.submitted_prompt_sha256,
+        trace.submitted_prompt_context_sha256,
+        trace.submitted_input_token_ids_sha256,
+        trace.query_sha256,
+    )
+    integer_fields = (
+        trace.rendered_context_utf8_bytes,
+        trace.received_context_utf8_bytes,
+        trace.rendered_context_token_count,
+        trace.submitted_prompt_context_start,
+        trace.submitted_prompt_context_end,
+        trace.submitted_input_token_count,
+    )
+    if (
+        any(
+            type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None
+            for value in hash_fields
+        )
+        or any(type(value) is not int or value < 0 for value in integer_fields)
+        or trace.submitted_prompt_context_end - trace.submitted_prompt_context_start
+        != trace.rendered_context_utf8_bytes
+        or trace.submitted_prompt_context_sha256 != trace.rendered_context_sha256
+        or trace.submitted_input_token_count == 0
+        or type(trace.response) is not str
+    ):
+        return "model_call_receipt"
+    try:
+        rerendered = render_context(
+            tuple(
+                ResolvedEntry(
+                    slot=entry.slot,
+                    key=entry.key,
+                    value=entry.value,
+                    source_kind=entry.source_kind,
+                    revision_id=entry.revision_id,
+                    candidate_id=entry.candidate_id,
+                    evidence_ids=entry.evidence_ids,
+                )
+                for entry in trace.entries
+            )
+        )
+    except (TypeError, ValueError):
+        return "provenance_mismatch"
+    if (
+        rerendered.entry_receipts != trace.entries
+        or hashlib.sha256(rerendered.bytes).hexdigest() != trace.rendered_context_sha256
+        or len(rerendered.bytes) != trace.rendered_context_utf8_bytes
+    ):
+        return "provenance_mismatch"
+    actual_values = tuple(
+        (entry.slot, entry.key, entry.value, entry.source_kind)
+        for entry in trace.entries
+    )
+    if actual_values != _model_expected_entry_values(case, outcome.arm):
+        return "treatment_fidelity"
+    revision_ids = tuple(
+        entry.revision_id for entry in trace.entries if entry.revision_id is not None
+    )
+    source_evidence_ids = tuple(
+        evidence_id for entry in trace.entries for evidence_id in entry.evidence_ids
+    )
+    if expected_source_kind == "release":
+        if (
+            type(trace.release_id) is not str
+            or not trace.release_id
+            or any(
+                entry.revision_id is None or entry.candidate_id is None
+                for entry in trace.entries
+            )
+            or trace.eligible_revision_ids != revision_ids
+            or trace.retrieved_revision_ids != revision_ids
+            or trace.returned_revision_ids != revision_ids
+            or trace.injected_revision_ids != revision_ids
+            or trace.source_evidence_ids != source_evidence_ids
+        ):
+            return "provenance_mismatch"
+        expected_operations = (
+            "get_assigned_release",
+            *(
+                operation
+                for _entry in trace.entries
+                for operation in ("get_revision", "get_candidate")
+            ),
+        )
+    elif expected_source_kind == "raw_evidence":
+        if (
+            trace.release_id is not None
+            or any(
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or not entry.evidence_ids
+                for entry in trace.entries
+            )
+            or trace.eligible_revision_ids
+            or trace.retrieved_revision_ids
+            or trace.returned_revision_ids
+            or trace.injected_revision_ids
+            or trace.source_evidence_ids != source_evidence_ids
+        ):
+            return "provenance_mismatch"
+        expected_operations = ("list_eligible_evidence",)
+    else:
+        if (
+            trace.release_id is not None
+            or any(
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or entry.evidence_ids
+                for entry in trace.entries
+            )
+            or trace.eligible_revision_ids
+            or trace.retrieved_revision_ids
+            or trace.returned_revision_ids
+            or trace.injected_revision_ids
+            or trace.source_evidence_ids
+        ):
+            return "provenance_mismatch"
+        expected_operations = ("entries",)
+    if tuple(
+        event.operation for event in trace.reader_audit
+    ) != expected_operations or any(
+        type(event) is not ReadAuditEvent
+        or event.requested_scope != expected_scope
+        or event.allowed is not True
+        for event in trace.reader_audit
+    ):
+        return "audit_failure"
+    return None
+
+
+def _model_case_schema_is_valid(case: CodebookCase) -> bool:
+    if (
+        type(case) is not CodebookCase
+        or type(case.schema_version) is not int
+        or case.schema_version != SCHEMA_VERSION
+        or type(case.seed) is not str
+        or case.seed != CASE_SEED
+        or type(case.case_id) is not str
+        or type(case.subject_id) is not str
+        or type(case.case_index) is not int
+        or type(case.target_slot) is not int
+        or case.target_slot not in range(5)
+        or type(case.target_key) is not str
+        or type(case.old_value) is not str
+        or type(case.current_value) is not str
+        or type(case.masked_value) is not str
+        or case.masked_value != MASKED_VALUE
+        or type(case.shared_entries) is not tuple
+        or len(case.shared_entries) != 4
+        or any(type(entry) is not CodebookEntry for entry in case.shared_entries)
+        or type(case.padding_entry) is not CodebookEntry
+    ):
+        return False
+    entries = (*case.shared_entries, case.padding_entry)
+    if any(
+        type(entry.key) is not str
+        or type(entry.value) is not str
+        or not entry.key
+        or not entry.value
+        for entry in entries
+    ):
+        return False
+    keys = (case.target_key, *(entry.key for entry in entries))
+    values = (
+        case.old_value,
+        case.current_value,
+        *(entry.value for entry in entries),
+    )
+    if (
+        any(not value for value in (*keys, *values, case.case_id, case.subject_id))
+        or len(set(keys)) != len(keys)
+        or len(set(values)) != len(values)
+        or {UNKNOWN, MASKED_VALUE}.intersection(values)
+    ):
+        return False
+    try:
+        for value in (*keys, *values, case.case_id, case.subject_id, case.seed):
+            value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False
+    if any(
+        re.fullmatch(_KEY_PATTERN, key.encode("utf-8")) is None for key in keys
+    ) or any(
+        re.fullmatch(_VALUE_PATTERN, value.encode("utf-8")) is None for value in values
+    ):
+        return False
+    return True
+
+
+def _validate_model_structure(
+    *,
+    manifest: object,
+    outcomes: object,
+    attrition: object,
+    frozen_case_manifest_sha256s: object,
+) -> tuple[
+    tuple[ModelCaseIdentity, ...],
+    tuple[ModelArmOutcome, ...],
+    tuple[ModelRunAttrition, ...],
+    tuple[str, ...],
+]:
+    if (
+        type(manifest) is not tuple
+        or type(outcomes) is not tuple
+        or type(attrition) is not tuple
+        or type(frozen_case_manifest_sha256s) is not tuple
+    ):
+        return (), (), (), ("closed_schema",)
+    typed_manifest = manifest
+    typed_outcomes = outcomes
+    typed_attrition = attrition
+    for loss in typed_attrition:
+        if (
+            type(loss) is not ModelRunAttrition
+            or type(loss.case_index) is not int
+            or type(loss.arm) is not str
+            or loss.reason not in {"timeout", "missing_outcome", "model_call_failure"}
+            or type(loss.attempted) is not bool
+        ):
+            return typed_manifest, typed_outcomes, (), ("closed_schema",)
+    if (
+        len(typed_manifest) != MODEL_CASE_COUNT
+        or len(frozen_case_manifest_sha256s) != MODEL_CASE_COUNT
+    ):
+        return typed_manifest, typed_outcomes, typed_attrition, ("manifest_mismatch",)
+    for index, identity in enumerate(typed_manifest):
+        if (
+            type(identity) is not ModelCaseIdentity
+            or not _model_case_schema_is_valid(identity.case)
+            or type(identity.references) is not CaseDatabaseReferences
+            or type(identity.references.capture) is not CaptureReferences
+            or type(identity.references.revisions) is not RevisionReferences
+            or type(identity.references.releases) is not ReleaseAssignments
+        ):
+            return typed_manifest, typed_outcomes, typed_attrition, ("closed_schema",)
+        case = identity.case
+        if (
+            type(case.case_index) is not int
+            or case.case_index != index
+            or case.case_id != f"nonce-{index:03d}"
+            or case.subject_id != f"nonce-subject-{index:03d}"
+            or type(identity.case_manifest_sha256) is not str
+            or _SHA256_PATTERN.fullmatch(identity.case_manifest_sha256) is None
+            or type(frozen_case_manifest_sha256s[index]) is not str
+            or identity.case_manifest_sha256 != frozen_case_manifest_sha256s[index]
+        ):
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("manifest_mismatch",),
+            )
+        try:
+            actual_hash = case_manifest_sha256(case)
+        except (AttributeError, TypeError, ValueError):
+            return typed_manifest, typed_outcomes, typed_attrition, ("closed_schema",)
+        if actual_hash != identity.case_manifest_sha256:
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("manifest_mismatch",),
+            )
+        try:
+            _parent_capture_catalog(case, identity.references)
+            _validate_parent_foreign_companion_contract(case, identity.references)
+            derived_references = derive_case_database_references(case)
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            ChildExecutionValidationError,
+        ):
+            return typed_manifest, typed_outcomes, typed_attrition, ("closed_schema",)
+        if identity.references != derived_references:
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("manifest_mismatch",),
+            )
+
+    expected_slots = tuple(
+        (case_index, arm)
+        for case_index, identity in enumerate(typed_manifest)
+        for arm in model_arm_order(identity.case.case_id)
+    )
+    outcome_slots: list[tuple[int, str]] = []
+    for outcome in typed_outcomes:
+        if (
+            type(outcome) is not ModelArmOutcome
+            or type(outcome.case_index) is not int
+            or type(outcome.arm) is not str
+        ):
+            return typed_manifest, typed_outcomes, typed_attrition, ("closed_schema",)
+        outcome_slots.append((outcome.case_index, outcome.arm))
+    attrition_slots: list[tuple[int, str]] = []
+    for loss in typed_attrition:
+        attrition_slots.append((loss.case_index, loss.arm))
+    if (
+        len(outcome_slots) != len(set(outcome_slots))
+        or len(attrition_slots) != len(set(attrition_slots))
+        or set(outcome_slots).intersection(attrition_slots)
+        or set(outcome_slots).union(attrition_slots) != set(expected_slots)
+        or tuple(outcome_slots)
+        != tuple(slot for slot in expected_slots if slot not in set(attrition_slots))
+        or tuple(attrition_slots)
+        != tuple(slot for slot in expected_slots if slot in set(attrition_slots))
+    ):
+        return (
+            typed_manifest,
+            typed_outcomes,
+            typed_attrition,
+            ("execution_completeness",),
+        )
+    if typed_attrition:
+        return typed_manifest, typed_outcomes, typed_attrition, ("attrition",)
+
+    execution_indexes: list[int] = []
+    future_instances: list[str] = []
+    future_sessions: list[str] = []
+    future_runs: list[str] = []
+    capture_by_case: dict[int, set[str]] = {
+        case_index: set() for case_index in range(MODEL_CASE_COUNT)
+    }
+    by_case_arm: dict[tuple[int, str], ModelArmOutcome] = {}
+    for execution_index, outcome in enumerate(typed_outcomes):
+        identity = typed_manifest[outcome.case_index]
+        try:
+            schedule = make_parent_schedule_item(
+                execution_index=execution_index,
+                case=identity.case,
+                references=identity.references,
+                arm=outcome.arm,
+            )
+        except (TypeError, ValueError, ChildExecutionValidationError):
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("manifest_mismatch",),
+            )
+        reason = _model_trace_reason(identity, outcome, schedule)
+        if reason is not None:
+            return typed_manifest, typed_outcomes, typed_attrition, (reason,)
+        trace = outcome.trace
+        execution_indexes.append(trace.execution_index)
+        future_instances.append(trace.future_process_instance_id)
+        future_sessions.append(trace.future_session_id)
+        future_runs.append(trace.future_run_id)
+        capture_by_case[outcome.case_index].add(trace.capture_process_instance_id)
+        by_case_arm[(outcome.case_index, outcome.arm)] = outcome
+    capture_instances = tuple(next(iter(values)) for values in capture_by_case.values())
+    capture_pids = {
+        case_index: {
+            outcome.trace.capture_pid
+            for outcome in typed_outcomes
+            if outcome.case_index == case_index
+        }
+        for case_index in range(MODEL_CASE_COUNT)
+    }
+    capture_sessions = {
+        session_id
+        for identity in typed_manifest
+        for session_id in (
+            *identity.references.capture.capture_session_ids,
+            f"{identity.case.case_id}-capture-foreign",
+        )
+    }
+    capture_runs = {
+        f"{identity.case.case_id}-run-{role}"
+        for identity in typed_manifest
+        for role in ("old", "new", "control", "foreign")
+    }
+    if (
+        len(set(execution_indexes)) != len(expected_slots)
+        or set(execution_indexes) != set(range(len(expected_slots)))
+        or len(set(future_instances)) != len(expected_slots)
+        or len(set(future_sessions)) != len(expected_slots)
+        or len(set(future_runs)) != len(expected_slots)
+        or any(len(values) != 1 for values in capture_by_case.values())
+        or any(len(values) != 1 for values in capture_pids.values())
+        or len(set(capture_instances)) != MODEL_CASE_COUNT
+        or set(capture_instances).intersection(future_instances)
+        or capture_sessions.intersection(future_sessions)
+        or capture_runs.intersection(future_runs)
+    ):
+        return (
+            typed_manifest,
+            typed_outcomes,
+            typed_attrition,
+            ("process_or_assignment",),
+        )
+    for case_index in range(MODEL_CASE_COUNT):
+        current = by_case_arm[(case_index, "current_release")].trace
+        oracle = by_case_arm[(case_index, "oracle")].trace
+        if normalize_response(current.response) != normalize_response(oracle.response):
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("oracle_response_mismatch",),
+            )
+        if (
+            current.rendered_context_sha256 != oracle.rendered_context_sha256
+            or current.rendered_context_utf8_bytes != oracle.rendered_context_utf8_bytes
+            or current.received_context_sha256 != oracle.received_context_sha256
+            or current.received_context_utf8_bytes != oracle.received_context_utf8_bytes
+            or current.submitted_prompt_sha256 != oracle.submitted_prompt_sha256
+            or current.submitted_prompt_context_start
+            != oracle.submitted_prompt_context_start
+            or current.submitted_prompt_context_end
+            != oracle.submitted_prompt_context_end
+            or current.submitted_prompt_context_sha256
+            != oracle.submitted_prompt_context_sha256
+            or current.submitted_input_token_ids_sha256
+            != oracle.submitted_input_token_ids_sha256
+            or current.submitted_input_token_count != oracle.submitted_input_token_count
+        ):
+            return (
+                typed_manifest,
+                typed_outcomes,
+                typed_attrition,
+                ("oracle_receipt_mismatch",),
+            )
+    return typed_manifest, typed_outcomes, typed_attrition, ()
+
+
+def _linear_type7(sorted_values: object, quantile: float) -> float:
+    count = len(sorted_values)  # type: ignore[arg-type]
+    position = (count - 1) * quantile
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    lower = float(sorted_values[lower_index])  # type: ignore[index]
+    upper = float(sorted_values[upper_index])  # type: ignore[index]
+    return float(lower + (position - lower_index) * (upper - lower))
+
+
+def _model_metric_estimates(
+    vectors: dict[str, tuple[float, ...]],
+) -> tuple[dict[str, MetricEstimate], str, tuple[int, ...]]:
+    # NumPy is deliberately imported only after every structural gate has passed.
+    import numpy as np
+
+    generator = np.random.Generator(np.random.PCG64(MODEL_BOOTSTRAP_SEED))
+    indexes = generator.integers(
+        0,
+        MODEL_CASE_COUNT,
+        size=(MODEL_BOOTSTRAP_RESAMPLES, MODEL_CASE_COUNT),
+        endpoint=False,
+        dtype=np.int64,
+    )
+    matrix_bytes = indexes.astype(np.dtype("<i8"), copy=False).tobytes(order="C")
+    matrix_sha256 = hashlib.sha256(matrix_bytes).hexdigest()
+    if matrix_sha256 != MODEL_BOOTSTRAP_MATRIX_SHA256:
+        raise RuntimeError("bootstrap_matrix_mismatch")
+    first_indexes = tuple(int(index) for index in indexes[0, :8])
+    estimates: dict[str, MetricEstimate] = {}
+    for name, values in vectors.items():
+        if (
+            type(values) is not tuple
+            or len(values) != MODEL_CASE_COUNT
+            or any(
+                type(value) is not float or not math.isfinite(value) for value in values
+            )
+        ):
+            raise ValueError("metric_vector")
+        value_array = np.asarray(values, dtype=np.float64)
+        resampled = value_array[indexes].mean(axis=1)
+        ordered = np.sort(resampled)
+        point = float(sum(values) / MODEL_CASE_COUNT)
+        estimates[name] = MetricEstimate(
+            per_case_values=values,
+            point=point,
+            ci_lower=_linear_type7(ordered, 0.025),
+            ci_upper=_linear_type7(ordered, 0.975),
+        )
+    return estimates, matrix_sha256, first_indexes
+
+
+def _model_target_coverage(
+    identity: ModelCaseIdentity,
+    outcome: ModelArmOutcome,
+) -> tuple[float, float, float]:
+    trace = outcome.trace
+    target_entries = tuple(
+        entry for entry in trace.entries if entry.key == identity.case.target_key
+    )
+    assigned = float(bool(target_entries))
+    if trace.source_kind == "release":
+        returned = float(
+            any(
+                entry.revision_id in trace.returned_revision_ids
+                for entry in target_entries
+            )
+        )
+        injected = float(
+            any(
+                entry.revision_id in trace.injected_revision_ids
+                for entry in target_entries
+            )
+        )
+    elif trace.source_kind == "raw_evidence":
+        returned = float(
+            any(
+                evidence_id in trace.source_evidence_ids
+                for entry in target_entries
+                for evidence_id in entry.evidence_ids
+            )
+        )
+        injected = returned
+    else:
+        returned = assigned
+        injected = assigned
+    return assigned, returned, injected
+
+
+def model_arm_order(case_id: str) -> tuple[str, ...]:
+    """Return the pre-registered per-case model execution order."""
+
+    if type(case_id) is not str or not case_id:
+        raise TypeError("case_id")
+    prefix = "areal-memory-arm-order-v1-20260708|"
+    return tuple(
+        sorted(
+            MODEL_ARMS,
+            key=lambda arm: (
+                hashlib.sha256(f"{prefix}{case_id}|{arm}".encode()).digest(),
+                arm,
+            ),
+        )
+    )
+
+
+def _validate_model_leakage_sentinels(
+    manifest: tuple[ModelCaseIdentity, ...],
+    outcomes: tuple[ModelArmOutcome, ...],
+    leakage_sentinels: object,
+) -> tuple[tuple[LeakageSentinelTrace, ...], int, str | None]:
+    if (
+        type(leakage_sentinels) is not tuple
+        or len(leakage_sentinels) != MODEL_CASE_COUNT
+    ):
+        return (), 0, "leakage_completeness"
+    typed_sentinels = leakage_sentinels
+    outcome_capture_instances = {
+        outcome.case_index: outcome.trace.capture_process_instance_id
+        for outcome in outcomes
+    }
+    outcome_capture_pids = {
+        outcome.case_index: outcome.trace.capture_pid for outcome in outcomes
+    }
+    occupied_instances = {
+        instance
+        for outcome in outcomes
+        for instance in (
+            outcome.trace.capture_process_instance_id,
+            outcome.trace.future_process_instance_id,
+        )
+    }
+    outcome_sessions = {outcome.trace.future_session_id for outcome in outcomes}
+    outcome_runs = {outcome.trace.future_run_id for outcome in outcomes}
+    capture_sessions = {
+        session_id
+        for identity in manifest
+        for session_id in (
+            *identity.references.capture.capture_session_ids,
+            f"{identity.case.case_id}-capture-foreign",
+        )
+    }
+    capture_runs = {
+        f"{identity.case.case_id}-run-{role}"
+        for identity in manifest
+        for role in ("old", "new", "control", "foreign")
+    }
+    probe_instances: list[str] = []
+    probe_sessions: list[str] = []
+    probe_runs: list[str] = []
+    foreign_release_ids: list[str] = []
+    foreign_evidence_ids: list[str] = []
+    false_positives = 0
+    for case_index, sentinel in enumerate(typed_sentinels):
+        if type(sentinel) is not LeakageSentinelTrace:
+            return (), 0, "closed_schema"
+        identity = manifest[case_index]
+        case = identity.case
+        expected_scope = identity.references.capture.local_scope
+        try:
+            (
+                expected_companion,
+                expected_foreign_evidence_id,
+                _expected_foreign_revision_id,
+                expected_foreign_release_id,
+            ) = _validate_parent_foreign_companion_contract(
+                case,
+                identity.references,
+            )
+        except ChildExecutionValidationError:
+            return (), 0, "leakage_sentinel"
+        if (
+            sentinel.schema_version != SCHEMA_VERSION
+            or sentinel.case_id != case.case_id
+            or sentinel.case_manifest_sha256 != identity.case_manifest_sha256
+            or sentinel.execution_index
+            != len(MODEL_ARMS) * MODEL_CASE_COUNT + case_index
+            or sentinel.requested_scope != expected_scope
+            or sentinel.companion_scope != expected_companion
+            or sentinel.foreign_release_id != expected_foreign_release_id
+            or sentinel.foreign_evidence_id != expected_foreign_evidence_id
+            or sentinel.capture_pid != outcome_capture_pids[case_index]
+            or sentinel.capture_process_instance_id
+            != outcome_capture_instances[case_index]
+            or type(sentinel.future_pid) is not int
+            or sentinel.future_pid <= 0
+            or not _is_canonical_uuid4(sentinel.future_process_instance_id)
+            or type(sentinel.future_session_id) is not str
+            or not sentinel.future_session_id
+            or type(sentinel.future_run_id) is not str
+            or not sentinel.future_run_id
+            or type(sentinel.history_length) is not int
+            or sentinel.history_length != 0
+            or type(sentinel.reason) is not str
+        ):
+            return (), 0, "leakage_sentinel"
+        probe_instances.append(sentinel.future_process_instance_id)
+        probe_sessions.append(sentinel.future_session_id)
+        probe_runs.append(sentinel.future_run_id)
+        foreign_release_ids.append(sentinel.foreign_release_id)
+        foreign_evidence_ids.append(sentinel.foreign_evidence_id)
+        false_positives += int(sentinel.reason != "foreign_scope")
+    if (
+        len(set(probe_instances)) != MODEL_CASE_COUNT
+        or occupied_instances.intersection(probe_instances)
+        or len(set(probe_sessions)) != MODEL_CASE_COUNT
+        or len(set(probe_runs)) != MODEL_CASE_COUNT
+        or outcome_sessions.intersection(probe_sessions)
+        or outcome_runs.intersection(probe_runs)
+        or capture_sessions.intersection(probe_sessions)
+        or capture_runs.intersection(probe_runs)
+        or len(set(foreign_release_ids)) != MODEL_CASE_COUNT
+        or len(set(foreign_evidence_ids)) != MODEL_CASE_COUNT
+    ):
+        return (), 0, "process_or_assignment"
+    if false_positives:
+        return typed_sentinels, false_positives, "cross_scope_leakage"
+    return typed_sentinels, false_positives, None
+
+
+def analyze_model_run(
+    *,
+    manifest: tuple[ModelCaseIdentity, ...],
+    outcomes: tuple[ModelArmOutcome, ...],
+    attrition: tuple[ModelRunAttrition, ...],
+    leakage_sentinels: tuple[LeakageSentinelTrace, ...],
+    frozen_case_manifest_sha256s: tuple[str, ...],
+) -> ModelEvaluationResult:
+    """Validate, aggregate, and classify one frozen 64-by-6 model run."""
+
+    (
+        typed_manifest,
+        typed_outcomes,
+        typed_attrition,
+        structural_reasons,
+    ) = _validate_model_structure(
+        manifest=manifest,
+        outcomes=outcomes,
+        attrition=attrition,
+        frozen_case_manifest_sha256s=frozen_case_manifest_sha256s,
+    )
+    if structural_reasons:
+        return _invalid_model_evaluation(
+            structural_reasons,
+            attrition=typed_attrition,
+        )
+    (
+        _typed_leakage_sentinels,
+        cross_scope_false_positive_count,
+        leakage_reason,
+    ) = _validate_model_leakage_sentinels(
+        typed_manifest,
+        typed_outcomes,
+        leakage_sentinels,
+    )
+    if leakage_reason is not None:
+        return _invalid_model_evaluation(
+            (leakage_reason,),
+            attrition=typed_attrition,
+        )
+    by_case_arm = {
+        (outcome.case_index, outcome.arm): outcome for outcome in typed_outcomes
+    }
+    normalized: dict[tuple[int, str], str] = {
+        key: normalize_response(outcome.trace.response)
+        for key, outcome in by_case_arm.items()
+    }
+    utilities: dict[tuple[int, str], float] = {}
+    confident_errors: dict[tuple[int, str], float] = {}
+    abstentions: dict[tuple[int, str], float] = {}
+    for case_index, identity in enumerate(typed_manifest):
+        for arm in MODEL_ARMS:
+            response = normalized[(case_index, arm)]
+            utilities[(case_index, arm)] = float(
+                utility(response, current_value=identity.case.current_value)
+            )
+            confident_errors[(case_index, arm)] = float(
+                response not in {identity.case.current_value, UNKNOWN}
+            )
+            abstentions[(case_index, arm)] = float(response == UNKNOWN)
+
+    vectors: dict[str, tuple[float, ...]] = {}
+    vectors["strict_signature_rate"] = tuple(
+        float(
+            tuple(normalized[(case_index, arm)] for arm in MODEL_ARMS)
+            == (
+                identity.case.current_value,
+                identity.case.current_value,
+                UNKNOWN,
+                UNKNOWN,
+                identity.case.old_value,
+                identity.case.current_value,
+            )
+        )
+        for case_index, identity in enumerate(typed_manifest)
+    )
+    vectors["oracle_success_rate"] = tuple(
+        float(normalized[(case_index, "oracle")] == identity.case.current_value)
+        for case_index, identity in enumerate(typed_manifest)
+    )
+    vectors["masked_abstention_rate"] = tuple(
+        abstentions[(case_index, "target_masked")]
+        for case_index in range(MODEL_CASE_COUNT)
+    )
+    delta_specs = {
+        "delta_help": ("current_release", "memory_off"),
+        "delta_masked": ("current_release", "target_masked"),
+        "delta_masked_off": ("target_masked", "memory_off"),
+        "delta_raw": ("current_release", "raw_history"),
+        "delta_current_stale": ("current_release", "stale_release"),
+        "delta_harm": ("stale_release", "memory_off"),
+        "oracle_gap": ("oracle", "current_release"),
+    }
+    for name, (left_arm, right_arm) in delta_specs.items():
+        vectors[name] = tuple(
+            float(
+                utilities[(case_index, left_arm)] - utilities[(case_index, right_arm)]
+            )
+            for case_index in range(MODEL_CASE_COUNT)
+        )
+    vectors["delta_confident_error"] = tuple(
+        float(
+            confident_errors[(case_index, "current_release")]
+            - confident_errors[(case_index, "memory_off")]
+        )
+        for case_index in range(MODEL_CASE_COUNT)
+    )
+    vectors["stale_value_follow_rate"] = tuple(
+        float(normalized[(case_index, "stale_release")] == identity.case.old_value)
+        for case_index, identity in enumerate(typed_manifest)
+    )
+    for arm in MODEL_ARMS:
+        vectors[f"{arm}:abstention"] = tuple(
+            abstentions[(case_index, arm)] for case_index in range(MODEL_CASE_COUNT)
+        )
+        if arm != "memory_off":
+            coverage = tuple(
+                _model_target_coverage(
+                    typed_manifest[case_index],
+                    by_case_arm[(case_index, arm)],
+                )
+                for case_index in range(MODEL_CASE_COUNT)
+            )
+            for coverage_index, name in enumerate(("assigned", "returned", "injected")):
+                vectors[f"{arm}:{name}"] = tuple(
+                    values[coverage_index] for values in coverage
+                )
+
+    estimates, bootstrap_matrix_sha256, bootstrap_first_indexes = (
+        _model_metric_estimates(vectors)
+    )
+    arm_summaries = tuple(
+        ArmMetricSummary(
+            arm=arm,
+            outcome_count=MODEL_CASE_COUNT,
+            abstention_rate=estimates[f"{arm}:abstention"],
+            assigned_target_coverage=(
+                None if arm == "memory_off" else estimates[f"{arm}:assigned"]
+            ),
+            returned_target_coverage=(
+                None if arm == "memory_off" else estimates[f"{arm}:returned"]
+            ),
+            injected_target_coverage=(
+                None if arm == "memory_off" else estimates[f"{arm}:injected"]
+            ),
+        )
+        for arm in MODEL_ARMS
+    )
+    access_denial_count = sum(
+        event.allowed is not True
+        for outcome in typed_outcomes
+        for event in outcome.trace.reader_audit
+    )
+    provenance_validation_failure_count = 0
+    for execution_index, outcome in enumerate(typed_outcomes):
+        identity = typed_manifest[outcome.case_index]
+        expected = make_parent_schedule_item(
+            execution_index=execution_index,
+            case=identity.case,
+            references=identity.references,
+            arm=outcome.arm,
+        ).expected_source
+        provenance_validation_failure_count += int(
+            outcome.trace.entries != expected.entries
+            or outcome.trace.source_evidence_ids != expected.source_evidence_ids
+        )
+    summary = ModelMetricSummary(
+        bootstrap_matrix_sha256=bootstrap_matrix_sha256,
+        bootstrap_first_indexes=bootstrap_first_indexes,
+        strict_signature_rate=estimates["strict_signature_rate"],
+        oracle_success_rate=estimates["oracle_success_rate"],
+        masked_abstention_rate=estimates["masked_abstention_rate"],
+        delta_help=estimates["delta_help"],
+        delta_masked=estimates["delta_masked"],
+        delta_masked_off=estimates["delta_masked_off"],
+        delta_raw=estimates["delta_raw"],
+        delta_current_stale=estimates["delta_current_stale"],
+        delta_harm=estimates["delta_harm"],
+        delta_confident_error=estimates["delta_confident_error"],
+        oracle_gap=estimates["oracle_gap"],
+        stale_value_follow_rate=estimates["stale_value_follow_rate"],
+        arm_summaries=arm_summaries,
+        access_denial_count=access_denial_count,
+        provenance_validation_failure_count=provenance_validation_failure_count,
+        cross_scope_false_positive_count=cross_scope_false_positive_count,
+    )
+    if not _masked_control_is_valid(summary):
+        return _invalid_model_evaluation(
+            ("masked_control",),
+            attrition=typed_attrition,
+            summary=summary,
+        )
+    efficacy, safety, stale_susceptibility = _classify_model_summary(summary)
+    return ModelEvaluationResult(
+        validity="valid",
+        efficacy=efficacy,
+        safety=safety,
+        stale_susceptibility=stale_susceptibility,
+        invalid_reasons=(),
+        summary=summary,
+        attrition=typed_attrition,
+    )
 
 
 def _write_child_response(response: object) -> None:
