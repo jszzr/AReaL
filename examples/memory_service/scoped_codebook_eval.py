@@ -76,7 +76,20 @@ MODEL_QUERY_TEMPLATE = (
     b"What is the current code for {target_key}? "
     b"Reply with exactly the code or UNKNOWN."
 )
-MODEL_ARM_ORDER_DOMAIN = b"areal-memory-arm-order-v1-20260708|"
+MODEL_ARM_SCHEDULE_DOMAIN = b"areal-memory-williams-schedule-v1-20260711|"
+MODEL_ARM_SCHEDULE_ALGORITHM = "block-randomized-williams-6-v1"
+MODEL_ARM_SCHEDULE_SHA256 = (
+    "11c0f8f684acce81b99f35d01769748b3ac7df79db47a69837dbf32b8087a9ff"
+)
+_MODEL_WILLIAMS_ROWS = (
+    (0, 1, 5, 2, 4, 3),
+    (1, 2, 0, 3, 5, 4),
+    (2, 3, 1, 4, 0, 5),
+    (3, 4, 2, 5, 1, 0),
+    (4, 5, 3, 0, 2, 1),
+    (5, 0, 4, 1, 3, 2),
+)
+_MODEL_LEGACY_ARM_ORDER_DOMAIN = b"areal-memory-arm-order-v1-20260708|"
 MODEL_THRESHOLDS = (
     ("masked_abstention_rate_min", "0.90"),
     ("delta_masked_off_ci_lower_min", "-0.10"),
@@ -836,8 +849,9 @@ class ModelRunManifest:
     prompt_grammar_sha256: str
     renderer_sha256: str
     query_template_sha256: str
-    arm_order_algorithm: str
-    arm_order_domain_sha256: str
+    arm_schedule_algorithm: str
+    arm_schedule_domain_sha256: str
+    arm_schedule_sha256: str
     decoding_mode: str
     decoding_temperature: str
     decoding_samples: int
@@ -5247,13 +5261,15 @@ def _model_arm_outcome_from_wire(value: object) -> ModelArmOutcome:
     if case_index not in range(MODEL_CASE_COUNT) or arm not in MODEL_ARMS:
         raise WireProtocolError("closed_schema")
     case_id = f"nonce-{case_index:03d}"
-    expected_execution_index = case_index * len(MODEL_ARMS) + model_arm_order(
-        case_id
-    ).index(arm)
+    base_execution_index = case_index * len(MODEL_ARMS)
+    supported_execution_indexes = {
+        base_execution_index + model_arm_order(case_index).index(arm),
+        base_execution_index + _legacy_model_arm_order(case_index).index(arm),
+    }
     if (
         trace.case_id != case_id
         or trace.arm != arm
-        or trace.execution_index != expected_execution_index
+        or trace.execution_index not in supported_execution_indexes
     ):
         raise WireProtocolError("closed_schema")
     return ModelArmOutcome(case_index=case_index, arm=arm, trace=trace)
@@ -8534,12 +8550,20 @@ def _model_result_semantics_are_valid(value: ModelEvaluationResult) -> bool:
     attrition_slots = tuple((loss.case_index, loss.arm) for loss in value.attrition)
     if len(attrition_slots) != len(set(attrition_slots)):
         return False
-    attrition_order = tuple(
+    current_attrition_order = tuple(
         loss.case_index * len(MODEL_ARMS)
-        + model_arm_order(f"nonce-{loss.case_index:03d}").index(loss.arm)
+        + model_arm_order(loss.case_index).index(loss.arm)
         for loss in value.attrition
     )
-    if attrition_order != tuple(sorted(attrition_order)):
+    legacy_attrition_order = tuple(
+        loss.case_index * len(MODEL_ARMS)
+        + _legacy_model_arm_order(loss.case_index).index(loss.arm)
+        for loss in value.attrition
+    )
+    if all(
+        order != tuple(sorted(order))
+        for order in (current_attrition_order, legacy_attrition_order)
+    ):
         return False
     if value.validity == "valid":
         if (
@@ -9015,8 +9039,8 @@ def _validate_model_structure(
 
     expected_slots = tuple(
         (case_index, arm)
-        for case_index, identity in enumerate(typed_manifest)
-        for arm in model_arm_order(identity.case.case_id)
+        for case_index, _identity in enumerate(typed_manifest)
+        for arm in model_arm_order(case_index)
     )
     outcome_slots: list[tuple[int, str]] = []
     for outcome in typed_outcomes:
@@ -9248,22 +9272,78 @@ def _model_target_coverage(
     return assigned, returned, injected
 
 
-def model_arm_order(case_id: str) -> tuple[str, ...]:
-    """Return the pre-registered per-case model execution order."""
+def _model_schedule_digest(
+    block_index: int,
+    kind: str,
+    value: str,
+) -> bytes:
+    payload = f"block={block_index}|{kind}={value}".encode("ascii")
+    return hashlib.sha256(MODEL_ARM_SCHEDULE_DOMAIN + payload).digest()
 
-    if type(case_id) is not str or not case_id:
-        raise TypeError("case_id")
+
+def _legacy_model_arm_order(case_index: int) -> tuple[str, ...]:
+    case_id = f"nonce-{case_index:03d}"
     return tuple(
         sorted(
             MODEL_ARMS,
             key=lambda arm: (
                 hashlib.sha256(
-                    MODEL_ARM_ORDER_DOMAIN + f"{case_id}|{arm}".encode()
+                    _MODEL_LEGACY_ARM_ORDER_DOMAIN + f"{case_id}|{arm}".encode("ascii")
                 ).digest(),
                 arm,
             ),
         )
     )
+
+
+def model_arm_order(case_index: int) -> tuple[str, ...]:
+    """Return one row of the frozen block-randomized Williams schedule."""
+
+    if type(case_index) is not int:
+        raise TypeError("case_index")
+    if case_index not in range(MODEL_CASE_COUNT):
+        raise ValueError("case_index")
+    block_index, row_offset = divmod(case_index, len(MODEL_ARMS))
+    arm_labels = tuple(
+        sorted(
+            MODEL_ARMS,
+            key=lambda arm: (
+                _model_schedule_digest(block_index, "arm", arm),
+                arm,
+            ),
+        )
+    )
+    row_order = tuple(
+        sorted(
+            range(len(_MODEL_WILLIAMS_ROWS)),
+            key=lambda row: (
+                _model_schedule_digest(block_index, "row", str(row)),
+                row,
+            ),
+        )
+    )
+    row = _MODEL_WILLIAMS_ROWS[row_order[row_offset]]
+    return tuple(arm_labels[column] for column in row)
+
+
+def _model_arm_schedule_bytes() -> bytes:
+    value = [
+        {
+            "arms": list(model_arm_order(case_index)),
+            "case_index": case_index,
+        }
+        for case_index in range(MODEL_CASE_COUNT)
+    ]
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def _model_arm_schedule_sha256() -> str:
+    return hashlib.sha256(_model_arm_schedule_bytes()).hexdigest()
 
 
 def _model_preregistration_context(case: CodebookCase, arm: str) -> bytes:
@@ -9402,7 +9482,7 @@ def prepare_model_case_registration(
         query = _case_query_bytes(case)
         arm_calls: list[ModelArmCallRegistration] = []
         try:
-            for execution_offset, arm in enumerate(model_arm_order(case.case_id)):
+            for execution_offset, arm in enumerate(model_arm_order(case_index)):
                 schedule = make_parent_schedule_item(
                     execution_index=case_index * len(MODEL_ARMS) + execution_offset,
                     case=case,
@@ -9561,7 +9641,7 @@ def prepare_model_run_manifest(
         registrations.append(result.registration)
     manifest = ModelRunManifest(
         schema_version=SCHEMA_VERSION,
-        profile="model-helpfulness-v1",
+        profile="model-helpfulness-v2",
         case_seed=CASE_SEED,
         case_count=MODEL_CASE_COUNT,
         call_count=MODEL_CASE_COUNT * len(MODEL_ARMS),
@@ -9575,8 +9655,11 @@ def prepare_model_run_manifest(
         prompt_grammar_sha256=_model_prompt_grammar_sha256(),
         renderer_sha256=hashlib.sha256(_RENDER_HEADER).hexdigest(),
         query_template_sha256=hashlib.sha256(MODEL_QUERY_TEMPLATE).hexdigest(),
-        arm_order_algorithm="sha256-domain-sort-v1",
-        arm_order_domain_sha256=hashlib.sha256(MODEL_ARM_ORDER_DOMAIN).hexdigest(),
+        arm_schedule_algorithm=MODEL_ARM_SCHEDULE_ALGORITHM,
+        arm_schedule_domain_sha256=hashlib.sha256(
+            MODEL_ARM_SCHEDULE_DOMAIN
+        ).hexdigest(),
+        arm_schedule_sha256=MODEL_ARM_SCHEDULE_SHA256,
         decoding_mode="greedy",
         decoding_temperature="0",
         decoding_samples=1,
@@ -9661,7 +9744,7 @@ def validate_model_run_manifest(
         type(manifest.schema_version) is not int
         or manifest.schema_version != SCHEMA_VERSION
         or type(manifest.profile) is not str
-        or manifest.profile != "model-helpfulness-v1"
+        or manifest.profile != "model-helpfulness-v2"
         or type(manifest.case_seed) is not str
         or manifest.case_seed != CASE_SEED
         or type(manifest.case_count) is not int
@@ -9678,11 +9761,14 @@ def validate_model_run_manifest(
         or type(manifest.query_template_sha256) is not str
         or manifest.query_template_sha256
         != hashlib.sha256(MODEL_QUERY_TEMPLATE).hexdigest()
-        or type(manifest.arm_order_algorithm) is not str
-        or manifest.arm_order_algorithm != "sha256-domain-sort-v1"
-        or type(manifest.arm_order_domain_sha256) is not str
-        or manifest.arm_order_domain_sha256
-        != hashlib.sha256(MODEL_ARM_ORDER_DOMAIN).hexdigest()
+        or type(manifest.arm_schedule_algorithm) is not str
+        or manifest.arm_schedule_algorithm != MODEL_ARM_SCHEDULE_ALGORITHM
+        or type(manifest.arm_schedule_domain_sha256) is not str
+        or manifest.arm_schedule_domain_sha256
+        != hashlib.sha256(MODEL_ARM_SCHEDULE_DOMAIN).hexdigest()
+        or type(manifest.arm_schedule_sha256) is not str
+        or manifest.arm_schedule_sha256 != MODEL_ARM_SCHEDULE_SHA256
+        or manifest.arm_schedule_sha256 != _model_arm_schedule_sha256()
         or type(manifest.decoding_mode) is not str
         or manifest.decoding_mode != "greedy"
         or type(manifest.decoding_temperature) is not str
@@ -9735,7 +9821,7 @@ def validate_model_run_manifest(
                 or registration.query_sha256 != hashlib.sha256(query).hexdigest()
                 or type(registration.arm_calls) is not tuple
                 or tuple(call.arm for call in registration.arm_calls)
-                != model_arm_order(case.case_id)
+                != model_arm_order(case_index)
                 or type(registration.balanced_context_token_count) is not int
                 or registration.balanced_context_token_count <= 0
                 or type(registration.balanced_prompt_token_count) is not int
@@ -9883,9 +9969,10 @@ def _model_run_manifest_bytes_unchecked(manifest: ModelRunManifest) -> bytes:
         "prompt_grammar_sha256": manifest.prompt_grammar_sha256,
         "renderer_sha256": manifest.renderer_sha256,
         "query_template_sha256": manifest.query_template_sha256,
-        "arm_order": {
-            "algorithm": manifest.arm_order_algorithm,
-            "domain_sha256": manifest.arm_order_domain_sha256,
+        "arm_schedule": {
+            "algorithm": manifest.arm_schedule_algorithm,
+            "domain_sha256": manifest.arm_schedule_domain_sha256,
+            "schedule_sha256": manifest.arm_schedule_sha256,
         },
         "decoding": {
             "mode": manifest.decoding_mode,

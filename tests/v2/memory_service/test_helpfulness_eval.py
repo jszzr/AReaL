@@ -5579,7 +5579,7 @@ def _model_outcomes(
     outcomes = []
     for case_index in range(64):
         case = helpfulness.generate_case(case_index)
-        for execution_offset, arm in enumerate(_model_arm_order(case.case_id)):
+        for execution_offset, arm in enumerate(_model_arm_order(case_index)):
             trace = replace(
                 _model_trace(case, arm, responses(case, arm)),
                 execution_index=case_index * 6 + execution_offset,
@@ -5594,17 +5594,163 @@ def _model_outcomes(
     return tuple(outcomes)
 
 
-def _model_arm_order(case_id: str) -> tuple[str, ...]:
+def _model_arm_order(case_index: int) -> tuple[str, ...]:
+    domain = b"areal-memory-williams-schedule-v1-20260711|"
+    rows = (
+        (0, 1, 5, 2, 4, 3),
+        (1, 2, 0, 3, 5, 4),
+        (2, 3, 1, 4, 0, 5),
+        (3, 4, 2, 5, 1, 0),
+        (4, 5, 3, 0, 2, 1),
+        (5, 0, 4, 1, 3, 2),
+    )
+    block_index, row_offset = divmod(case_index, 6)
+
+    def digest(kind: str, value: str) -> bytes:
+        payload = f"block={block_index}|{kind}={value}".encode("ascii")
+        return sha256(domain + payload).digest()
+
+    labels = tuple(sorted(MODEL_ARMS, key=lambda arm: (digest("arm", arm), arm)))
+    row_order = tuple(sorted(range(6), key=lambda row: (digest("row", str(row)), row)))
+    return tuple(labels[column] for column in rows[row_order[row_offset]])
+
+
+def _legacy_model_arm_order(case_index: int) -> tuple[str, ...]:
     prefix = "areal-memory-arm-order-v1-20260708|"
+    case_id = f"nonce-{case_index:03d}"
     return tuple(
         sorted(
             MODEL_ARMS,
             key=lambda arm: (
-                sha256(f"{prefix}{case_id}|{arm}".encode()).digest(),
+                sha256(f"{prefix}{case_id}|{arm}".encode("ascii")).digest(),
                 arm,
             ),
         )
     )
+
+
+def test_williams_schedule_has_frozen_rows_and_global_sha256() -> None:
+    schedule = tuple(helpfulness.model_arm_order(index) for index in range(64))
+    assert schedule == tuple(_model_arm_order(index) for index in range(64))
+    assert schedule[:6] == (
+        (
+            "stale_release",
+            "current_release",
+            "memory_off",
+            "target_masked",
+            "oracle",
+            "raw_history",
+        ),
+        (
+            "target_masked",
+            "raw_history",
+            "current_release",
+            "oracle",
+            "stale_release",
+            "memory_off",
+        ),
+        (
+            "current_release",
+            "target_masked",
+            "stale_release",
+            "raw_history",
+            "memory_off",
+            "oracle",
+        ),
+        (
+            "oracle",
+            "memory_off",
+            "raw_history",
+            "stale_release",
+            "target_masked",
+            "current_release",
+        ),
+        (
+            "memory_off",
+            "stale_release",
+            "oracle",
+            "current_release",
+            "raw_history",
+            "target_masked",
+        ),
+        (
+            "raw_history",
+            "oracle",
+            "target_masked",
+            "memory_off",
+            "current_release",
+            "stale_release",
+        ),
+    )
+    encoded = json.dumps(
+        [
+            {"arms": list(row), "case_index": case_index}
+            for case_index, row in enumerate(schedule)
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    assert encoded == helpfulness._model_arm_schedule_bytes()
+    assert sha256(encoded).hexdigest() == helpfulness.MODEL_ARM_SCHEDULE_SHA256
+    assert helpfulness.MODEL_ARM_SCHEDULE_SHA256 == (
+        "11c0f8f684acce81b99f35d01769748b3ac7df79db47a69837dbf32b8087a9ff"
+    )
+
+
+def test_williams_schedule_is_minimally_position_balanced_for_64_cases() -> None:
+    schedule = tuple(_model_arm_order(index) for index in range(64))
+    position_counts = Counter(
+        (arm, position) for row in schedule for position, arm in enumerate(row)
+    )
+
+    assert set(position_counts) == {
+        (arm, position) for arm in MODEL_ARMS for position in range(6)
+    }
+    assert Counter(position_counts.values()) == Counter({11: 24, 10: 12})
+    for block_index in range(10):
+        block = schedule[block_index * 6 : block_index * 6 + 6]
+        assert Counter(
+            (arm, position) for row in block for position, arm in enumerate(row)
+        ) == Counter(
+            {(arm, position): 1 for arm in MODEL_ARMS for position in range(6)}
+        )
+
+
+def test_williams_schedule_balances_all_directed_adjacent_pairs() -> None:
+    schedule = tuple(_model_arm_order(index) for index in range(64))
+    pair_counts = Counter(
+        pair for row in schedule for pair in zip(row, row[1:], strict=False)
+    )
+
+    assert set(pair_counts) == {
+        (left, right) for left in MODEL_ARMS for right in MODEL_ARMS if left != right
+    }
+    assert Counter(pair_counts.values()) == Counter({11: 20, 10: 10})
+    for block_index in range(10):
+        block = schedule[block_index * 6 : block_index * 6 + 6]
+        assert Counter(
+            pair for row in block for pair in zip(row, row[1:], strict=False)
+        ) == Counter(
+            {
+                (left, right): 1
+                for left in MODEL_ARMS
+                for right in MODEL_ARMS
+                if left != right
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("case_index", "error_type"),
+    [(True, TypeError), ("0", TypeError), (-1, ValueError), (64, ValueError)],
+)
+def test_williams_schedule_rejects_noncanonical_case_indexes(
+    case_index: object,
+    error_type: type[Exception],
+) -> None:
+    with pytest.raises(error_type):
+        helpfulness.model_arm_order(case_index)  # type: ignore[arg-type]
 
 
 def _model_manifest() -> tuple[helpfulness.ModelCaseIdentity, ...]:
@@ -5755,15 +5901,11 @@ def test_metrics_preserve_paired_rows_and_compute_all_deltas() -> None:
     assert summary.cross_scope_false_positive_count == 0
 
 
-def test_model_rows_join_hashed_execution_order_by_arm_name() -> None:
+def test_model_rows_join_preregistered_williams_schedule_by_arm_name() -> None:
     outcomes = _model_outcomes(_strict_model_response)
 
-    assert tuple(outcome.arm for outcome in outcomes[:6]) == _model_arm_order(
-        "nonce-000"
-    )
-    assert tuple(outcome.arm for outcome in outcomes[6:12]) == _model_arm_order(
-        "nonce-001"
-    )
+    assert tuple(outcome.arm for outcome in outcomes[:6]) == _model_arm_order(0)
+    assert tuple(outcome.arm for outcome in outcomes[6:12]) == _model_arm_order(1)
 
     result = _analyze_model_fixture(outcomes=outcomes)
 
@@ -6173,7 +6315,7 @@ def test_model_wire_round_trip_is_closed_deterministic_and_exact_typed() -> None
     outcome = _model_outcomes(_strict_model_response)[0]
     attrition = helpfulness.ModelRunAttrition(
         case_index=0,
-        arm=_model_arm_order("nonce-000")[0],
+        arm=_model_arm_order(0)[0],
         reason="timeout",
         attempted=True,
     )
@@ -6215,6 +6357,35 @@ def test_model_arm_outcome_wire_rejects_outer_trace_contradictions(
         )
 
     assert error.value.reason == "closed_schema"
+
+
+def test_model_arm_outcome_wire_preserves_all_legacy_v1_execution_positions() -> None:
+    for outcome in _model_outcomes(_strict_model_response):
+        base = outcome.case_index * len(MODEL_ARMS)
+        legacy_position = _legacy_model_arm_order(outcome.case_index).index(outcome.arm)
+        current_position = _model_arm_order(outcome.case_index).index(outcome.arm)
+        legacy = replace(
+            outcome,
+            trace=replace(
+                outcome.trace,
+                execution_index=base + legacy_position,
+            ),
+        )
+        assert helpfulness.wire_loads(helpfulness.wire_dumps(legacy)) == legacy
+
+        for invalid_position in range(len(MODEL_ARMS)):
+            if invalid_position in {legacy_position, current_position}:
+                continue
+            invalid = replace(
+                outcome,
+                trace=replace(
+                    outcome.trace,
+                    execution_index=base + invalid_position,
+                ),
+            )
+            with pytest.raises(helpfulness.WireProtocolError) as error:
+                helpfulness.wire_loads(helpfulness.wire_dumps(invalid))
+            assert error.value.reason == "closed_schema"
 
 
 @pytest.mark.parametrize(
@@ -6387,7 +6558,7 @@ def test_model_result_wire_rejects_semantic_contradictions() -> None:
     )
     loss = helpfulness.ModelRunAttrition(
         case_index=0,
-        arm=_model_arm_order("nonce-000")[0],
+        arm=_model_arm_order(0)[0],
         reason="timeout",
         attempted=True,
     )
@@ -6509,7 +6680,7 @@ def test_model_wire_rejects_coverage_utility_and_attrition_forgery() -> None:
     )
     loss = helpfulness.ModelRunAttrition(
         case_index=0,
-        arm=_model_arm_order("nonce-000")[0],
+        arm=_model_arm_order(0)[0],
         reason="timeout",
         attempted=True,
     )
@@ -6538,7 +6709,7 @@ def test_model_result_wire_requires_canonical_attrition_order() -> None:
     losses = tuple(
         helpfulness.ModelRunAttrition(
             case_index=case_index,
-            arm=_model_arm_order(f"nonce-{case_index:03d}")[0],
+            arm=_model_arm_order(case_index)[0],
             reason="timeout",
             attempted=True,
         )
@@ -6558,6 +6729,35 @@ def test_model_result_wire_requires_canonical_attrition_order() -> None:
         helpfulness.wire_dumps(reversed_result)
 
     assert error.value.reason == "closed_schema"
+
+
+def test_model_result_wire_preserves_legacy_v1_attrition_order() -> None:
+    losses = tuple(
+        helpfulness.ModelRunAttrition(
+            case_index=0,
+            arm=arm,
+            reason="timeout",
+            attempted=True,
+        )
+        for arm in ("oracle", "stale_release")
+    )
+    assert tuple(helpfulness.model_arm_order(0).index(loss.arm) for loss in losses) == (
+        4,
+        0,
+    )
+    legacy_result = helpfulness.ModelEvaluationResult(
+        validity="invalid",
+        efficacy="not-assessed",
+        safety="not-assessed",
+        stale_susceptibility="not-assessed",
+        invalid_reasons=("attrition",),
+        summary=None,
+        attrition=losses,
+    )
+
+    assert (
+        helpfulness.wire_loads(helpfulness.wire_dumps(legacy_result)) == legacy_result
+    )
 
 
 @pytest.mark.parametrize("field", ["future_session_id", "future_run_id"])
@@ -7088,7 +7288,7 @@ def test_model_boundary_rejects_non_string_response() -> None:
     assert error.value.reason == "boundary_response"
 
 
-def test_model_case_registration_freezes_arm_order_and_token_parity() -> None:
+def test_model_case_registration_freezes_arm_schedule_and_token_parity() -> None:
     result = helpfulness.prepare_model_case_registration(0, _ByteModelTokenizer())
 
     assert result.failure is None
@@ -7096,12 +7296,12 @@ def test_model_case_registration_freezes_arm_order_and_token_parity() -> None:
     registration = result.registration
     assert registration.model_attempt == 0
     assert tuple(call.arm for call in registration.arm_calls) == (
-        "oracle",
-        "current_release",
-        "raw_history",
-        "memory_off",
         "stale_release",
+        "current_release",
+        "memory_off",
         "target_masked",
+        "oracle",
+        "raw_history",
     )
     by_arm = {call.arm: call for call in registration.arm_calls}
     balanced_arms = set(MODEL_ARMS) - {"memory_off"}
@@ -7512,6 +7712,43 @@ def test_public_model_analysis_has_one_manifest_root_and_scores_bound_evidence(
     assert result.efficacy == "helpful"
     assert result.safety == "non-increased"
     assert result.stale_susceptibility == "stale-sensitive"
+
+
+def test_v2_model_analysis_rejects_legacy_v1_execution_position(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dry_run, outcomes, _sentinels = registered_model_evidence
+    target = next(
+        outcome
+        for outcome in outcomes
+        if outcome.case_index == 0 and outcome.arm == "oracle"
+    )
+    legacy_index = _legacy_model_arm_order(0).index("oracle")
+    assert legacy_index != _model_arm_order(0).index("oracle")
+    legacy_position = replace(
+        target,
+        trace=replace(target.trace, execution_index=legacy_index),
+    )
+    forged = tuple(
+        legacy_position if outcome is target else outcome for outcome in outcomes
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        outcomes=forged,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("process_or_assignment",)
+    assert result.summary is None
 
 
 def test_public_model_analysis_rejects_unregistered_prompt_receipts(
@@ -8132,7 +8369,7 @@ def test_full_model_manifest_is_canonical_complete_and_preregistered() -> None:
         == sha256(encoded).hexdigest()
     )
     assert helpfulness.model_run_manifest_sha256(manifest, tokenizer) == (
-        "31eac9a9e274fc282270863efb09a7a884ee784f57032f9224b2f0bba4570bbb"
+        "9c4c580220eaa40115018abf8352db8db64a4b236b0a7dd6270a9dc9a3c6d451"
     )
     assert len(manifest.cases) == 64
     assert tuple(case.identity.case.case_index for case in manifest.cases) == tuple(
@@ -8156,10 +8393,19 @@ def test_full_model_manifest_is_canonical_complete_and_preregistered() -> None:
     assert parsed["query_template_sha256"] == (
         "a5c17c493e037c8bd3d43e35ba2f35875f5fe8eadbf2036c432f70e457a6ec50"
     )
-    assert parsed["profile"] == "model-helpfulness-v1"
+    assert parsed["profile"] == "model-helpfulness-v2"
     assert parsed["case_seed"] == helpfulness.CASE_SEED
     assert parsed["case_count"] == 64
     assert parsed["call_count"] == 384
+    assert parsed["arm_schedule"] == {
+        "algorithm": "block-randomized-williams-6-v1",
+        "domain_sha256": (
+            "80fab7f6f0ad7c5a3e1d8dcb679339ced31f5e733a0ca00cf05f2c9e22507e34"
+        ),
+        "schedule_sha256": (
+            "11c0f8f684acce81b99f35d01769748b3ac7df79db47a69837dbf32b8087a9ff"
+        ),
+    }
     assert parsed["decoding"] == {
         "mode": "greedy",
         "samples": 1,
@@ -8175,9 +8421,107 @@ def test_full_model_manifest_is_canonical_complete_and_preregistered() -> None:
     assert tuple(case["case_index"] for case in parsed["cases"]) == tuple(range(64))
     assert all(
         tuple(arm["arm"] for arm in case["arms"])
-        == helpfulness.model_arm_order(case["case_id"])
+        == helpfulness.model_arm_order(case["case_index"])
         for case in parsed["cases"]
     )
+
+
+def _globally_unbalanced_model_manifest(
+    manifest: helpfulness.ModelRunManifest,
+) -> helpfulness.ModelRunManifest:
+    forged_cases = tuple(
+        replace(
+            registration,
+            arm_calls=tuple(
+                {call.arm: call for call in registration.arm_calls}[arm]
+                for arm in MODEL_ARMS
+            ),
+        )
+        for registration in manifest.cases
+    )
+    unbalanced_schedule = [
+        {
+            "arms": list(MODEL_ARMS),
+            "case_index": case_index,
+        }
+        for case_index in range(64)
+    ]
+    fake_hash = sha256(
+        json.dumps(
+            unbalanced_schedule,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return replace(
+        manifest,
+        arm_schedule_sha256=fake_hash,
+        cases=forged_cases,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["algorithm", "domain", "schedule_hash", "rehashed_unbalanced_schedule"],
+)
+def test_model_manifest_rejects_forged_global_arm_schedule(
+    mutation: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    if mutation == "algorithm":
+        forged = replace(manifest, arm_schedule_algorithm="sha256-domain-sort-v1")
+    elif mutation == "domain":
+        forged = replace(manifest, arm_schedule_domain_sha256="0" * 64)
+    elif mutation == "schedule_hash":
+        forged = replace(manifest, arm_schedule_sha256="0" * 64)
+    else:
+        forged = _globally_unbalanced_model_manifest(manifest)
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(forged, _ByteModelTokenizer())
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_dry_run_validates_arm_schedule_before_model_boundary(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    boundary_calls = 0
+
+    class ForbiddenBoundary:
+        def submit(self, *_args, **_kwargs):
+            nonlocal boundary_calls
+            boundary_calls += 1
+            raise AssertionError("invalid schedule must fail before boundary")
+
+    target_index = 7
+    target = prepared_model_manifest.cases[target_index]
+    nested_only_forgery = replace(
+        prepared_model_manifest,
+        cases=(
+            *prepared_model_manifest.cases[:target_index],
+            replace(
+                target,
+                arm_calls=(
+                    target.arm_calls[1],
+                    target.arm_calls[0],
+                    *target.arm_calls[2:],
+                ),
+            ),
+            *prepared_model_manifest.cases[target_index + 1 :],
+        ),
+    )
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.run_model_dry_run(
+            nested_only_forgery,
+            _ByteModelTokenizer(),
+            ForbiddenBoundary(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+    assert boundary_calls == 0
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "reordered"])
@@ -8612,7 +8956,7 @@ def test_dry_run_submits_all_registered_calls_without_expected_answer(
     assert len(result.calls) == 64 * 6
     assert all(call.execution.valid for call in result.calls)
     assert tuple(call.arm for call in result.calls[:6]) == helpfulness.model_arm_order(
-        "nonce-000"
+        0
     )
     assert tuple(field.name for field in fields(helpfulness.PreparedModelCall)) == (
         "prompt",
@@ -8663,15 +9007,10 @@ def test_receiptless_case_attempts_all_six_arms_once_without_replacement(
     assert tuple(
         (failure.case_index, failure.arm, failure.reason)
         for failure in result.invalid_calls
-    ) == tuple(
-        (0, arm, "model_call_receipt")
-        for arm in helpfulness.model_arm_order("nonce-000")
-    )
+    ) == tuple((0, arm, "model_call_receipt") for arm in helpfulness.model_arm_order(0))
     case_zero = tuple(call for call in result.calls if call.case_index == 0)
     assert len(case_zero) == 6
-    assert tuple(call.arm for call in case_zero) == helpfulness.model_arm_order(
-        "nonce-000"
-    )
+    assert tuple(call.arm for call in case_zero) == helpfulness.model_arm_order(0)
     assert all(call.execution.valid is False for call in case_zero)
     assert all(
         call.execution.invalid_reason == "model_call_receipt" for call in case_zero
