@@ -132,6 +132,7 @@ _FACT_PATTERN = re.compile(
     rb"(?P<key>" + _KEY_PATTERN + rb") = (?P<value>" + _VALUE_PATTERN + rb")"
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_RELEASE_ID_PATTERN = re.compile(r"rel_[0-9a-f]{24}")
 _OPAQUE_TOKEN_PATTERN = re.compile(r"[89abcdef][0-9a-f]{31}")
 
 
@@ -662,6 +663,7 @@ class ModelObservationStateReceipt:
     renderer_instance_id: str
     audit_instance_id: str
     logical_session_instance_id: str
+    process_instance_id: str
     logical_session_id: str
     logical_run_id: str
 
@@ -672,6 +674,59 @@ class ModelObservationChildResponse:
 
     observation: ModelSourceObservation
     state_receipt: ModelObservationStateReceipt
+    database_receipt: ModelCaptureDatabaseReceipt
+    pid: int
+    process_instance_id: str
+    isolated_mode: bool
+    areal_module_path: str
+    visible_forbidden_environment: tuple[str, ...]
+    environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLeakageProbeChildRequest:
+    """Minimal scoped point-read capability for one opaque probe."""
+
+    execution_index: int
+    database_path: str
+    database_receipt: ModelCaptureDatabaseReceipt
+    scope: MemoryScope
+    release_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLeakageProbeObservation:
+    """Raw outcome echoing only the requested scope, never returned content."""
+
+    execution_index: int
+    requested_scope: MemoryScope
+    release_id: str
+    future_session_id: str
+    future_run_id: str
+    future_pid: int
+    future_process_instance_id: str
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLeakageProbeStateReceipt:
+    """Fresh point-reader state; resolver, renderer, consumer, and history are absent."""
+
+    execution_index: int
+    generation_index: int
+    store_instance_id: str
+    logical_session_instance_id: str
+    process_instance_id: str
+    logical_session_id: str
+    logical_run_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelLeakageProbeChildResponse:
+    """One raw scoped lookup observation plus process and database commitments."""
+
+    probe: ModelLeakageProbeObservation
+    state_receipt: ModelLeakageProbeStateReceipt
     database_receipt: ModelCaptureDatabaseReceipt
     pid: int
     process_instance_id: str
@@ -4917,6 +4972,7 @@ def _model_observation_state_receipt_to_wire(
         "logical_run_id": _wire_string(value.logical_run_id),
         "logical_session_id": _wire_string(value.logical_session_id),
         "logical_session_instance_id": _wire_sha256(value.logical_session_instance_id),
+        "process_instance_id": _wire_string(value.process_instance_id),
         "reader_instance_id": _wire_sha256(value.reader_instance_id),
         "renderer_instance_id": _wire_sha256(value.renderer_instance_id),
         "resolver_instance_id": _wire_sha256(value.resolver_instance_id),
@@ -4939,6 +4995,7 @@ def _model_observation_state_receipt_from_wire(
                 "renderer_instance_id",
                 "audit_instance_id",
                 "logical_session_instance_id",
+                "process_instance_id",
                 "logical_session_id",
                 "logical_run_id",
             }
@@ -4957,6 +5014,7 @@ def _model_observation_state_receipt_from_wire(
         renderer_instance_id=_wire_sha256(item["renderer_instance_id"]),
         audit_instance_id=_wire_sha256(item["audit_instance_id"]),
         logical_session_instance_id=_wire_sha256(item["logical_session_instance_id"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
         logical_session_id=_wire_string(item["logical_session_id"]),
         logical_run_id=_wire_string(item["logical_run_id"]),
     )
@@ -5006,6 +5064,231 @@ def _model_observation_response_from_wire(
     return ModelObservationChildResponse(
         observation=_model_source_observation_from_wire(item["observation"]),
         state_receipt=_model_observation_state_receipt_from_wire(item["state_receipt"]),
+        database_receipt=_model_capture_database_receipt_from_wire(
+            item["database_receipt"]
+        ),
+        pid=_wire_integer(item["pid"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        isolated_mode=_wire_boolean(item["isolated_mode"]),
+        areal_module_path=_wire_string(item["areal_module_path"]),
+        visible_forbidden_environment=tuple(
+            _wire_string(part)
+            for part in _wire_list(item["visible_forbidden_environment"])
+        ),
+        environment_clean=_wire_boolean(item["environment_clean"]),
+    )
+
+
+def _model_leakage_probe_request_to_wire(
+    value: ModelLeakageProbeChildRequest,
+) -> dict[str, object]:
+    if (
+        type(value) is not ModelLeakageProbeChildRequest
+        or type(value.scope) is not MemoryScope
+    ):
+        raise WireProtocolError("closed_schema")
+    return {
+        "database_path": _wire_database_path(value.database_path),
+        "database_receipt": _model_capture_database_receipt_to_wire(
+            value.database_receipt
+        ),
+        "execution_index": _wire_integer(value.execution_index),
+        "release_id": _wire_string(value.release_id),
+        "scope": _scope_to_wire(value.scope),
+    }
+
+
+def _model_leakage_probe_request_from_wire(
+    value: object,
+) -> ModelLeakageProbeChildRequest:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "database_path",
+                "database_receipt",
+                "scope",
+                "release_id",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    release_id = _wire_string(item["release_id"])
+    if (
+        not _is_opaque_execution_token(execution_index)
+        or _RELEASE_ID_PATTERN.fullmatch(release_id) is None
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelLeakageProbeChildRequest(
+        execution_index=execution_index,
+        database_path=_wire_database_path(item["database_path"]),
+        database_receipt=_model_capture_database_receipt_from_wire(
+            item["database_receipt"]
+        ),
+        scope=_scope_from_wire(item["scope"]),
+        release_id=release_id,
+    )
+
+
+def _model_leakage_probe_observation_to_wire(
+    value: ModelLeakageProbeObservation,
+) -> dict[str, object]:
+    if (
+        type(value) is not ModelLeakageProbeObservation
+        or type(value.requested_scope) is not MemoryScope
+        or value.outcome not in {"release_not_found", "release_found"}
+    ):
+        raise WireProtocolError("closed_schema")
+    return {
+        "execution_index": _wire_integer(value.execution_index),
+        "future_pid": _wire_integer(value.future_pid),
+        "future_process_instance_id": _wire_string(value.future_process_instance_id),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "outcome": _wire_string(value.outcome),
+        "release_id": _wire_string(value.release_id),
+        "requested_scope": _scope_to_wire(value.requested_scope),
+    }
+
+
+def _model_leakage_probe_observation_from_wire(
+    value: object,
+) -> ModelLeakageProbeObservation:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "requested_scope",
+                "release_id",
+                "future_session_id",
+                "future_run_id",
+                "future_pid",
+                "future_process_instance_id",
+                "outcome",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    release_id = _wire_string(item["release_id"])
+    future_pid = _wire_integer(item["future_pid"])
+    outcome = _wire_string(item["outcome"])
+    if (
+        not _is_opaque_execution_token(execution_index)
+        or _RELEASE_ID_PATTERN.fullmatch(release_id) is None
+        or future_pid <= 0
+        or outcome not in {"release_not_found", "release_found"}
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelLeakageProbeObservation(
+        execution_index=execution_index,
+        requested_scope=_scope_from_wire(item["requested_scope"]),
+        release_id=release_id,
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        future_pid=future_pid,
+        future_process_instance_id=_wire_string(item["future_process_instance_id"]),
+        outcome=outcome,
+    )
+
+
+def _model_leakage_probe_state_receipt_to_wire(
+    value: ModelLeakageProbeStateReceipt,
+) -> dict[str, object]:
+    if type(value) is not ModelLeakageProbeStateReceipt:
+        raise WireProtocolError("closed_schema")
+    return {
+        "execution_index": _wire_integer(value.execution_index),
+        "generation_index": _wire_integer(value.generation_index),
+        "logical_run_id": _wire_string(value.logical_run_id),
+        "logical_session_id": _wire_string(value.logical_session_id),
+        "logical_session_instance_id": _wire_sha256(value.logical_session_instance_id),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "store_instance_id": _wire_sha256(value.store_instance_id),
+    }
+
+
+def _model_leakage_probe_state_receipt_from_wire(
+    value: object,
+) -> ModelLeakageProbeStateReceipt:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "generation_index",
+                "store_instance_id",
+                "logical_session_instance_id",
+                "process_instance_id",
+                "logical_session_id",
+                "logical_run_id",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    generation_index = _wire_integer(item["generation_index"])
+    if not _is_opaque_execution_token(execution_index) or generation_index != 0:
+        raise WireProtocolError("closed_schema")
+    return ModelLeakageProbeStateReceipt(
+        execution_index=execution_index,
+        generation_index=generation_index,
+        store_instance_id=_wire_sha256(item["store_instance_id"]),
+        logical_session_instance_id=_wire_sha256(item["logical_session_instance_id"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        logical_session_id=_wire_string(item["logical_session_id"]),
+        logical_run_id=_wire_string(item["logical_run_id"]),
+    )
+
+
+def _model_leakage_probe_response_to_wire(
+    value: ModelLeakageProbeChildResponse,
+) -> dict[str, object]:
+    if type(value) is not ModelLeakageProbeChildResponse:
+        raise WireProtocolError("closed_schema")
+    return {
+        "areal_module_path": _wire_string(value.areal_module_path),
+        "database_receipt": _model_capture_database_receipt_to_wire(
+            value.database_receipt
+        ),
+        "environment_clean": _wire_boolean(value.environment_clean),
+        "isolated_mode": _wire_boolean(value.isolated_mode),
+        "pid": _wire_integer(value.pid),
+        "probe": _model_leakage_probe_observation_to_wire(value.probe),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "state_receipt": _model_leakage_probe_state_receipt_to_wire(
+            value.state_receipt
+        ),
+        "visible_forbidden_environment": [
+            _wire_string(name) for name in value.visible_forbidden_environment
+        ],
+    }
+
+
+def _model_leakage_probe_response_from_wire(
+    value: object,
+) -> ModelLeakageProbeChildResponse:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "probe",
+                "state_receipt",
+                "database_receipt",
+                "pid",
+                "process_instance_id",
+                "isolated_mode",
+                "areal_module_path",
+                "visible_forbidden_environment",
+                "environment_clean",
+            }
+        ),
+    )
+    return ModelLeakageProbeChildResponse(
+        probe=_model_leakage_probe_observation_from_wire(item["probe"]),
+        state_receipt=_model_leakage_probe_state_receipt_from_wire(
+            item["state_receipt"]
+        ),
         database_receipt=_model_capture_database_receipt_from_wire(
             item["database_receipt"]
         ),
@@ -6217,6 +6500,14 @@ _WIRE_ENCODERS: dict[type[object], tuple[str, Callable[[Any], dict[str, object]]
         "model_observation_child_response",
         _model_observation_response_to_wire,
     ),
+    ModelLeakageProbeChildRequest: (
+        "model_leakage_probe_child_request",
+        _model_leakage_probe_request_to_wire,
+    ),
+    ModelLeakageProbeChildResponse: (
+        "model_leakage_probe_child_response",
+        _model_leakage_probe_response_to_wire,
+    ),
     FutureBatchRequest: ("future_batch_request", _future_batch_request_to_wire),
     FutureBatchResponse: ("future_batch_response", _future_batch_response_to_wire),
     FutureChildRequest: ("future_child_request", _future_request_to_wire),
@@ -6242,6 +6533,8 @@ _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
     "model_capture_child_response": _model_capture_response_from_wire,
     "model_observation_child_request": _model_observation_request_from_wire,
     "model_observation_child_response": _model_observation_response_from_wire,
+    "model_leakage_probe_child_request": _model_leakage_probe_request_from_wire,
+    "model_leakage_probe_child_response": _model_leakage_probe_response_from_wire,
     "future_batch_request": _future_batch_request_from_wire,
     "future_batch_response": _future_batch_response_from_wire,
     "future_child_request": _future_request_from_wire,
@@ -6270,6 +6563,8 @@ def wire_dumps(value: object) -> str:
         if type(value) in {
             ModelObservationChildRequest,
             ModelObservationChildResponse,
+            ModelLeakageProbeChildRequest,
+            ModelLeakageProbeChildResponse,
         } and not _exact_typed_tree_equal(value, decoded):
             raise WireProtocolError("closed_schema")
     except WireProtocolError:
@@ -6949,6 +7244,7 @@ def _new_model_observation_state(
             component="logical_session",
             value=logical_session,
         ),
+        process_instance_id=PROCESS_INSTANCE_ID,
         logical_session_id=logical_session.session_id,
         logical_run_id=logical_session.run_id,
     )
@@ -6979,16 +7275,86 @@ def _model_observation_state_objects(
     )
 
 
+def _model_observation_reader_is_bound(
+    state: _ModelObservationState,
+    *,
+    require_fresh: bool,
+) -> bool:
+    reader = state.reader
+    if type(reader) is ReleaseReadCapability:
+        return (
+            getattr(reader, "_ReleaseReadCapability__store", None) is state.store
+            and getattr(reader, "_ReleaseReadCapability__assignment", None)
+            == state.assignment
+            and getattr(reader, "_ReleaseReadCapability__audit", None) is state.audit
+            and (
+                not require_fresh
+                or (
+                    getattr(reader, "_ReleaseReadCapability__revision_ids", None)
+                    == set()
+                    and getattr(
+                        reader,
+                        "_ReleaseReadCapability__candidate_ids",
+                        None,
+                    )
+                    == set()
+                )
+            )
+        )
+    if type(reader) is RawEvidenceReadCapability:
+        return (
+            getattr(reader, "_RawEvidenceReadCapability__store", None) is state.store
+            and getattr(reader, "_RawEvidenceReadCapability__assignment", None)
+            == state.assignment
+            and getattr(reader, "_RawEvidenceReadCapability__audit", None)
+            is state.audit
+        )
+    if type(reader) is OracleEntryCapability:
+        return (
+            getattr(reader, "_OracleEntryCapability__assignment", None)
+            == state.assignment
+            and getattr(reader, "_OracleEntryCapability__audit", None) is state.audit
+        )
+    return False
+
+
 def _claim_model_observation_state(
     state: _ModelObservationState,
     request: ModelObservationChildRequest,
 ) -> None:
+    source = request.source
+    if source.source_kind == "release":
+        expected_assignment: object = ReleaseSourceAssignment(
+            request.scope,
+            source.release_id,
+        )
+    elif source.source_kind == "raw_evidence":
+        expected_assignment = RawSourceAssignment(
+            request.scope,
+            source.cutoff,
+        )
+    else:
+        expected_assignment = OracleSourceAssignment(
+            request.scope,
+            source.oracle_entries,
+        )
     if (
-        state.used
+        type(state) is not _ModelObservationState
+        or type(state.store) is not SQLiteMemoryStore
+        or getattr(state.store, "_database_path", None) != request.database_path
+        or state.assignment != expected_assignment
+        or type(state.audit) is not ReadAuditSink
+        or type(state.resolver) is not _ItemResolver
+        or type(state.renderer) is not _ItemRenderer
+        or type(state.logical_session) is not _LogicalSessionState
+        or type(state.receipt) is not ModelObservationStateReceipt
+        or not _model_observation_reader_is_bound(state, require_fresh=True)
+        or state.used
         or state.generation_index != 0
         or state.receipt.execution_index != request.execution_index
         or state.logical_session.session_id != request.future_session_id
         or state.logical_session.run_id != request.future_run_id
+        or state.receipt.process_instance_id != PROCESS_INSTANCE_ID
     ):
         raise ChildExecutionValidationError("state_reuse")
     objects = _model_observation_state_objects(state)
@@ -7006,6 +7372,95 @@ def _claim_model_observation_state(
         state.receipt.resolver_instance_id,
         state.receipt.renderer_instance_id,
         state.receipt.audit_instance_id,
+        state.receipt.logical_session_instance_id,
+    )
+    observed = tuple(
+        _state_identity(
+            generation_index=state.generation_index,
+            component=component,
+            value=value,
+        )
+        for component, value in zip(components, objects, strict=True)
+    )
+    if len({id(value) for value in objects}) != len(objects) or observed != expected:
+        raise ChildExecutionValidationError("state_reuse")
+    state.used = True
+
+
+@dataclass(slots=True)
+class _ModelLeakageProbeState:
+    generation_index: int
+    store: SQLiteMemoryStore
+    logical_session: _LogicalSessionState
+    receipt: ModelLeakageProbeStateReceipt
+    used: bool
+
+
+def _new_model_leakage_probe_state(
+    request: ModelLeakageProbeChildRequest,
+) -> _ModelLeakageProbeState:
+    future_session_id, future_run_id = _opaque_future_identity(request.execution_index)
+    store = SQLiteMemoryStore(request.database_path)
+    logical_session = _LogicalSessionState(
+        session_id=future_session_id,
+        run_id=future_run_id,
+    )
+    generation_index = 0
+    receipt = ModelLeakageProbeStateReceipt(
+        execution_index=request.execution_index,
+        generation_index=generation_index,
+        store_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="store",
+            value=store,
+        ),
+        logical_session_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="logical_session",
+            value=logical_session,
+        ),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        logical_session_id=logical_session.session_id,
+        logical_run_id=logical_session.run_id,
+    )
+    return _ModelLeakageProbeState(
+        generation_index=generation_index,
+        store=store,
+        logical_session=logical_session,
+        receipt=receipt,
+        used=False,
+    )
+
+
+def _claim_model_leakage_probe_state(
+    state: _ModelLeakageProbeState,
+    request: ModelLeakageProbeChildRequest,
+) -> None:
+    future_session_id, future_run_id = _opaque_future_identity(request.execution_index)
+    if (
+        type(state) is not _ModelLeakageProbeState
+        or type(state.store) is not SQLiteMemoryStore
+        or getattr(state.store, "_database_path", None) != request.database_path
+        or type(state.logical_session) is not _LogicalSessionState
+        or type(state.receipt) is not ModelLeakageProbeStateReceipt
+        or state.used
+        or state.generation_index != 0
+        or state.receipt.execution_index != request.execution_index
+        or state.receipt.generation_index != 0
+        or state.logical_session.session_id != future_session_id
+        or state.logical_session.run_id != future_run_id
+        or state.receipt.logical_session_id != future_session_id
+        or state.receipt.logical_run_id != future_run_id
+        or state.receipt.process_instance_id != PROCESS_INSTANCE_ID
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    objects = (
+        state.store,
+        state.logical_session,
+    )
+    components = ("store", "logical_session")
+    expected = (
+        state.receipt.store_instance_id,
         state.receipt.logical_session_instance_id,
     )
     observed = tuple(
@@ -7345,6 +7800,12 @@ def execute_model_observation_child_request(
         raise ChildExecutionValidationError("state_reuse") from error
     _claim_model_observation_state(state, request)
     observation = _execute_model_source_observation(request, state)
+    if (
+        type(state.store) is not SQLiteMemoryStore
+        or getattr(state.store, "_database_path", None) != request.database_path
+        or not _model_observation_reader_is_bound(state, require_fresh=False)
+    ):
+        raise ChildExecutionValidationError("state_reuse")
     database_receipt = _require_model_observation_database(request)
     visible = _visible_forbidden_environment()
     return ModelObservationChildResponse(
@@ -7352,6 +7813,104 @@ def execute_model_observation_child_request(
         state_receipt=state.receipt,
         database_receipt=database_receipt,
         pid=os.getpid(),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        isolated_mode=bool(sys.flags.isolated),
+        areal_module_path=_areal_module_path(),
+        visible_forbidden_environment=visible,
+        environment_clean=not visible,
+    )
+
+
+def _validate_model_leakage_probe_request(
+    request: ModelLeakageProbeChildRequest,
+) -> None:
+    if type(request) is not ModelLeakageProbeChildRequest:
+        raise WireProtocolError("closed_schema")
+    decoded = _model_leakage_probe_request_from_wire(
+        _model_leakage_probe_request_to_wire(request)
+    )
+    if not _exact_typed_tree_equal(request, decoded):
+        raise WireProtocolError("closed_schema")
+
+
+def _require_model_leakage_probe_database(
+    request: ModelLeakageProbeChildRequest,
+) -> ModelCaptureDatabaseReceipt:
+    _model_capture_directory_identity(os.path.dirname(request.database_path))
+    receipt = request.database_receipt
+    observed = _model_capture_database_receipt(
+        request.database_path,
+        expected_identity=(receipt.device, receipt.inode),
+        durable=False,
+    )
+    if observed != receipt:
+        raise ChildExecutionValidationError("state_reuse")
+    return observed
+
+
+def execute_model_leakage_probe_child_request(
+    request: ModelLeakageProbeChildRequest,
+) -> ModelLeakageProbeChildResponse:
+    """Point-read one scoped release and expose only a raw presence bit."""
+
+    _validate_model_leakage_probe_request(request)
+    _require_model_leakage_probe_database(request)
+    try:
+        state = _new_model_leakage_probe_state(request)
+    except (MemoryPersistenceError, OSError) as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    _claim_model_leakage_probe_state(state, request)
+    try:
+        release = state.store.get_release(request.scope, request.release_id)
+    except ReleaseNotFoundError:
+        outcome = "release_not_found"
+    except (MemoryPersistenceError, OSError) as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    except MemoryServiceError as error:
+        raise ChildExecutionValidationError("assignment_mismatch") from error
+    else:
+        if (
+            type(release) is not MemoryRelease
+            or type(release.manifest) is not ReleaseManifest
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        try:
+            manifest_hash = hashlib.sha256(
+                release.manifest.canonical_bytes()
+            ).hexdigest()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ChildExecutionValidationError("assignment_mismatch") from error
+        if (
+            release.release_id != request.release_id
+            or type(release.content_hash) is not str
+            or release.content_hash != manifest_hash
+            or release.release_id != f"rel_{manifest_hash[:24]}"
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        outcome = "release_found"
+    if (
+        type(state.store) is not SQLiteMemoryStore
+        or getattr(state.store, "_database_path", None) != request.database_path
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    database_receipt = _require_model_leakage_probe_database(request)
+    future_session_id, future_run_id = _opaque_future_identity(request.execution_index)
+    pid = os.getpid()
+    visible = _visible_forbidden_environment()
+    return ModelLeakageProbeChildResponse(
+        probe=ModelLeakageProbeObservation(
+            execution_index=request.execution_index,
+            requested_scope=request.scope,
+            release_id=request.release_id,
+            future_session_id=future_session_id,
+            future_run_id=future_run_id,
+            future_pid=pid,
+            future_process_instance_id=PROCESS_INSTANCE_ID,
+            outcome=outcome,
+        ),
+        state_receipt=state.receipt,
+        database_receipt=database_receipt,
+        pid=pid,
         process_instance_id=PROCESS_INSTANCE_ID,
         isolated_mode=bool(sys.flags.isolated),
         areal_module_path=_areal_module_path(),
@@ -7423,6 +7982,7 @@ def execute_future_batch_request(
 def _validate_model_observation_state_receipt(
     receipt: ModelObservationStateReceipt,
     request: ModelObservationChildRequest,
+    process_instance_id: str,
 ) -> None:
     if type(receipt) is not ModelObservationStateReceipt:
         raise ChildExecutionValidationError("state_reuse")
@@ -7439,8 +7999,13 @@ def _validate_model_observation_state_receipt(
         or receipt.generation_index != 0
         or receipt.logical_session_id != request.future_session_id
         or receipt.logical_run_id != request.future_run_id
+        or receipt.process_instance_id != process_instance_id
+        or not _is_canonical_uuid4(receipt.process_instance_id)
         or len(set(identities)) != len(identities)
-        or any(_SHA256_PATTERN.fullmatch(identity) is None for identity in identities)
+        or any(
+            type(identity) is not str or _SHA256_PATTERN.fullmatch(identity) is None
+            for identity in identities
+        )
     ):
         raise ChildExecutionValidationError("state_reuse")
 
@@ -7655,7 +8220,11 @@ def _validate_model_observation_child_assignment(
         or response.database_receipt != initial_receipt
     ):
         raise ChildExecutionValidationError("assignment_mismatch")
-    _validate_model_observation_state_receipt(response.state_receipt, request)
+    _validate_model_observation_state_receipt(
+        response.state_receipt,
+        request,
+        response.process_instance_id,
+    )
     resolved_entries = _model_observation_resolved_entries(observation)
     _validate_model_observation_provenance(observation, resolved_entries)
     if source.source_kind == "oracle" and not _exact_typed_tree_equal(
@@ -7668,11 +8237,75 @@ def _validate_model_observation_child_assignment(
         raise ChildExecutionValidationError("state_reuse")
 
 
+def _validate_model_leakage_probe_state_receipt(
+    receipt: ModelLeakageProbeStateReceipt,
+    request: ModelLeakageProbeChildRequest,
+    process_instance_id: str,
+) -> None:
+    future_session_id, future_run_id = _opaque_future_identity(request.execution_index)
+    if type(receipt) is not ModelLeakageProbeStateReceipt:
+        raise ChildExecutionValidationError("state_reuse")
+    identities = (
+        receipt.store_instance_id,
+        receipt.logical_session_instance_id,
+    )
+    if (
+        receipt.execution_index != request.execution_index
+        or receipt.generation_index != 0
+        or receipt.logical_session_id != future_session_id
+        or receipt.logical_run_id != future_run_id
+        or receipt.process_instance_id != process_instance_id
+        or not _is_canonical_uuid4(receipt.process_instance_id)
+        or len(set(identities)) != len(identities)
+        or any(
+            type(identity) is not str or _SHA256_PATTERN.fullmatch(identity) is None
+            for identity in identities
+        )
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+
+
+def _validate_model_leakage_probe_child_assignment(
+    response: ModelLeakageProbeChildResponse,
+    request: ModelLeakageProbeChildRequest,
+) -> None:
+    if (
+        type(response) is not ModelLeakageProbeChildResponse
+        or type(request) is not ModelLeakageProbeChildRequest
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    _validate_model_leakage_probe_request(request)
+    initial_receipt = _require_model_leakage_probe_database(request)
+    future_session_id, future_run_id = _opaque_future_identity(request.execution_index)
+    probe = response.probe
+    if (
+        type(probe) is not ModelLeakageProbeObservation
+        or probe.execution_index != request.execution_index
+        or probe.requested_scope != request.scope
+        or probe.release_id != request.release_id
+        or probe.future_session_id != future_session_id
+        or probe.future_run_id != future_run_id
+        or probe.outcome not in {"release_not_found", "release_found"}
+        or response.database_receipt != request.database_receipt
+        or response.database_receipt != initial_receipt
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    _validate_model_leakage_probe_state_receipt(
+        response.state_receipt,
+        request,
+        response.process_instance_id,
+    )
+    final_receipt = _require_model_leakage_probe_database(request)
+    if final_receipt != response.database_receipt:
+        raise ChildExecutionValidationError("state_reuse")
+
+
 def run_isolated_child_raw(
     request: CaptureBatchRequest
     | CaptureChildRequest
     | ModelCaptureChildRequest
     | ModelObservationChildRequest
+    | ModelLeakageProbeChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -7684,7 +8317,13 @@ def run_isolated_child_raw(
     normalized_timeout_seconds = _normalize_positive_finite_seconds(timeout_seconds)
     if (
         type(role) is not str
-        or role not in {"capture-child", "future-child", "model-observation-child"}
+        or role
+        not in {
+            "capture-child",
+            "future-child",
+            "model-observation-child",
+            "model-leakage-probe-child",
+        }
         or (
             role == "capture-child"
             and type(request)
@@ -7702,6 +8341,10 @@ def run_isolated_child_raw(
             role == "model-observation-child"
             and type(request) is not ModelObservationChildRequest
         )
+        or (
+            role == "model-leakage-probe-child"
+            and type(request) is not ModelLeakageProbeChildRequest
+        )
     ):
         raise WireProtocolError("closed_schema")
     script_path = str(Path(__file__).resolve())
@@ -7715,6 +8358,7 @@ def run_isolated_child_raw(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            close_fds=True,
         )
     except OSError as error:
         raise WireProtocolError("child_spawn", str(error)) from error
@@ -7756,6 +8400,7 @@ def _validate_child_process_response(
     | CaptureChildResponse
     | ModelCaptureChildResponse
     | ModelObservationChildResponse
+    | ModelLeakageProbeChildResponse
     | FutureBatchResponse
     | FutureChildResponse,
     *,
@@ -7796,6 +8441,16 @@ def _validate_child_process_response(
             or observation.future_process_instance_id != response.process_instance_id
             or not _is_canonical_uuid4(observation.future_process_instance_id)
         )
+    if type(response) is ModelLeakageProbeChildResponse:
+        probe = response.probe
+        if type(probe) is not ModelLeakageProbeObservation:
+            invalid = True
+        else:
+            invalid = invalid or (
+                probe.future_pid != response.pid
+                or probe.future_process_instance_id != response.process_instance_id
+                or not _is_canonical_uuid4(probe.future_process_instance_id)
+            )
     if invalid:
         raise ChildExecutionValidationError("process_isolation")
 
@@ -7805,6 +8460,7 @@ def run_isolated_child(
     | CaptureChildRequest
     | ModelCaptureChildRequest
     | ModelObservationChildRequest
+    | ModelLeakageProbeChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -7815,6 +8471,7 @@ def run_isolated_child(
     | CaptureChildResponse
     | ModelCaptureChildResponse
     | ModelObservationChildResponse
+    | ModelLeakageProbeChildResponse
     | FutureBatchResponse
     | FutureChildResponse
 ):
@@ -7826,6 +8483,12 @@ def run_isolated_child(
         _normalize_positive_finite_seconds(timeout_seconds)
         _validate_model_observation_request(request)
         _require_model_observation_database(request)
+    if type(request) is ModelLeakageProbeChildRequest:
+        if type(role) is not str or role != "model-leakage-probe-child":
+            raise WireProtocolError("closed_schema")
+        _normalize_positive_finite_seconds(timeout_seconds)
+        _validate_model_leakage_probe_request(request)
+        _require_model_leakage_probe_database(request)
     completed = run_isolated_child_raw(
         request,
         role=role,
@@ -7843,6 +8506,7 @@ def run_isolated_child(
         CaptureChildRequest: CaptureChildResponse,
         ModelCaptureChildRequest: ModelCaptureChildResponse,
         ModelObservationChildRequest: ModelObservationChildResponse,
+        ModelLeakageProbeChildRequest: ModelLeakageProbeChildResponse,
         FutureBatchRequest: FutureBatchResponse,
         FutureChildRequest: FutureChildResponse,
     }[type(request)]
@@ -7877,6 +8541,8 @@ def run_isolated_child(
             raise ChildExecutionValidationError("assignment_mismatch")
     elif type(request) is ModelObservationChildRequest:
         _validate_model_observation_child_assignment(response, request)
+    elif type(request) is ModelLeakageProbeChildRequest:
+        _validate_model_leakage_probe_child_assignment(response, request)
     elif type(request) is FutureBatchRequest:
         expected_index_sequence = tuple(item.execution_index for item in request.items)
         expected_indexes = set(expected_index_sequence)
@@ -12186,10 +12852,16 @@ def _write_child_response(response: object) -> None:
 
 
 def _child_main() -> int:
-    roles = {"capture-child", "future-child", "model-observation-child"}
+    roles = {
+        "capture-child",
+        "future-child",
+        "model-observation-child",
+        "model-leakage-probe-child",
+    }
     if len(sys.argv) != 2 or sys.argv[1] not in roles:
         sys.stderr.write(
-            "expected capture-child, future-child, or model-observation-child role\n"
+            "expected capture-child, future-child, model-observation-child, "
+            "or model-leakage-probe-child role\n"
         )
         return 2
     role = sys.argv[1]
@@ -12212,8 +12884,13 @@ def _child_main() -> int:
                 response = execute_future_child_request(request)
             else:
                 raise WireProtocolError("closed_schema")
-        elif type(request) is ModelObservationChildRequest:
-            response = execute_model_observation_child_request(request)
+        elif role == "model-observation-child":
+            if type(request) is ModelObservationChildRequest:
+                response = execute_model_observation_child_request(request)
+            else:
+                raise WireProtocolError("closed_schema")
+        elif type(request) is ModelLeakageProbeChildRequest:
+            response = execute_model_leakage_probe_child_request(request)
         else:
             raise WireProtocolError("closed_schema")
         _write_child_response(response)
@@ -12239,7 +12916,10 @@ def _child_main() -> int:
         _write_child_response(ChildFailureResponse(reason))
         return 0
     except Exception as error:
-        sys.stderr.write(f"{type(error).__name__}: {error}\n")
+        if role == "model-leakage-probe-child":
+            sys.stderr.write(f"{type(error).__name__}\n")
+        else:
+            sys.stderr.write(f"{type(error).__name__}: {error}\n")
         return 1
 
 

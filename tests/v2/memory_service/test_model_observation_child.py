@@ -198,6 +198,7 @@ def test_model_observation_wire_has_no_scorer_or_model_output(
         "logical_run_id",
         "logical_session_id",
         "logical_session_instance_id",
+        "process_instance_id",
         "reader_instance_id",
         "renderer_instance_id",
         "resolver_instance_id",
@@ -487,25 +488,15 @@ def test_model_observation_uses_fresh_real_isolated_processes(
         first.database_receipt == second.database_receipt == (capture.database_receipt)
     )
     assert parent_store_calls == Counter()
+    expected_args = [
+        sys.executable,
+        "-I",
+        str(Path(helpfulness.__file__).resolve()),
+        "model-observation-child",
+    ]
     assert launches == [
-        (
-            [
-                sys.executable,
-                "-I",
-                str(Path(helpfulness.__file__).resolve()),
-                "model-observation-child",
-            ],
-            first.pid,
-        ),
-        (
-            [
-                sys.executable,
-                "-I",
-                str(Path(helpfulness.__file__).resolve()),
-                "model-observation-child",
-            ],
-            second.pid,
-        ),
+        (expected_args, first.pid),
+        (expected_args, second.pid),
     ]
     assert first.pid != os.getpid()
     assert second.pid != os.getpid()
@@ -532,21 +523,45 @@ def test_model_observation_uses_fresh_real_isolated_processes(
     first_state = {
         value
         for field in fields(first.state_receipt)
-        if field.name.endswith("_instance_id")
+        if field.name.endswith("_instance_id") and field.name != "process_instance_id"
         for value in (getattr(first.state_receipt, field.name),)
     }
     second_state = {
         value
         for field in fields(second.state_receipt)
-        if field.name.endswith("_instance_id")
+        if field.name.endswith("_instance_id") and field.name != "process_instance_id"
         for value in (getattr(second.state_receipt, field.name),)
     }
     assert len(first_state) == len(second_state) == 6
     assert first_state.isdisjoint(second_state)
     for response in (first, second):
+        assert (
+            response.state_receipt.process_instance_id == response.process_instance_id
+        )
         assert response.isolated_mode is True
         assert response.visible_forbidden_environment == ()
         assert response.environment_clean is True
+
+    spliced = replace(second, state_receipt=first.state_receipt)
+    completed = helpfulness.ChildProcessResult(
+        args=expected_args,
+        pid=second.pid,
+        returncode=0,
+        stdout=helpfulness.wire_dumps(spliced),
+        stderr="",
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "run_isolated_child_raw",
+        lambda *_args, **_kwargs: completed,
+    )
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as splice_error:
+        helpfulness.run_isolated_child(
+            second_request,
+            role="model-observation-child",
+            timeout_seconds=20,
+        )
+    assert splice_error.value.reason == "state_reuse"
 
 
 def test_model_observation_rejects_aliased_in_process_state(
@@ -585,6 +600,86 @@ def test_model_observation_rejects_aliased_in_process_state(
     assert error.value.reason == "state_reuse"
 
 
+def test_model_observation_rejects_store_and_reader_from_another_database(
+    observation_setup: tuple[
+        helpfulness.CodebookCase,
+        helpfulness.ModelCaptureChildResponse,
+        helpfulness.ModelObservationChildRequest,
+        helpfulness.ParentScheduleItem,
+    ],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _case, _capture, request, _schedule = observation_setup
+    _other_case, _other_capture, other_request, _other_schedule = _build_setup(
+        tmp_path / "other-observation-database",
+        execution_token=_EXECUTION_TOKEN + 9,
+    )
+    other_store = helpfulness.SQLiteMemoryStore(other_request.database_path)
+    original_new_state = helpfulness._new_model_observation_state
+
+    def wrong_store(observation_request):
+        state = original_new_state(observation_request)
+        state.store = other_store
+        state.receipt = replace(
+            state.receipt,
+            store_instance_id=helpfulness._state_identity(
+                generation_index=state.generation_index,
+                component="store",
+                value=state.store,
+            ),
+        )
+        return state
+
+    def wrong_reader(observation_request):
+        state = original_new_state(observation_request)
+        assert type(state.assignment) is helpfulness.ReleaseSourceAssignment
+        state.reader = helpfulness.ReleaseReadCapability(
+            other_store,
+            state.assignment,
+            state.audit,
+        )
+        state.receipt = replace(
+            state.receipt,
+            reader_instance_id=helpfulness._state_identity(
+                generation_index=state.generation_index,
+                component="reader",
+                value=state.reader,
+            ),
+        )
+        return state
+
+    for factory in (wrong_store, wrong_reader):
+        monkeypatch.setattr(
+            helpfulness,
+            "_new_model_observation_state",
+            factory,
+        )
+        with pytest.raises(helpfulness.ChildExecutionValidationError) as error:
+            helpfulness.execute_model_observation_child_request(request)
+        assert error.value.reason == "state_reuse"
+
+    monkeypatch.setattr(
+        helpfulness,
+        "_new_model_observation_state",
+        original_new_state,
+    )
+    original_get_release = helpfulness.SQLiteMemoryStore.get_release
+
+    def redirect_after_claim(store, scope, release_id):
+        store._database_path = other_request.database_path
+        return original_get_release(store, scope, release_id)
+
+    monkeypatch.setattr(
+        helpfulness.SQLiteMemoryStore,
+        "get_release",
+        redirect_after_claim,
+    )
+    with pytest.raises(helpfulness.ChildExecutionValidationError) as redirect_error:
+        helpfulness.execute_model_observation_child_request(request)
+    assert redirect_error.value.reason == "state_reuse"
+
+
 def test_model_observation_parent_rejects_forged_process_source_and_state(
     observation_setup: tuple[
         helpfulness.CodebookCase,
@@ -607,6 +702,10 @@ def test_model_observation_parent_rejects_forged_process_source_and_state(
         ),
         visible_forbidden_environment=(),
         environment_clean=True,
+        state_receipt=replace(
+            observed.state_receipt,
+            process_instance_id=process_id,
+        ),
         observation=replace(
             observed.observation,
             future_pid=12_345,
@@ -1040,6 +1139,10 @@ def test_model_observation_parent_rejects_self_consistent_forged_oracle(
         ),
         visible_forbidden_environment=(),
         environment_clean=True,
+        state_receipt=replace(
+            observed.state_receipt,
+            process_instance_id=child_process_id,
+        ),
         observation=replace(
             observed.observation,
             future_pid=child_pid,
