@@ -44,7 +44,11 @@ from areal.v2.memory_service import (  # noqa: E402
     RevisionOperation,
     RevisionProposal,
 )
-from areal.v2.memory_service.errors import ReleaseNotFoundError  # noqa: E402
+from areal.v2.memory_service.errors import (  # noqa: E402
+    MemoryPersistenceError,
+    MemoryServiceError,
+    ReleaseNotFoundError,
+)
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore  # noqa: E402
 
 PROCESS_INSTANCE_ID = str(uuid.uuid4())
@@ -611,6 +615,73 @@ class ModelCaptureChildResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelObservationChildRequest:
+    """Opaque capability for independently reproducing Memory-rendered bytes."""
+
+    execution_index: int
+    database_path: str
+    database_receipt: ModelCaptureDatabaseReceipt
+    scope: MemoryScope
+    source: WireSourceSpec
+    future_session_id: str
+    future_run_id: str
+    renderer_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSourceObservation:
+    """Reader/render facts with no consumer response or model-call receipt."""
+
+    execution_index: int
+    source_kind: str
+    scope: MemoryScope
+    future_session_id: str
+    future_run_id: str
+    future_pid: int
+    future_process_instance_id: str
+    release_id: str | None
+    eligible_ids: tuple[str, ...]
+    retrieved_ids: tuple[str, ...]
+    returned_ids: tuple[str, ...]
+    source_evidence_ids: tuple[str, ...]
+    entries: tuple[EntryReceipt, ...]
+    reader_audit: tuple[ReadAuditEvent, ...]
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelObservationStateReceipt:
+    """Fresh per-exec Memory components; consumer and history are absent by design."""
+
+    execution_index: int
+    generation_index: int
+    store_instance_id: str
+    reader_instance_id: str
+    resolver_instance_id: str
+    renderer_instance_id: str
+    audit_instance_id: str
+    logical_session_instance_id: str
+    logical_session_id: str
+    logical_run_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelObservationChildResponse:
+    """One source observation plus child-owned process and database commitments."""
+
+    observation: ModelSourceObservation
+    state_receipt: ModelObservationStateReceipt
+    database_receipt: ModelCaptureDatabaseReceipt
+    pid: int
+    process_instance_id: str
+    isolated_mode: bool
+    areal_module_path: str
+    visible_forbidden_environment: tuple[str, ...]
+    environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FutureChildRequest:
     execution_index: int
     database_path: str
@@ -651,8 +722,16 @@ class FutureExecutionObservation:
     response: str
 
 
-class _ObservationView(Protocol):
-    """Common validated fields shared by live and wire-future observations."""
+class _SourceRequestView(Protocol):
+    """Minimum capability assignment shared by answer and source-only requests."""
+
+    database_path: str
+    scope: MemoryScope
+    source: WireSourceSpec
+
+
+class _SourceObservationView(Protocol):
+    """Actual source, provenance, audit, and render facts."""
 
     source_kind: str
     eligible_ids: tuple[str, ...]
@@ -663,6 +742,11 @@ class _ObservationView(Protocol):
     reader_audit: tuple[ReadAuditEvent, ...]
     rendered_context_sha256: str
     rendered_context_utf8_bytes: int
+
+
+class _ObservationView(_SourceObservationView, Protocol):
+    """Source facts extended with consumer and model-call boundary receipts."""
+
     consumer_input_receipt: ConsumerInputReceipt
     model_call_receipt: ModelCallReceipt | None
     query_sha256: str
@@ -3600,7 +3684,7 @@ def _validate_receipts_and_acknowledge(
 
 
 def _validate_parent_source_contract(
-    observation: _ObservationView,
+    observation: _SourceObservationView,
     schedule: ParentScheduleItem,
 ) -> None:
     expected = schedule.expected_source
@@ -4637,6 +4721,291 @@ def _model_capture_response_from_wire(value: object) -> ModelCaptureChildRespons
         model_attempt=model_attempt,
         case_manifest_sha256=_wire_sha256(item["case_manifest_sha256"]),
         references=_database_references_from_wire(item["references"]),
+        database_receipt=_model_capture_database_receipt_from_wire(
+            item["database_receipt"]
+        ),
+        pid=_wire_integer(item["pid"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        isolated_mode=_wire_boolean(item["isolated_mode"]),
+        areal_module_path=_wire_string(item["areal_module_path"]),
+        visible_forbidden_environment=tuple(
+            _wire_string(part)
+            for part in _wire_list(item["visible_forbidden_environment"])
+        ),
+        environment_clean=_wire_boolean(item["environment_clean"]),
+    )
+
+
+def _model_observation_request_to_wire(
+    value: ModelObservationChildRequest,
+) -> dict[str, object]:
+    if (
+        type(value) is not ModelObservationChildRequest
+        or type(value.scope) is not MemoryScope
+        or type(value.source) is not WireSourceSpec
+    ):
+        raise WireProtocolError("closed_schema")
+    return {
+        "database_path": _wire_database_path(value.database_path),
+        "database_receipt": _model_capture_database_receipt_to_wire(
+            value.database_receipt
+        ),
+        "execution_index": _wire_integer(value.execution_index),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "renderer_version": _wire_string(value.renderer_version),
+        "scope": _scope_to_wire(value.scope),
+        "source": _source_spec_to_wire(value.source),
+    }
+
+
+def _model_observation_request_from_wire(
+    value: object,
+) -> ModelObservationChildRequest:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "database_path",
+                "database_receipt",
+                "scope",
+                "source",
+                "future_session_id",
+                "future_run_id",
+                "renderer_version",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    if not _is_opaque_execution_token(execution_index):
+        raise WireProtocolError("closed_schema")
+    return ModelObservationChildRequest(
+        execution_index=execution_index,
+        database_path=_wire_database_path(item["database_path"]),
+        database_receipt=_model_capture_database_receipt_from_wire(
+            item["database_receipt"]
+        ),
+        scope=_scope_from_wire(item["scope"]),
+        source=_source_spec_from_wire(item["source"]),
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        renderer_version=_wire_string(item["renderer_version"]),
+    )
+
+
+def _model_source_observation_to_wire(
+    value: ModelSourceObservation,
+) -> dict[str, object]:
+    if (
+        type(value) is not ModelSourceObservation
+        or type(value.scope) is not MemoryScope
+        or type(value.eligible_ids) is not tuple
+        or type(value.retrieved_ids) is not tuple
+        or type(value.returned_ids) is not tuple
+        or type(value.source_evidence_ids) is not tuple
+        or type(value.entries) is not tuple
+        or type(value.reader_audit) is not tuple
+        or any(type(part) is not str for part in value.eligible_ids)
+        or any(type(part) is not str for part in value.retrieved_ids)
+        or any(type(part) is not str for part in value.returned_ids)
+        or any(type(part) is not str for part in value.source_evidence_ids)
+        or any(type(entry) is not EntryReceipt for entry in value.entries)
+        or any(type(event) is not ReadAuditEvent for event in value.reader_audit)
+    ):
+        raise WireProtocolError("closed_schema")
+    return {
+        "eligible_ids": [_wire_string(part) for part in value.eligible_ids],
+        "entries": [_entry_receipt_to_wire(entry) for entry in value.entries],
+        "execution_index": _wire_integer(value.execution_index),
+        "future_pid": _wire_integer(value.future_pid),
+        "future_process_instance_id": _wire_string(value.future_process_instance_id),
+        "future_run_id": _wire_string(value.future_run_id),
+        "future_session_id": _wire_string(value.future_session_id),
+        "reader_audit": [_audit_to_wire(event) for event in value.reader_audit],
+        "release_id": (
+            None if value.release_id is None else _wire_string(value.release_id)
+        ),
+        "rendered_context_sha256": _wire_sha256(value.rendered_context_sha256),
+        "rendered_context_utf8_bytes": _wire_integer(value.rendered_context_utf8_bytes),
+        "retrieved_ids": [_wire_string(part) for part in value.retrieved_ids],
+        "returned_ids": [_wire_string(part) for part in value.returned_ids],
+        "scope": _scope_to_wire(value.scope),
+        "source_evidence_ids": [
+            _wire_string(part) for part in value.source_evidence_ids
+        ],
+        "source_kind": _wire_string(value.source_kind),
+    }
+
+
+def _model_source_observation_from_wire(value: object) -> ModelSourceObservation:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "source_kind",
+                "scope",
+                "future_session_id",
+                "future_run_id",
+                "future_pid",
+                "future_process_instance_id",
+                "release_id",
+                "eligible_ids",
+                "retrieved_ids",
+                "returned_ids",
+                "source_evidence_ids",
+                "entries",
+                "reader_audit",
+                "rendered_context_sha256",
+                "rendered_context_utf8_bytes",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    future_pid = _wire_integer(item["future_pid"])
+    rendered_bytes = _wire_integer(item["rendered_context_utf8_bytes"])
+    source_kind = _wire_string(item["source_kind"])
+    if (
+        not _is_opaque_execution_token(execution_index)
+        or future_pid <= 0
+        or rendered_bytes < 0
+        or source_kind not in {"release", "raw_evidence", "oracle"}
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelSourceObservation(
+        execution_index=execution_index,
+        source_kind=source_kind,
+        scope=_scope_from_wire(item["scope"]),
+        future_session_id=_wire_string(item["future_session_id"]),
+        future_run_id=_wire_string(item["future_run_id"]),
+        future_pid=future_pid,
+        future_process_instance_id=_wire_string(item["future_process_instance_id"]),
+        release_id=_optional_string(item["release_id"]),
+        eligible_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["eligible_ids"])
+        ),
+        retrieved_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["retrieved_ids"])
+        ),
+        returned_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["returned_ids"])
+        ),
+        source_evidence_ids=tuple(
+            _wire_string(part) for part in _wire_list(item["source_evidence_ids"])
+        ),
+        entries=tuple(
+            _entry_receipt_from_wire(part) for part in _wire_list(item["entries"])
+        ),
+        reader_audit=tuple(
+            _audit_from_wire(part) for part in _wire_list(item["reader_audit"])
+        ),
+        rendered_context_sha256=_wire_sha256(item["rendered_context_sha256"]),
+        rendered_context_utf8_bytes=rendered_bytes,
+    )
+
+
+def _model_observation_state_receipt_to_wire(
+    value: ModelObservationStateReceipt,
+) -> dict[str, object]:
+    if type(value) is not ModelObservationStateReceipt:
+        raise WireProtocolError("closed_schema")
+    return {
+        "audit_instance_id": _wire_sha256(value.audit_instance_id),
+        "execution_index": _wire_integer(value.execution_index),
+        "generation_index": _wire_integer(value.generation_index),
+        "logical_run_id": _wire_string(value.logical_run_id),
+        "logical_session_id": _wire_string(value.logical_session_id),
+        "logical_session_instance_id": _wire_sha256(value.logical_session_instance_id),
+        "reader_instance_id": _wire_sha256(value.reader_instance_id),
+        "renderer_instance_id": _wire_sha256(value.renderer_instance_id),
+        "resolver_instance_id": _wire_sha256(value.resolver_instance_id),
+        "store_instance_id": _wire_sha256(value.store_instance_id),
+    }
+
+
+def _model_observation_state_receipt_from_wire(
+    value: object,
+) -> ModelObservationStateReceipt:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "execution_index",
+                "generation_index",
+                "store_instance_id",
+                "reader_instance_id",
+                "resolver_instance_id",
+                "renderer_instance_id",
+                "audit_instance_id",
+                "logical_session_instance_id",
+                "logical_session_id",
+                "logical_run_id",
+            }
+        ),
+    )
+    execution_index = _wire_integer(item["execution_index"])
+    generation_index = _wire_integer(item["generation_index"])
+    if not _is_opaque_execution_token(execution_index) or generation_index != 0:
+        raise WireProtocolError("closed_schema")
+    return ModelObservationStateReceipt(
+        execution_index=execution_index,
+        generation_index=generation_index,
+        store_instance_id=_wire_sha256(item["store_instance_id"]),
+        reader_instance_id=_wire_sha256(item["reader_instance_id"]),
+        resolver_instance_id=_wire_sha256(item["resolver_instance_id"]),
+        renderer_instance_id=_wire_sha256(item["renderer_instance_id"]),
+        audit_instance_id=_wire_sha256(item["audit_instance_id"]),
+        logical_session_instance_id=_wire_sha256(item["logical_session_instance_id"]),
+        logical_session_id=_wire_string(item["logical_session_id"]),
+        logical_run_id=_wire_string(item["logical_run_id"]),
+    )
+
+
+def _model_observation_response_to_wire(
+    value: ModelObservationChildResponse,
+) -> dict[str, object]:
+    if type(value) is not ModelObservationChildResponse:
+        raise WireProtocolError("closed_schema")
+    return {
+        "areal_module_path": _wire_string(value.areal_module_path),
+        "database_receipt": _model_capture_database_receipt_to_wire(
+            value.database_receipt
+        ),
+        "environment_clean": _wire_boolean(value.environment_clean),
+        "isolated_mode": _wire_boolean(value.isolated_mode),
+        "observation": _model_source_observation_to_wire(value.observation),
+        "pid": _wire_integer(value.pid),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "state_receipt": _model_observation_state_receipt_to_wire(value.state_receipt),
+        "visible_forbidden_environment": [
+            _wire_string(name) for name in value.visible_forbidden_environment
+        ],
+    }
+
+
+def _model_observation_response_from_wire(
+    value: object,
+) -> ModelObservationChildResponse:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "observation",
+                "state_receipt",
+                "database_receipt",
+                "pid",
+                "process_instance_id",
+                "isolated_mode",
+                "areal_module_path",
+                "visible_forbidden_environment",
+                "environment_clean",
+            }
+        ),
+    )
+    return ModelObservationChildResponse(
+        observation=_model_source_observation_from_wire(item["observation"]),
+        state_receipt=_model_observation_state_receipt_from_wire(item["state_receipt"]),
         database_receipt=_model_capture_database_receipt_from_wire(
             item["database_receipt"]
         ),
@@ -5840,6 +6209,14 @@ _WIRE_ENCODERS: dict[type[object], tuple[str, Callable[[Any], dict[str, object]]
         "model_capture_child_response",
         _model_capture_response_to_wire,
     ),
+    ModelObservationChildRequest: (
+        "model_observation_child_request",
+        _model_observation_request_to_wire,
+    ),
+    ModelObservationChildResponse: (
+        "model_observation_child_response",
+        _model_observation_response_to_wire,
+    ),
     FutureBatchRequest: ("future_batch_request", _future_batch_request_to_wire),
     FutureBatchResponse: ("future_batch_response", _future_batch_response_to_wire),
     FutureChildRequest: ("future_child_request", _future_request_to_wire),
@@ -5863,6 +6240,8 @@ _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
     "capture_child_response": _capture_response_from_wire,
     "model_capture_child_request": _model_capture_request_from_wire,
     "model_capture_child_response": _model_capture_response_from_wire,
+    "model_observation_child_request": _model_observation_request_from_wire,
+    "model_observation_child_response": _model_observation_response_from_wire,
     "future_batch_request": _future_batch_request_from_wire,
     "future_batch_response": _future_batch_response_from_wire,
     "future_child_request": _future_request_from_wire,
@@ -5887,7 +6266,12 @@ def wire_dumps(value: object) -> str:
         raise WireProtocolError("closed_schema") from error
     try:
         payload = encoder(value)
-        _WIRE_DECODERS[type_name](payload)
+        decoded = _WIRE_DECODERS[type_name](payload)
+        if type(value) in {
+            ModelObservationChildRequest,
+            ModelObservationChildResponse,
+        } and not _exact_typed_tree_equal(value, decoded):
+            raise WireProtocolError("closed_schema")
     except WireProtocolError:
         raise
     except (TypeError, ValueError, OverflowError, RecursionError) as error:
@@ -6419,7 +6803,7 @@ def execute_capture_batch_request(
 
 
 def _assignment_and_capability(
-    request: FutureChildRequest,
+    request: _SourceRequestView,
     store: SQLiteMemoryStore,
     audit: ReadAuditSink,
 ) -> tuple[
@@ -6503,6 +6887,138 @@ def _state_identity(
         f"{PROCESS_INSTANCE_ID}|{generation_index}|{component}|{id(value)}"
     ).encode()
     return hashlib.sha256(material).hexdigest()
+
+
+@dataclass(slots=True)
+class _ModelObservationState:
+    generation_index: int
+    store: SQLiteMemoryStore
+    assignment: ReleaseSourceAssignment | RawSourceAssignment | OracleSourceAssignment
+    reader: ReleaseReadCapability | RawEvidenceReadCapability | OracleEntryCapability
+    audit: ReadAuditSink
+    resolver: _ItemResolver
+    renderer: _ItemRenderer
+    logical_session: _LogicalSessionState
+    receipt: ModelObservationStateReceipt
+    used: bool
+
+
+def _new_model_observation_state(
+    request: ModelObservationChildRequest,
+) -> _ModelObservationState:
+    audit = ReadAuditSink()
+    store = SQLiteMemoryStore(request.database_path)
+    assignment, reader = _assignment_and_capability(request, store, audit)
+    resolver = _ItemResolver()
+    renderer = _ItemRenderer()
+    logical_session = _LogicalSessionState(
+        session_id=request.future_session_id,
+        run_id=request.future_run_id,
+    )
+    generation_index = 0
+    receipt = ModelObservationStateReceipt(
+        execution_index=request.execution_index,
+        generation_index=generation_index,
+        store_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="store",
+            value=store,
+        ),
+        reader_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="reader",
+            value=reader,
+        ),
+        resolver_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="resolver",
+            value=resolver,
+        ),
+        renderer_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="renderer",
+            value=renderer,
+        ),
+        audit_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="audit",
+            value=audit,
+        ),
+        logical_session_instance_id=_state_identity(
+            generation_index=generation_index,
+            component="logical_session",
+            value=logical_session,
+        ),
+        logical_session_id=logical_session.session_id,
+        logical_run_id=logical_session.run_id,
+    )
+    return _ModelObservationState(
+        generation_index=generation_index,
+        store=store,
+        assignment=assignment,
+        reader=reader,
+        audit=audit,
+        resolver=resolver,
+        renderer=renderer,
+        logical_session=logical_session,
+        receipt=receipt,
+        used=False,
+    )
+
+
+def _model_observation_state_objects(
+    state: _ModelObservationState,
+) -> tuple[object, ...]:
+    return (
+        state.store,
+        state.reader,
+        state.resolver,
+        state.renderer,
+        state.audit,
+        state.logical_session,
+    )
+
+
+def _claim_model_observation_state(
+    state: _ModelObservationState,
+    request: ModelObservationChildRequest,
+) -> None:
+    if (
+        state.used
+        or state.generation_index != 0
+        or state.receipt.execution_index != request.execution_index
+        or state.logical_session.session_id != request.future_session_id
+        or state.logical_session.run_id != request.future_run_id
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    objects = _model_observation_state_objects(state)
+    components = (
+        "store",
+        "reader",
+        "resolver",
+        "renderer",
+        "audit",
+        "logical_session",
+    )
+    expected = (
+        state.receipt.store_instance_id,
+        state.receipt.reader_instance_id,
+        state.receipt.resolver_instance_id,
+        state.receipt.renderer_instance_id,
+        state.receipt.audit_instance_id,
+        state.receipt.logical_session_instance_id,
+    )
+    observed = tuple(
+        _state_identity(
+            generation_index=state.generation_index,
+            component=component,
+            value=value,
+        )
+        for component, value in zip(components, objects, strict=True)
+    )
+    if len({id(value) for value in objects}) != len(objects) or observed != expected:
+        raise ChildExecutionValidationError("state_reuse")
+    state.used = True
 
 
 def _new_item_execution_state(
@@ -6731,6 +7247,119 @@ def execute_future_child_request(
     )
 
 
+def _validate_model_observation_request(
+    request: ModelObservationChildRequest,
+) -> None:
+    if type(request) is not ModelObservationChildRequest:
+        raise WireProtocolError("closed_schema")
+    _model_observation_request_from_wire(_model_observation_request_to_wire(request))
+    _validate_wire_source_spec(request.source)
+    expected_session_id, expected_run_id = _opaque_future_identity(
+        request.execution_index
+    )
+    if (
+        request.renderer_version != "memory-codebook/v1"
+        or request.future_session_id != expected_session_id
+        or request.future_run_id != expected_run_id
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    if request.source.source_kind == "oracle":
+        try:
+            render_context(request.source.oracle_entries)
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ChildExecutionValidationError("assignment_mismatch") from error
+
+
+def _require_model_observation_database(
+    request: ModelObservationChildRequest,
+) -> ModelCaptureDatabaseReceipt:
+    _model_capture_directory_identity(os.path.dirname(request.database_path))
+    receipt = request.database_receipt
+    observed = _model_capture_database_receipt(
+        request.database_path,
+        expected_identity=(receipt.device, receipt.inode),
+        durable=False,
+    )
+    if observed != receipt:
+        raise ChildExecutionValidationError("state_reuse")
+    return observed
+
+
+def _execute_model_source_observation(
+    request: ModelObservationChildRequest,
+    state: _ModelObservationState,
+) -> ModelSourceObservation:
+    try:
+        treatment = state.resolver.run(state.reader)
+        validate_resolved_treatment(
+            request.database_path,
+            state.assignment,
+            treatment,
+            state.audit.snapshot(),
+        )
+        rendered = state.renderer.run(treatment.entries)
+    except (MemoryPersistenceError, OSError) as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    except (
+        MemoryServiceError,
+        TreatmentValidationError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ChildExecutionValidationError("assignment_mismatch") from error
+    return ModelSourceObservation(
+        execution_index=request.execution_index,
+        source_kind=treatment.source_kind,
+        scope=treatment.scope,
+        future_session_id=request.future_session_id,
+        future_run_id=request.future_run_id,
+        future_pid=os.getpid(),
+        future_process_instance_id=PROCESS_INSTANCE_ID,
+        release_id=treatment.release_id,
+        eligible_ids=treatment.eligible_ids,
+        retrieved_ids=treatment.retrieved_ids,
+        returned_ids=treatment.returned_ids,
+        source_evidence_ids=treatment.source_evidence_ids,
+        entries=rendered.entry_receipts,
+        reader_audit=state.audit.snapshot(),
+        rendered_context_sha256=hashlib.sha256(rendered.bytes).hexdigest(),
+        rendered_context_utf8_bytes=len(rendered.bytes),
+    )
+
+
+def execute_model_observation_child_request(
+    request: ModelObservationChildRequest,
+) -> ModelObservationChildResponse:
+    """Independently audit Memory-rendered bytes without producing an answer.
+
+    This child stops at the renderer.  It does not claim to be the process that
+    supplied a model input; the later sidecar join proves byte equivalence with
+    the sealed model-call prompt context.
+    """
+
+    _validate_model_observation_request(request)
+    _require_model_observation_database(request)
+    try:
+        state = _new_model_observation_state(request)
+    except (MemoryPersistenceError, OSError) as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    _claim_model_observation_state(state, request)
+    observation = _execute_model_source_observation(request, state)
+    database_receipt = _require_model_observation_database(request)
+    visible = _visible_forbidden_environment()
+    return ModelObservationChildResponse(
+        observation=observation,
+        state_receipt=state.receipt,
+        database_receipt=database_receipt,
+        pid=os.getpid(),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        isolated_mode=bool(sys.flags.isolated),
+        areal_module_path=_areal_module_path(),
+        visible_forbidden_environment=visible,
+        environment_clean=not visible,
+    )
+
+
 def execute_future_batch_request(
     request: FutureBatchRequest,
 ) -> FutureBatchResponse:
@@ -6791,10 +7420,259 @@ def execute_future_batch_request(
     )
 
 
+def _validate_model_observation_state_receipt(
+    receipt: ModelObservationStateReceipt,
+    request: ModelObservationChildRequest,
+) -> None:
+    if type(receipt) is not ModelObservationStateReceipt:
+        raise ChildExecutionValidationError("state_reuse")
+    identities = (
+        receipt.store_instance_id,
+        receipt.reader_instance_id,
+        receipt.resolver_instance_id,
+        receipt.renderer_instance_id,
+        receipt.audit_instance_id,
+        receipt.logical_session_instance_id,
+    )
+    if (
+        receipt.execution_index != request.execution_index
+        or receipt.generation_index != 0
+        or receipt.logical_session_id != request.future_session_id
+        or receipt.logical_run_id != request.future_run_id
+        or len(set(identities)) != len(identities)
+        or any(_SHA256_PATTERN.fullmatch(identity) is None for identity in identities)
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+
+
+def _model_observation_resolved_entries(
+    observation: ModelSourceObservation,
+) -> tuple[ResolvedEntry, ...]:
+    try:
+        resolved = tuple(
+            ResolvedEntry(
+                slot=entry.slot,
+                key=entry.key,
+                value=entry.value,
+                source_kind=entry.source_kind,
+                revision_id=entry.revision_id,
+                candidate_id=entry.candidate_id,
+                evidence_ids=entry.evidence_ids,
+            )
+            for entry in observation.entries
+        )
+        rerendered = render_context(resolved)
+    except (AttributeError, TypeError, ValueError, UnicodeError) as error:
+        raise ChildExecutionValidationError("assignment_mismatch") from error
+    if (
+        rerendered.entry_receipts != observation.entries
+        or hashlib.sha256(rerendered.bytes).hexdigest()
+        != observation.rendered_context_sha256
+        or len(rerendered.bytes) != observation.rendered_context_utf8_bytes
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    return resolved
+
+
+def _validate_model_observation_provenance(
+    observation: ModelSourceObservation,
+    resolved_entries: tuple[ResolvedEntry, ...],
+) -> None:
+    operations = tuple(event.operation for event in observation.reader_audit)
+    if (
+        not observation.reader_audit
+        or any(
+            entry.source_kind != observation.source_kind
+            for entry in observation.entries
+        )
+        or any(
+            type(event) is not ReadAuditEvent
+            or event.requested_scope != observation.scope
+            or event.allowed is not True
+            or any(
+                _SHA256_PATTERN.fullmatch(hash_value) is None
+                for hash_value in event.returned_content_hashes
+            )
+            for event in observation.reader_audit
+        )
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    if observation.source_kind == "release":
+        revision_ids: list[str] = []
+        evidence_ids: list[str] = []
+        for entry in observation.entries:
+            if (
+                type(entry.revision_id) is not str
+                or not entry.revision_id.startswith("rev_")
+                or type(entry.candidate_id) is not str
+                or not entry.candidate_id.startswith("cand_")
+                or not entry.evidence_ids
+                or any(
+                    not evidence_id.startswith("evd_")
+                    for evidence_id in entry.evidence_ids
+                )
+            ):
+                raise ChildExecutionValidationError("assignment_mismatch")
+            revision_ids.append(entry.revision_id)
+            evidence_ids.extend(entry.evidence_ids)
+        expected_operations = (
+            "get_assigned_release",
+            *(
+                operation
+                for _entry in observation.entries
+                for operation in ("get_revision", "get_candidate")
+            ),
+        )
+        release_id = observation.release_id
+        if (
+            type(release_id) is not str
+            or not release_id.startswith("rel_")
+            or operations != expected_operations
+            or observation.eligible_ids != tuple(revision_ids)
+            or observation.retrieved_ids != tuple(revision_ids)
+            or observation.returned_ids != tuple(revision_ids)
+            or tuple(evidence_ids) != observation.source_evidence_ids
+            or len(set(revision_ids)) != len(revision_ids)
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        release_event = observation.reader_audit[0]
+        try:
+            release_hash = hashlib.sha256(
+                ReleaseManifest(
+                    scope=observation.scope,
+                    revision_ids=tuple(revision_ids),
+                ).canonical_bytes()
+            ).hexdigest()
+        except (TypeError, ValueError) as error:
+            raise ChildExecutionValidationError("assignment_mismatch") from error
+        if (
+            release_id != f"rel_{release_hash[:24]}"
+            or release_event.requested_ids != (release_id,)
+            or release_event.returned_record_ids != (release_id,)
+            or release_event.returned_content_hashes != (release_hash,)
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        for entry_index, entry in enumerate(observation.entries):
+            revision_event = observation.reader_audit[1 + 2 * entry_index]
+            candidate_event = observation.reader_audit[2 + 2 * entry_index]
+            if (
+                revision_event.requested_ids != (entry.revision_id,)
+                or revision_event.returned_record_ids != (entry.revision_id,)
+                or len(revision_event.returned_content_hashes) != 1
+                or entry.revision_id
+                != f"rev_{revision_event.returned_content_hashes[0][:24]}"
+                or candidate_event.requested_ids != (entry.candidate_id,)
+                or candidate_event.returned_record_ids != (entry.candidate_id,)
+                or len(candidate_event.returned_content_hashes) != 1
+                or entry.candidate_id
+                != f"cand_{candidate_event.returned_content_hashes[0][:24]}"
+            ):
+                raise ChildExecutionValidationError("assignment_mismatch")
+        return
+    if observation.source_kind == "raw_evidence":
+        evidence_ids: list[str] = []
+        for entry in observation.entries:
+            if (
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or not entry.evidence_ids
+                or any(
+                    not evidence_id.startswith("evd_")
+                    for evidence_id in entry.evidence_ids
+                )
+            ):
+                raise ChildExecutionValidationError("assignment_mismatch")
+            evidence_ids.extend(entry.evidence_ids)
+        expected_evidence_ids = tuple(evidence_ids)
+        event = observation.reader_audit[0]
+        if (
+            operations != ("list_eligible_evidence",)
+            or observation.eligible_ids != expected_evidence_ids
+            or observation.retrieved_ids != expected_evidence_ids
+            or observation.returned_ids != expected_evidence_ids
+            or observation.source_evidence_ids != expected_evidence_ids
+            or event.requested_ids
+            or event.returned_record_ids != expected_evidence_ids
+            or len(event.returned_content_hashes) != len(expected_evidence_ids)
+            or any(
+                evidence_id != f"evd_{content_hash[:24]}"
+                for evidence_id, content_hash in zip(
+                    expected_evidence_ids,
+                    event.returned_content_hashes,
+                    strict=True,
+                )
+            )
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        return
+    if observation.source_kind == "oracle":
+        event = observation.reader_audit[0]
+        if (
+            operations != ("entries",)
+            or observation.eligible_ids
+            or observation.retrieved_ids
+            or observation.returned_ids
+            or observation.source_evidence_ids
+            or event.requested_ids
+            or event.returned_record_ids
+            or event.returned_content_hashes
+            != tuple(_semantic_entry_hash(entry) for entry in resolved_entries)
+            or any(
+                entry.revision_id is not None
+                or entry.candidate_id is not None
+                or entry.evidence_ids
+                for entry in observation.entries
+            )
+        ):
+            raise ChildExecutionValidationError("assignment_mismatch")
+        return
+    raise ChildExecutionValidationError("assignment_mismatch")
+
+
+def _validate_model_observation_child_assignment(
+    response: ModelObservationChildResponse,
+    request: ModelObservationChildRequest,
+) -> None:
+    if (
+        type(response) is not ModelObservationChildResponse
+        or type(request) is not ModelObservationChildRequest
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    _validate_model_observation_request(request)
+    initial_receipt = _require_model_observation_database(request)
+    observation = response.observation
+    source = request.source
+    expected_release_id = source.release_id if source.source_kind == "release" else None
+    if (
+        type(observation) is not ModelSourceObservation
+        or observation.execution_index != request.execution_index
+        or observation.source_kind != source.source_kind
+        or observation.scope != request.scope
+        or observation.future_session_id != request.future_session_id
+        or observation.future_run_id != request.future_run_id
+        or observation.release_id != expected_release_id
+        or response.database_receipt != request.database_receipt
+        or response.database_receipt != initial_receipt
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    _validate_model_observation_state_receipt(response.state_receipt, request)
+    resolved_entries = _model_observation_resolved_entries(observation)
+    _validate_model_observation_provenance(observation, resolved_entries)
+    if source.source_kind == "oracle" and not _exact_typed_tree_equal(
+        resolved_entries,
+        source.oracle_entries,
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    final_receipt = _require_model_observation_database(request)
+    if final_receipt != response.database_receipt:
+        raise ChildExecutionValidationError("state_reuse")
+
+
 def run_isolated_child_raw(
     request: CaptureBatchRequest
     | CaptureChildRequest
     | ModelCaptureChildRequest
+    | ModelObservationChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -6806,7 +7684,7 @@ def run_isolated_child_raw(
     normalized_timeout_seconds = _normalize_positive_finite_seconds(timeout_seconds)
     if (
         type(role) is not str
-        or role not in {"capture-child", "future-child"}
+        or role not in {"capture-child", "future-child", "model-observation-child"}
         or (
             role == "capture-child"
             and type(request)
@@ -6819,6 +7697,10 @@ def run_isolated_child_raw(
         or (
             role == "future-child"
             and type(request) not in {FutureBatchRequest, FutureChildRequest}
+        )
+        or (
+            role == "model-observation-child"
+            and type(request) is not ModelObservationChildRequest
         )
     ):
         raise WireProtocolError("closed_schema")
@@ -6873,6 +7755,7 @@ def _validate_child_process_response(
     response: CaptureBatchResponse
     | CaptureChildResponse
     | ModelCaptureChildResponse
+    | ModelObservationChildResponse
     | FutureBatchResponse
     | FutureChildResponse,
     *,
@@ -6906,6 +7789,13 @@ def _validate_child_process_response(
             or observation.future_process_instance_id != response.process_instance_id
             or not _is_canonical_uuid4(observation.future_process_instance_id)
         )
+    if type(response) is ModelObservationChildResponse:
+        observation = response.observation
+        invalid = invalid or (
+            observation.future_pid != response.pid
+            or observation.future_process_instance_id != response.process_instance_id
+            or not _is_canonical_uuid4(observation.future_process_instance_id)
+        )
     if invalid:
         raise ChildExecutionValidationError("process_isolation")
 
@@ -6914,6 +7804,7 @@ def run_isolated_child(
     request: CaptureBatchRequest
     | CaptureChildRequest
     | ModelCaptureChildRequest
+    | ModelObservationChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -6923,11 +7814,18 @@ def run_isolated_child(
     CaptureBatchResponse
     | CaptureChildResponse
     | ModelCaptureChildResponse
+    | ModelObservationChildResponse
     | FutureBatchResponse
     | FutureChildResponse
 ):
     """Run a child and reject noncanonical, wrong-role, or forged output."""
 
+    if type(request) is ModelObservationChildRequest:
+        if type(role) is not str or role != "model-observation-child":
+            raise WireProtocolError("closed_schema")
+        _normalize_positive_finite_seconds(timeout_seconds)
+        _validate_model_observation_request(request)
+        _require_model_observation_database(request)
     completed = run_isolated_child_raw(
         request,
         role=role,
@@ -6944,6 +7842,7 @@ def run_isolated_child(
         CaptureBatchRequest: CaptureBatchResponse,
         CaptureChildRequest: CaptureChildResponse,
         ModelCaptureChildRequest: ModelCaptureChildResponse,
+        ModelObservationChildRequest: ModelObservationChildResponse,
         FutureBatchRequest: FutureBatchResponse,
         FutureChildRequest: FutureChildResponse,
     }[type(request)]
@@ -6976,6 +7875,8 @@ def run_isolated_child(
             or observed_receipt != receipt
         ):
             raise ChildExecutionValidationError("assignment_mismatch")
+    elif type(request) is ModelObservationChildRequest:
+        _validate_model_observation_child_assignment(response, request)
     elif type(request) is FutureBatchRequest:
         expected_index_sequence = tuple(item.execution_index for item in request.items)
         expected_indexes = set(expected_index_sequence)
@@ -11285,8 +12186,11 @@ def _write_child_response(response: object) -> None:
 
 
 def _child_main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {"capture-child", "future-child"}:
-        sys.stderr.write("expected capture-child or future-child role\n")
+    roles = {"capture-child", "future-child", "model-observation-child"}
+    if len(sys.argv) != 2 or sys.argv[1] not in roles:
+        sys.stderr.write(
+            "expected capture-child, future-child, or model-observation-child role\n"
+        )
         return 2
     role = sys.argv[1]
     try:
@@ -11301,13 +12205,17 @@ def _child_main() -> int:
                 response = execute_model_capture_child_request(request)
             else:
                 raise WireProtocolError("closed_schema")
-        else:
+        elif role == "future-child":
             if type(request) is FutureBatchRequest:
                 response = execute_future_batch_request(request)
             elif type(request) is FutureChildRequest:
                 response = execute_future_child_request(request)
             else:
                 raise WireProtocolError("closed_schema")
+        elif type(request) is ModelObservationChildRequest:
+            response = execute_model_observation_child_request(request)
+        else:
+            raise WireProtocolError("closed_schema")
         _write_child_response(response)
         return 0
     except ChildExecutionValidationError as error:
