@@ -73,6 +73,7 @@ __all__ = [
     "infbridge_run_envelope_v2_sha256",
     "prepare_infbridge_run_envelope_v2",
     "validate_infbridge_model_call_v2",
+    "validate_infbridge_run_envelope_v2",
 ]
 
 _ADAPTER_ALGORITHM = "areal-memory-infbridge-adapter-v2"
@@ -1264,6 +1265,16 @@ def _validate_envelope_against_manifest(
     )
     if not _exact_tree_equal(envelope, expected):
         raise InfBridgeModelAdapterError("run_envelope")
+
+
+def validate_infbridge_run_envelope_v2(
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+) -> None:
+    """Rebuild all frozen calls and verify one envelope semantically."""
+
+    _validate_envelope_against_manifest(manifest, tokenizer, envelope)
 
 
 def _assert_bridge_matches_runtime(

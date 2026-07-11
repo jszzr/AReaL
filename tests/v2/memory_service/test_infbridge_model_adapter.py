@@ -39,6 +39,7 @@ from examples.memory_service.infbridge_model_adapter import (
     infbridge_run_envelope_v2_sha256,
     prepare_infbridge_run_envelope_v2,
     validate_infbridge_model_call_v2,
+    validate_infbridge_run_envelope_v2,
 )
 
 from areal.v2.inference_service.client_trace import (
@@ -503,6 +504,36 @@ async def test_envelope_loader_rejects_noncanonical_and_closed_schema_values(
             with pytest.raises(InfBridgeModelAdapterError) as error:
                 infbridge_run_envelope_v2_from_bytes(variant)
             _assert_reason(error, "run_envelope")
+    finally:
+        await bridge.aclose()
+
+
+@pytest.mark.asyncio
+async def test_public_envelope_validator_rebuilds_semantic_call_plans(
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: _ByteTokenizer,
+) -> None:
+    bridge = _make_bridge()
+    try:
+        envelope = prepare_infbridge_run_envelope_v2(
+            manifest,
+            tokenizer,
+            bridge,
+            max_new_tokens=32,
+        )
+        forged_plan = replace(
+            envelope.call_plans[0],
+            input_token_ids_sha256="f" * 64,
+        )
+        forged = replace(
+            envelope,
+            call_plans=(forged_plan, *envelope.call_plans[1:]),
+        )
+
+        with pytest.raises(InfBridgeModelAdapterError) as error:
+            validate_infbridge_run_envelope_v2(manifest, tokenizer, forged)
+
+        _assert_reason(error, "run_envelope")
     finally:
         await bridge.aclose()
 
