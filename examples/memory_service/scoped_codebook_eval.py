@@ -10127,7 +10127,7 @@ def _validate_model_leakage_sentinels(
     return typed_sentinels, false_positives, None
 
 
-def analyze_model_run(
+def _analyze_model_traces(
     *,
     manifest: tuple[ModelCaseIdentity, ...],
     outcomes: tuple[ModelArmOutcome, ...],
@@ -10135,7 +10135,7 @@ def analyze_model_run(
     leakage_sentinels: tuple[LeakageSentinelTrace, ...],
     frozen_case_manifest_sha256s: tuple[str, ...],
 ) -> ModelEvaluationResult:
-    """Validate, aggregate, and classify one frozen 64-by-6 model run."""
+    """Validate already-bound traces and compute the frozen statistics."""
 
     (
         typed_manifest,
@@ -10328,6 +10328,311 @@ def analyze_model_run(
         invalid_reasons=(),
         summary=summary,
         attrition=typed_attrition,
+    )
+
+
+def _model_dry_run_reason(
+    manifest: ModelRunManifest,
+    expected_manifest_sha256: str,
+    dry_run: object,
+) -> str | None:
+    """Validate every frozen call result without trusting producer flags."""
+
+    if type(dry_run) is not ModelDryRunResult:
+        return "closed_schema"
+    if (
+        type(dry_run.validity) is not str
+        or dry_run.validity not in {"valid", "invalid"}
+        or type(dry_run.invalid_calls) is not tuple
+        or type(dry_run.manifest_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(dry_run.manifest_sha256) is None
+        or type(dry_run.calls) is not tuple
+    ):
+        return "closed_schema"
+    if dry_run.manifest_sha256 != expected_manifest_sha256:
+        return "manifest_mismatch"
+
+    expected_calls = tuple(
+        (case_index, arm_call)
+        for case_index, registration in enumerate(manifest.cases)
+        for arm_call in registration.arm_calls
+    )
+    if len(dry_run.calls) != len(expected_calls):
+        return "execution_completeness"
+
+    expected_invalid_calls: list[ModelDryRunInvalidCall] = []
+    has_invalid_receipt = False
+    for (case_index, arm_call), observed_call in zip(
+        expected_calls,
+        dry_run.calls,
+        strict=True,
+    ):
+        if type(observed_call) is not ModelDryRunCall:
+            return "closed_schema"
+        if (
+            type(observed_call.case_index) is not int
+            or type(observed_call.arm) is not str
+            or type(observed_call.attempt_index) is not int
+        ):
+            return "closed_schema"
+        if (
+            observed_call.case_index != case_index
+            or observed_call.arm != arm_call.arm
+            or observed_call.attempt_index != 0
+        ):
+            return "execution_completeness"
+        execution = observed_call.execution
+        if execution is None:
+            expected_invalid_calls.append(
+                ModelDryRunInvalidCall(
+                    case_index=case_index,
+                    arm=arm_call.arm,
+                    attempted=True,
+                    reason="model_call_failure",
+                )
+            )
+            continue
+        if type(execution) is not ModelCallExecution:
+            return "closed_schema"
+        if (
+            type(execution.response) is not str
+            or type(execution.rendered_context_token_count) is not int
+            or type(execution.valid) is not bool
+            or (
+                execution.invalid_reason is not None
+                and type(execution.invalid_reason) is not str
+            )
+            or type(execution.consumer_input_receipt) is not ConsumerInputReceipt
+        ):
+            return "closed_schema"
+        prepared = arm_call.prepared_call
+        if (
+            not _exact_typed_tree_equal(
+                execution.consumer_input_receipt,
+                prepared.consumer_input_receipt,
+            )
+            or execution.rendered_context_token_count
+            != prepared.rendered_context_token_count
+        ):
+            return "receipt_mismatch"
+        receipt_is_valid = bool(
+            _model_call_receipt_is_well_typed(execution.model_call_receipt)
+            and _exact_typed_tree_equal(
+                execution.model_call_receipt,
+                prepared.expected_receipt,
+            )
+        )
+        expected_invalid_reason = None if receipt_is_valid else "model_call_receipt"
+        if (
+            execution.valid is not receipt_is_valid
+            or execution.invalid_reason != expected_invalid_reason
+        ):
+            return "model_call_receipt"
+        if not receipt_is_valid:
+            has_invalid_receipt = True
+            expected_invalid_calls.append(
+                ModelDryRunInvalidCall(
+                    case_index=case_index,
+                    arm=arm_call.arm,
+                    attempted=True,
+                    reason="model_call_receipt",
+                )
+            )
+
+    expected_invalid = tuple(expected_invalid_calls)
+    for invalid_call in dry_run.invalid_calls:
+        if (
+            type(invalid_call) is not ModelDryRunInvalidCall
+            or type(invalid_call.case_index) is not int
+            or type(invalid_call.arm) is not str
+            or type(invalid_call.attempted) is not bool
+            or type(invalid_call.reason) is not str
+            or invalid_call.case_index not in range(MODEL_CASE_COUNT)
+            or invalid_call.arm not in MODEL_ARMS
+            or invalid_call.reason not in {"model_call_failure", "model_call_receipt"}
+        ):
+            return "closed_schema"
+    if not _exact_typed_tree_equal(dry_run.invalid_calls, expected_invalid):
+        return "execution_completeness"
+    expected_validity = "invalid" if expected_invalid else "valid"
+    if dry_run.validity != expected_validity:
+        return "closed_schema"
+    if has_invalid_receipt:
+        return "model_call_receipt"
+    return None
+
+
+def _registered_outcome_reason(
+    registration: ModelCaseRegistration,
+    arm_call: ModelArmCallRegistration,
+    dry_call: ModelDryRunCall,
+    outcome: ModelArmOutcome,
+) -> str | None:
+    """Cross-bind one trace to its registered prompt and actual call result."""
+
+    execution = dry_call.execution
+    if (
+        type(outcome) is not ModelArmOutcome
+        or type(outcome.trace) is not EvaluationTrace
+        or type(execution) is not ModelCallExecution
+        or execution.valid is not True
+        or type(execution.model_call_receipt) is not ModelCallReceipt
+    ):
+        return "closed_schema"
+    if (
+        outcome.case_index != registration.identity.case.case_index
+        or outcome.arm != arm_call.arm
+    ):
+        return "execution_completeness"
+
+    trace = outcome.trace
+    consumer = execution.consumer_input_receipt
+    receipt = execution.model_call_receipt
+    expected_fields = (
+        arm_call.rendered_context_sha256,
+        arm_call.rendered_context_utf8_bytes,
+        execution.rendered_context_token_count,
+        consumer.received_context_sha256,
+        consumer.received_context_utf8_bytes,
+        consumer.received_query_sha256,
+        receipt.submitted_prompt_sha256,
+        receipt.submitted_prompt_context_start,
+        receipt.submitted_prompt_context_end,
+        receipt.submitted_prompt_context_sha256,
+        receipt.submitted_input_token_ids_sha256,
+        receipt.submitted_input_token_count,
+        registration.query_sha256,
+        consumer.received_history_length,
+        execution.response,
+    )
+    observed_fields = (
+        trace.rendered_context_sha256,
+        trace.rendered_context_utf8_bytes,
+        trace.rendered_context_token_count,
+        trace.received_context_sha256,
+        trace.received_context_utf8_bytes,
+        trace.received_query_sha256,
+        trace.submitted_prompt_sha256,
+        trace.submitted_prompt_context_start,
+        trace.submitted_prompt_context_end,
+        trace.submitted_prompt_context_sha256,
+        trace.submitted_input_token_ids_sha256,
+        trace.submitted_input_token_count,
+        trace.query_sha256,
+        trace.history_length,
+        trace.response,
+    )
+    if not _exact_typed_tree_equal(observed_fields, expected_fields):
+        return "receipt_mismatch"
+    return None
+
+
+def analyze_model_run(
+    *,
+    manifest: ModelRunManifest,
+    tokenizer: ModelTokenizer,
+    dry_run: ModelDryRunResult,
+    outcomes: tuple[ModelArmOutcome, ...],
+    leakage_sentinels: tuple[LeakageSentinelTrace, ...],
+) -> ModelEvaluationResult:
+    """Bind preregistration, calls, traces, and statistics in one scoring gate.
+
+    This proves internal evidence consistency.  It does not by itself authenticate
+    a boundary implementation; real-model claims still require an audited adapter.
+    """
+
+    encoded_manifest = model_run_manifest_bytes(manifest, tokenizer)
+    manifest_sha256 = hashlib.sha256(encoded_manifest).hexdigest()
+    dry_run_reason = _model_dry_run_reason(
+        manifest,
+        manifest_sha256,
+        dry_run,
+    )
+    if dry_run_reason is not None:
+        return _invalid_model_evaluation((dry_run_reason,), attrition=())
+    if type(outcomes) is not tuple:
+        return _invalid_model_evaluation(("closed_schema",), attrition=())
+
+    outcome_slots: list[tuple[int, str]] = []
+    outcome_by_slot: dict[tuple[int, str], ModelArmOutcome] = {}
+    for outcome in outcomes:
+        if (
+            type(outcome) is not ModelArmOutcome
+            or type(outcome.case_index) is not int
+            or type(outcome.arm) is not str
+        ):
+            return _invalid_model_evaluation(("closed_schema",), attrition=())
+        slot = (outcome.case_index, outcome.arm)
+        if slot in outcome_by_slot:
+            return _invalid_model_evaluation(
+                ("execution_completeness",),
+                attrition=(),
+            )
+        outcome_slots.append(slot)
+        outcome_by_slot[slot] = outcome
+
+    expected_outcome_slots: list[tuple[int, str]] = []
+    bound_outcomes: list[ModelArmOutcome] = []
+    attrition: list[ModelRunAttrition] = []
+    call_index = 0
+    for case_index, registration in enumerate(manifest.cases):
+        for arm_call in registration.arm_calls:
+            dry_call = dry_run.calls[call_index]
+            call_index += 1
+            slot = (case_index, arm_call.arm)
+            outcome = outcome_by_slot.get(slot)
+            execution = dry_call.execution
+            if execution is None:
+                if outcome is not None:
+                    return _invalid_model_evaluation(
+                        ("execution_completeness",),
+                        attrition=(),
+                    )
+                attrition.append(
+                    ModelRunAttrition(
+                        case_index=case_index,
+                        arm=arm_call.arm,
+                        reason="model_call_failure",
+                        attempted=True,
+                    )
+                )
+                continue
+            if type(execution) is not ModelCallExecution:
+                return _invalid_model_evaluation(("closed_schema",), attrition=())
+            if execution.valid is not True:
+                return _invalid_model_evaluation(
+                    ("model_call_receipt",),
+                    attrition=(),
+                )
+            if outcome is None:
+                return _invalid_model_evaluation(
+                    ("execution_completeness",),
+                    attrition=(),
+                )
+            reason = _registered_outcome_reason(
+                registration,
+                arm_call,
+                dry_call,
+                outcome,
+            )
+            if reason is not None:
+                return _invalid_model_evaluation((reason,), attrition=())
+            expected_outcome_slots.append(slot)
+            bound_outcomes.append(outcome)
+
+    if tuple(outcome_slots) != tuple(expected_outcome_slots):
+        return _invalid_model_evaluation(
+            ("execution_completeness",),
+            attrition=(),
+        )
+    identities = tuple(registration.identity for registration in manifest.cases)
+    frozen_hashes = tuple(identity.case_manifest_sha256 for identity in identities)
+    return _analyze_model_traces(
+        manifest=identities,
+        outcomes=tuple(bound_outcomes),
+        attrition=tuple(attrition),
+        leakage_sentinels=leakage_sentinels,
+        frozen_case_manifest_sha256s=frozen_hashes,
     )
 
 

@@ -5620,10 +5620,14 @@ def _frozen_model_hashes() -> tuple[str, ...]:
     )
 
 
-def _model_leakage_sentinels() -> tuple[helpfulness.LeakageSentinelTrace, ...]:
+def _model_leakage_sentinels(
+    cases: tuple[helpfulness.CodebookCase, ...] | None = None,
+) -> tuple[helpfulness.LeakageSentinelTrace, ...]:
+    if cases is None:
+        cases = tuple(helpfulness.generate_case(index) for index in range(64))
     traces = []
-    for case_index in range(64):
-        case = helpfulness.generate_case(case_index)
+    for case in cases:
+        case_index = case.case_index
         references = helpfulness.derive_case_database_references(case)
         traces.append(
             helpfulness.LeakageSentinelTrace(
@@ -5671,7 +5675,7 @@ def _analyze_model_fixture(
     attrition: tuple[helpfulness.ModelRunAttrition, ...] = (),
     leakage_sentinels: tuple[helpfulness.LeakageSentinelTrace, ...] | None = None,
 ) -> helpfulness.ModelEvaluationResult:
-    return helpfulness.analyze_model_run(
+    return helpfulness._analyze_model_traces(
         manifest=_model_manifest() if manifest is None else manifest,
         outcomes=_model_outcomes(responses) if outcomes is None else outcomes,
         attrition=attrition,
@@ -6337,7 +6341,7 @@ def test_malformed_attrition_is_not_reflected_in_typed_result(
 ) -> None:
     _forbid_numpy_import(monkeypatch)
 
-    result = helpfulness.analyze_model_run(
+    result = helpfulness._analyze_model_traces(
         manifest=_model_manifest(),
         outcomes=_model_outcomes(_strict_model_response),
         attrition=(object(),),
@@ -7354,6 +7358,766 @@ def prepared_model_manifest() -> helpfulness.ModelRunManifest:
     """Share only the recursively frozen manifest; tokenizers remain test-local."""
 
     return _build_prepared_model_manifest()
+
+
+def _run_registered_strict_model(
+    manifest: helpfulness.ModelRunManifest,
+) -> helpfulness.ModelDryRunResult:
+    responses = {
+        id(arm_call.prepared_call): _strict_model_response(
+            registration.identity.case,
+            arm_call.arm,
+        )
+        for registration in manifest.cases
+        for arm_call in registration.arm_calls
+    }
+
+    class StrictBoundary:
+        def submit(
+            self,
+            input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            return helpfulness.ModelBoundaryOutput(
+                response=responses[id(prepared_call)],
+                receipt=helpfulness.make_model_call_receipt(
+                    submitted_prompt=prepared_call.prompt,
+                    context_start=prepared_call.context_start,
+                    context_end=prepared_call.context_end,
+                    input_token_ids=input_token_ids,
+                ),
+            )
+
+    return helpfulness.run_model_dry_run(
+        manifest,
+        _ByteModelTokenizer(),
+        StrictBoundary(),
+    )
+
+
+def _registered_model_outcomes(
+    manifest: helpfulness.ModelRunManifest,
+    dry_run: helpfulness.ModelDryRunResult,
+) -> tuple[helpfulness.ModelArmOutcome, ...]:
+    outcomes: list[helpfulness.ModelArmOutcome] = []
+    call_index = 0
+    for case_index, registration in enumerate(manifest.cases):
+        case = registration.identity.case
+        for execution_offset, arm_call in enumerate(registration.arm_calls):
+            dry_call = dry_run.calls[call_index]
+            call_index += 1
+            execution = dry_call.execution
+            assert dry_call.case_index == case_index
+            assert dry_call.arm == arm_call.arm
+            assert execution is not None and execution.valid
+            receipt = execution.model_call_receipt
+            assert receipt is not None
+            consumer = execution.consumer_input_receipt
+            trace = replace(
+                _model_trace(case, arm_call.arm, execution.response),
+                execution_index=case_index * len(MODEL_ARMS) + execution_offset,
+                rendered_context_sha256=arm_call.rendered_context_sha256,
+                rendered_context_utf8_bytes=arm_call.rendered_context_utf8_bytes,
+                rendered_context_token_count=execution.rendered_context_token_count,
+                received_context_sha256=consumer.received_context_sha256,
+                received_context_utf8_bytes=consumer.received_context_utf8_bytes,
+                received_query_sha256=consumer.received_query_sha256,
+                submitted_prompt_sha256=receipt.submitted_prompt_sha256,
+                submitted_prompt_context_start=(receipt.submitted_prompt_context_start),
+                submitted_prompt_context_end=receipt.submitted_prompt_context_end,
+                submitted_prompt_context_sha256=(
+                    receipt.submitted_prompt_context_sha256
+                ),
+                submitted_input_token_ids_sha256=(
+                    receipt.submitted_input_token_ids_sha256
+                ),
+                submitted_input_token_count=receipt.submitted_input_token_count,
+                query_sha256=registration.query_sha256,
+                history_length=consumer.received_history_length,
+                response=execution.response,
+            )
+            outcomes.append(
+                helpfulness.ModelArmOutcome(
+                    case_index=case_index,
+                    arm=arm_call.arm,
+                    trace=trace,
+                )
+            )
+    assert call_index == len(dry_run.calls)
+    return tuple(outcomes)
+
+
+@pytest.fixture(scope="module")
+def registered_model_evidence(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> tuple[
+    helpfulness.ModelDryRunResult,
+    tuple[helpfulness.ModelArmOutcome, ...],
+    tuple[helpfulness.LeakageSentinelTrace, ...],
+]:
+    dry_run = _run_registered_strict_model(prepared_model_manifest)
+    cases = tuple(
+        registration.identity.case for registration in prepared_model_manifest.cases
+    )
+    return (
+        dry_run,
+        _registered_model_outcomes(prepared_model_manifest, dry_run),
+        _model_leakage_sentinels(cases),
+    )
+
+
+def _analyze_registered_fixture(
+    manifest: helpfulness.ModelRunManifest,
+    evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    *,
+    dry_run: helpfulness.ModelDryRunResult | None = None,
+    outcomes: tuple[helpfulness.ModelArmOutcome, ...] | None = None,
+) -> helpfulness.ModelEvaluationResult:
+    frozen_dry_run, frozen_outcomes, leakage_sentinels = evidence
+    return helpfulness.analyze_model_run(
+        manifest=manifest,
+        tokenizer=_ByteModelTokenizer(),
+        dry_run=frozen_dry_run if dry_run is None else dry_run,
+        outcomes=frozen_outcomes if outcomes is None else outcomes,
+        leakage_sentinels=leakage_sentinels,
+    )
+
+
+def test_public_model_analysis_has_one_manifest_root_and_scores_bound_evidence(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+) -> None:
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+    )
+
+    assert tuple(inspect.signature(helpfulness.analyze_model_run).parameters) == (
+        "manifest",
+        "tokenizer",
+        "dry_run",
+        "outcomes",
+        "leakage_sentinels",
+    )
+    assert result.validity == "valid"
+    assert result.efficacy == "helpful"
+    assert result.safety == "non-increased"
+    assert result.stale_susceptibility == "stale-sensitive"
+
+
+def test_public_model_analysis_rejects_unregistered_prompt_receipts(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        outcomes=_model_outcomes(_strict_model_response),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("receipt_mismatch",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_dry_run_from_another_manifest(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(dry_run, manifest_sha256="0" * 64),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("manifest_mismatch",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_reordered_dry_run_slots(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    reordered = replace(
+        dry_run,
+        calls=(dry_run.calls[1], dry_run.calls[0], *dry_run.calls[2:]),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=reordered,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_cross_binds_response_to_call_result(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    execution = dry_run.calls[0].execution
+    assert execution is not None
+    forged_call = replace(
+        dry_run.calls[0],
+        execution=replace(execution, response="FABRICATED-AFTER-THE-CALL"),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(dry_run, calls=(forged_call, *dry_run.calls[1:])),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("receipt_mismatch",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_cross_binds_trace_to_registered_receipt(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dry_run, outcomes, _sentinels = registered_model_evidence
+    forged = (
+        replace(
+            outcomes[0],
+            trace=replace(
+                outcomes[0].trace,
+                submitted_prompt_sha256="0" * 64,
+            ),
+        ),
+        *outcomes[1:],
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        outcomes=forged,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("receipt_mismatch",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_jointly_forged_dry_and_trace_receipt(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    execution = dry_run.calls[0].execution
+    assert execution is not None
+    receipt = execution.model_call_receipt
+    assert receipt is not None
+    forged_receipt = replace(receipt, submitted_prompt_sha256="0" * 64)
+    forged_call = replace(
+        dry_run.calls[0],
+        execution=replace(execution, model_call_receipt=forged_receipt),
+    )
+    forged_outcome = replace(
+        outcomes[0],
+        trace=replace(
+            outcomes[0].trace,
+            submitted_prompt_sha256=forged_receipt.submitted_prompt_sha256,
+        ),
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(dry_run, calls=(forged_call, *dry_run.calls[1:])),
+        outcomes=(forged_outcome, *outcomes[1:]),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("model_call_receipt",)
+    assert result.summary is None
+
+
+@pytest.mark.parametrize("mutation", ["consumer_hash", "context_token_count"])
+def test_public_model_analysis_rejects_jointly_forged_consumer_facts(
+    mutation: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    execution = dry_run.calls[0].execution
+    assert execution is not None
+    if mutation == "consumer_hash":
+        forged_consumer = replace(
+            execution.consumer_input_receipt,
+            received_context_sha256="0" * 64,
+        )
+        forged_execution = replace(
+            execution,
+            consumer_input_receipt=forged_consumer,
+        )
+        forged_trace = replace(
+            outcomes[0].trace,
+            received_context_sha256=forged_consumer.received_context_sha256,
+        )
+    else:
+        forged_execution = replace(
+            execution,
+            rendered_context_token_count=execution.rendered_context_token_count + 1,
+        )
+        forged_trace = replace(
+            outcomes[0].trace,
+            rendered_context_token_count=forged_execution.rendered_context_token_count,
+        )
+    forged_call = replace(dry_run.calls[0], execution=forged_execution)
+    forged_outcome = replace(outcomes[0], trace=forged_trace)
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(dry_run, calls=(forged_call, *dry_run.calls[1:])),
+        outcomes=(forged_outcome, *outcomes[1:]),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("receipt_mismatch",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_recomputes_invalid_call_ledger(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    first = dry_run.calls[0]
+    forged_invalid = helpfulness.ModelDryRunInvalidCall(
+        case_index=first.case_index,
+        arm=first.arm,
+        attempted=True,
+        reason="model_call_failure",
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(
+            dry_run,
+            validity="invalid",
+            invalid_calls=(forged_invalid,),
+        ),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_missing_invalid_call_ledger_entry(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    target = dry_run.calls[11]
+    failed = replace(target, execution=None)
+    remaining = (*outcomes[:11], *outcomes[12:])
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(
+            dry_run,
+            validity="invalid",
+            calls=(*dry_run.calls[:11], failed, *dry_run.calls[12:]),
+        ),
+        outcomes=remaining,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_validity_flag_lie(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(dry_run, validity="invalid"),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("closed_schema",)
+    assert result.summary is None
+
+
+@pytest.mark.parametrize("mutation", ["call_bool_index", "ledger_integer_bool"])
+def test_public_model_analysis_classifies_dry_run_type_confusion_as_schema(
+    mutation: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    if mutation == "call_bool_index":
+        malformed = replace(
+            dry_run,
+            calls=(replace(dry_run.calls[0], case_index=False), *dry_run.calls[1:]),
+        )
+    else:
+        first = dry_run.calls[0]
+        malformed = replace(
+            dry_run,
+            validity="invalid",
+            invalid_calls=(
+                helpfulness.ModelDryRunInvalidCall(
+                    case_index=first.case_index,
+                    arm=first.arm,
+                    attempted=1,  # type: ignore[arg-type]
+                    reason="model_call_failure",
+                ),
+            ),
+        )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=malformed,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("closed_schema",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_self_consistent_receiptless_call(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    target = dry_run.calls[0]
+    execution = target.execution
+    assert execution is not None
+    invalid_call = replace(
+        target,
+        execution=replace(
+            execution,
+            model_call_receipt=None,
+            valid=False,
+            invalid_reason="model_call_receipt",
+        ),
+    )
+    invalid_receipt = helpfulness.ModelDryRunInvalidCall(
+        case_index=target.case_index,
+        arm=target.arm,
+        attempted=True,
+        reason="model_call_receipt",
+    )
+    malformed = replace(
+        dry_run,
+        validity="invalid",
+        invalid_calls=(invalid_receipt,),
+        calls=(invalid_call, *dry_run.calls[1:]),
+    )
+    remaining = tuple(
+        outcome
+        for outcome in outcomes
+        if (outcome.case_index, outcome.arm) != (target.case_index, target.arm)
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=malformed,
+        outcomes=remaining,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("model_call_receipt",)
+    assert result.summary is None
+    assert result.attrition == ()
+
+
+def test_public_model_analysis_prioritizes_any_invalid_model_receipt(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    target_index = 300
+    target = dry_run.calls[target_index]
+    execution = target.execution
+    assert execution is not None
+    receiptless = replace(
+        target,
+        execution=replace(
+            execution,
+            model_call_receipt=None,
+            valid=False,
+            invalid_reason="model_call_receipt",
+        ),
+    )
+    invalid_receipt = helpfulness.ModelDryRunInvalidCall(
+        case_index=target.case_index,
+        arm=target.arm,
+        attempted=True,
+        reason="model_call_receipt",
+    )
+    earlier_mismatch = (
+        replace(
+            outcomes[0],
+            trace=replace(outcomes[0].trace, response="EARLY-MISMATCH"),
+        ),
+        *outcomes[1:],
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(
+            dry_run,
+            validity="invalid",
+            invalid_calls=(invalid_receipt,),
+            calls=(
+                *dry_run.calls[:target_index],
+                receiptless,
+                *dry_run.calls[target_index + 1 :],
+            ),
+        ),
+        outcomes=earlier_mismatch,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("model_call_receipt",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_rejects_outcome_for_failed_call(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dry_run, _outcomes, _sentinels = registered_model_evidence
+    target = dry_run.calls[13]
+    failure = helpfulness.ModelDryRunInvalidCall(
+        case_index=target.case_index,
+        arm=target.arm,
+        attempted=True,
+        reason="model_call_failure",
+    )
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=replace(
+            dry_run,
+            validity="invalid",
+            invalid_calls=(failure,),
+            calls=(
+                *dry_run.calls[:13],
+                replace(target, execution=None),
+                *dry_run.calls[14:],
+            ),
+        ),
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
+
+
+def test_public_model_analysis_derives_fixed_slot_boundary_attrition(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+) -> None:
+    dry_run, outcomes, _sentinels = registered_model_evidence
+    target = dry_run.calls[17]
+    failed_call = replace(target, execution=None)
+    failure = helpfulness.ModelDryRunInvalidCall(
+        case_index=target.case_index,
+        arm=target.arm,
+        attempted=True,
+        reason="model_call_failure",
+    )
+    failed_run = replace(
+        dry_run,
+        validity="invalid",
+        invalid_calls=(failure,),
+        calls=(*dry_run.calls[:17], failed_call, *dry_run.calls[18:]),
+    )
+    remaining = tuple(
+        outcome
+        for outcome in outcomes
+        if (outcome.case_index, outcome.arm) != (target.case_index, target.arm)
+    )
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        dry_run=failed_run,
+        outcomes=remaining,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("attrition",)
+    assert result.summary is None
+    assert result.attrition == (
+        helpfulness.ModelRunAttrition(
+            case_index=target.case_index,
+            arm=target.arm,
+            reason="model_call_failure",
+            attempted=True,
+        ),
+    )
+
+
+def test_public_model_analysis_rejects_missing_successful_outcome(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+) -> None:
+    _dry_run, outcomes, _sentinels = registered_model_evidence
+    remaining = (*outcomes[:29], *outcomes[30:])
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        outcomes=remaining,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
+    assert result.attrition == ()
+
+
+def test_public_model_analysis_does_not_silently_reorder_outcomes(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+    registered_model_evidence: tuple[
+        helpfulness.ModelDryRunResult,
+        tuple[helpfulness.ModelArmOutcome, ...],
+        tuple[helpfulness.LeakageSentinelTrace, ...],
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dry_run, outcomes, _sentinels = registered_model_evidence
+    reordered = (outcomes[1], outcomes[0], *outcomes[2:])
+    _forbid_numpy_import(monkeypatch)
+
+    result = _analyze_registered_fixture(
+        prepared_model_manifest,
+        registered_model_evidence,
+        outcomes=reordered,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_reasons == ("execution_completeness",)
+    assert result.summary is None
 
 
 def test_full_model_manifest_is_canonical_complete_and_preregistered() -> None:
