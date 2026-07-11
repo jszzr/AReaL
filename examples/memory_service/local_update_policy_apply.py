@@ -9,18 +9,22 @@ the visibility barrier.  Retries use decision-derived idempotency keys.
 
 Candidate or revision rows may remain after a crash, but they are not reachable
 through any runtime release traversal until the final release exists.  The
-builder-produced ``PolicyInputV1`` is the frozen evidence snapshot: later rows,
-including backdated rows, belong to a later update and do not invalidate this
-one.  Snapshot completeness therefore relies on the honest serialized runner
-calling the builder before sealing; this module proves pointwise membership and
-contents, not a database-wide ingestion watermark.
+builder-produced ``PolicyInputV1`` binds a durable evidence snapshot, including
+its global ingestion watermark and complete ordered members.  Later rows,
+including backdated rows, belong to a later snapshot and do not invalidate this
+one.
 
 This is a crash-conservative single-writer protocol, not an atomic multi-process
-transaction, signature, freshness proof, or confidentiality mechanism.  Hashes
-and truncated content IDs can be enumerated when answer spaces are small.  The
-later experiment runner must seal every case before it materializes any future
-query or outcome and must consume only an explicitly returned receipt/release,
-never a release selected by list order or a "latest" heuristic.
+transaction, signature, freshness proof, or confidentiality mechanism.  A
+trusted writer proves completeness at the selected watermark; orchestration
+still decides whether that snapshot is fresh enough.  Hashes and truncated
+content IDs can be enumerated when answer spaces are small.  The later
+experiment runner must seal every case before it materializes any future query
+or outcome and must consume only an explicitly returned receipt/release, never
+a release selected by list order or a "latest" heuristic.
+
+Like the policy DTO, this experimental V1 receipt is not a migration target for
+an earlier public wire; both shapes land together in the same contribution.
 """
 
 from __future__ import annotations
@@ -29,8 +33,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
 
 from examples.memory_service import local_update_policy_eval as policy
 
@@ -104,7 +107,7 @@ class AppliedPolicyReleaseV1:
 
 
 _SCHEMA_VERSION = 1
-_SEAL_POLICY = "same-scope-base-revalidated-release-last-v1"
+_SEAL_POLICY = "same-scope-durable-snapshot-revalidated-release-last-v1"
 _APPLICATION_ID_DOMAIN = b"areal-memory-local-update-application-id-v1\0"
 _UPDATE_HASH_DOMAIN = b"areal-memory-local-update-application-v1\0"
 _ROOT_DOMAIN = b"areal-memory-local-update-release-evidence-v1\0"
@@ -332,28 +335,18 @@ def _replay_policy_input(
 ) -> policy.PolicyInputV1:
     try:
         policy.policy_input_wire_v1(value)
-        cutoff = datetime.fromisoformat(value.cutoff_utc)
-        live_projection = policy.make_policy_input_v1(
+    except (policy.LocalUpdatePolicyError, TypeError, ValueError, OverflowError):
+        raise LocalUpdateApplyError("input_invalid") from None
+    try:
+        live_projection = policy.project_policy_input_from_snapshot_v1(
             store=store,
             scope=scope,
             base_release_id=value.base_release_id,
-            cutoff=cutoff,
+            evidence_snapshot_id=value.evidence_snapshot_id,
         )
     except (policy.LocalUpdatePolicyError, TypeError, ValueError, OverflowError):
-        raise LocalUpdateApplyError("input_invalid") from None
-    if (
-        live_projection.policy_scope_token != value.policy_scope_token
-        or live_projection.base_release_id != value.base_release_id
-        or live_projection.base_release_content_sha256
-        != value.base_release_content_sha256
-        or live_projection.cutoff_utc != value.cutoff_utc
-        or live_projection.base_memories != value.base_memories
-    ):
-        raise LocalUpdateApplyError("input_drift")
-    live_evidence_by_id = {item.evidence_id: item for item in live_projection.evidence}
-    if any(
-        live_evidence_by_id.get(item.evidence_id) != item for item in value.evidence
-    ):
+        raise LocalUpdateApplyError("input_drift") from None
+    if live_projection != value:
         raise LocalUpdateApplyError("input_drift")
     return value
 
@@ -441,6 +434,11 @@ def apply_local_update_decision_v1(
         != set(base_revision_ids)
     ):
         raise LocalUpdateApplyError("input_drift")
+
+    # Keep the final fail-closed read adjacent to the first candidate write.
+    # Public snapshots are immutable; this guard also catches injected storage
+    # drift before any decision-derived orphan can be created.
+    _replay_policy_input(store=store, scope=scope, value=replayed)
     result_revision_ids = list(base_revision_ids)
     receipts: list[AppliedUpdateReceiptV1] = []
 
@@ -538,11 +536,11 @@ def apply_local_update_decision_v1(
             idempotency_key=f"{application_id}-release",
         )
         revisions = store.get_release_revisions(scope, release.release_id)
-        post_projection = policy.make_policy_input_v1(
+        post_projection = policy.project_policy_input_from_snapshot_v1(
             store=store,
             scope=scope,
             base_release_id=release.release_id,
-            cutoff=datetime.fromisoformat(replayed.cutoff_utc),
+            evidence_snapshot_id=replayed.evidence_snapshot_id,
         )
     except (
         MemoryServiceError,
@@ -557,22 +555,19 @@ def apply_local_update_decision_v1(
     expected_base_memories = tuple(
         sorted(expected_base_by_key.values(), key=lambda item: item.key)
     )
-    post_evidence_by_id = {item.evidence_id: item for item in post_projection.evidence}
+    expected_post_projection = replace(
+        replayed,
+        base_release_id=release.release_id,
+        base_release_content_sha256=release.content_hash,
+        base_memories=expected_base_memories,
+    )
     if (
         release.manifest.scope != scope
         or release.manifest.revision_ids != revision_ids
         or revision_ids != expected_revision_ids
         or (bool(receipts) and release.release_id == replayed.base_release_id)
         or (not receipts and release.release_id != replayed.base_release_id)
-        or post_projection.policy_scope_token != replayed.policy_scope_token
-        or post_projection.cutoff_utc != replayed.cutoff_utc
-        or any(
-            post_evidence_by_id.get(item.evidence_id) != item
-            for item in replayed.evidence
-        )
-        or post_projection.base_memories != expected_base_memories
-        or post_projection.base_release_id != release.release_id
-        or post_projection.base_release_content_sha256 != release.content_hash
+        or post_projection != expected_post_projection
     ):
         raise LocalUpdateApplyError("publication_invalid")
 

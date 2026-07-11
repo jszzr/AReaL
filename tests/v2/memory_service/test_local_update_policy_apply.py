@@ -316,6 +316,7 @@ def test_supersede_replaces_in_place_and_add_appends_after_all_base_members(
         scope=scope,
         base_release_id=base_release.release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="policy-input-three-base-snapshot",
     )
     decision = policy.run_local_update_policy_v1("feedback_latest", policy_input)
 
@@ -414,6 +415,138 @@ def test_constructible_input_payload_forgery_is_replayed_from_store_before_write
     ) == before
 
 
+def test_constructible_input_cannot_omit_snapshot_member_before_writes(
+    tmp_path,
+) -> None:
+    store, scope, _records, _base, policy_input = _fixture(tmp_path)
+    forged_input = dataclasses.replace(
+        policy_input,
+        evidence_snapshot_members=policy_input.evidence_snapshot_members[:-1],
+        evidence=policy_input.evidence[:-1],
+    )
+    forged_decision = policy.run_local_update_policy_v1(
+        "feedback_latest",
+        forged_input,
+    )
+    before = (
+        len(store.list_candidates(scope)),
+        len(store.list_revisions(scope)),
+        len(store.list_releases(scope)),
+    )
+
+    with pytest.raises(application.LocalUpdateApplyError) as error:
+        application.apply_local_update_decision_v1(
+            store=store,
+            scope=scope,
+            policy_input=forged_input,
+            decision=forged_decision,
+            expected_policy="feedback_latest",
+        )
+
+    assert error.value.reason == "input_drift"
+    assert (
+        len(store.list_candidates(scope)),
+        len(store.list_revisions(scope)),
+        len(store.list_releases(scope)),
+    ) == before
+
+
+def test_second_snapshot_replay_guards_first_candidate_write(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, scope, _records, _base, policy_input = _fixture(tmp_path)
+    decision = policy.run_local_update_policy_v1("feedback_latest", policy_input)
+    original = policy.project_policy_input_from_snapshot_v1
+    calls = 0
+
+    def drift_on_prewrite(**kwargs):
+        nonlocal calls
+        calls += 1
+        projected = original(**kwargs)
+        if calls == 2:
+            return dataclasses.replace(
+                projected,
+                evidence_snapshot_content_hash="0" * 64,
+            )
+        return projected
+
+    monkeypatch.setattr(
+        policy,
+        "project_policy_input_from_snapshot_v1",
+        drift_on_prewrite,
+    )
+    before = (
+        len(store.list_candidates(scope)),
+        len(store.list_revisions(scope)),
+        len(store.list_releases(scope)),
+    )
+
+    with pytest.raises(application.LocalUpdateApplyError) as error:
+        application.apply_local_update_decision_v1(
+            store=store,
+            scope=scope,
+            policy_input=policy_input,
+            decision=decision,
+            expected_policy="feedback_latest",
+        )
+
+    assert calls == 2
+    assert error.value.reason == "input_drift"
+    assert (
+        len(store.list_candidates(scope)),
+        len(store.list_revisions(scope)),
+        len(store.list_releases(scope)),
+    ) == before
+
+
+def test_apply_only_reads_bound_snapshot_and_never_reseals(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, scope, _records, _base, policy_input = _fixture(tmp_path)
+    decision = policy.run_local_update_policy_v1("feedback_latest", policy_input)
+    original_project = policy.project_policy_input_from_snapshot_v1
+    calls: list[tuple[str, str]] = []
+
+    def seal_must_not_run(*_args, **_kwargs):
+        raise AssertionError("apply attempted to seal a new snapshot")
+
+    def observe_projection(**kwargs):
+        calls.append(
+            (kwargs["base_release_id"], kwargs["evidence_snapshot_id"])
+        )
+        return original_project(**kwargs)
+
+    monkeypatch.setattr(
+        SQLiteMemoryStore,
+        "seal_evidence_snapshot",
+        seal_must_not_run,
+    )
+    monkeypatch.setattr(
+        policy,
+        "project_policy_input_from_snapshot_v1",
+        observe_projection,
+    )
+
+    result = application.apply_local_update_decision_v1(
+        store=store,
+        scope=scope,
+        policy_input=policy_input,
+        decision=decision,
+        expected_policy="feedback_latest",
+    )
+
+    assert len(calls) == 4
+    assert {snapshot_id for _release_id, snapshot_id in calls} == {
+        policy_input.evidence_snapshot_id
+    }
+    assert tuple(release_id for release_id, _snapshot_id in calls[:3]) == (
+        policy_input.base_release_id,
+    ) * 3
+    assert calls[-1][0] == result.release_id
+
+
 def test_later_backdated_evidence_does_not_rewrite_the_sealed_policy_snapshot(
     tmp_path,
 ) -> None:
@@ -436,6 +569,7 @@ def test_later_backdated_evidence_does_not_rewrite_the_sealed_policy_snapshot(
         scope=scope,
         base_release_id=policy_input.base_release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="policy-input-after-backfill",
     )
     assert live_input != policy_input
     assert policy.run_local_update_policy_v1("feedback_latest", live_input) != decision
@@ -667,17 +801,18 @@ def test_post_commit_projection_failure_leaves_shadow_release_then_retry_recover
 ) -> None:
     store, scope, _records, _base, policy_input = _fixture(tmp_path)
     decision = policy.run_local_update_policy_v1("feedback_latest", policy_input)
-    original = policy.make_policy_input_v1
-    calls = 0
+    original = policy.project_policy_input_from_snapshot_v1
 
-    def fail_third_projection(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 3:
+    def fail_post_commit_projection(**kwargs):
+        if kwargs["base_release_id"] != policy_input.base_release_id:
             raise policy.LocalUpdatePolicyError("test_post_commit_failure")
         return original(**kwargs)
 
-    monkeypatch.setattr(policy, "make_policy_input_v1", fail_third_projection)
+    monkeypatch.setattr(
+        policy,
+        "project_policy_input_from_snapshot_v1",
+        fail_post_commit_projection,
+    )
     with pytest.raises(application.LocalUpdateApplyError) as error:
         application.apply_local_update_decision_v1(
             store=store,
@@ -689,7 +824,11 @@ def test_post_commit_projection_failure_leaves_shadow_release_then_retry_recover
     assert error.value.reason == "publication_invalid"
     assert len(store.list_releases(scope)) == 2
 
-    monkeypatch.setattr(policy, "make_policy_input_v1", original)
+    monkeypatch.setattr(
+        policy,
+        "project_policy_input_from_snapshot_v1",
+        original,
+    )
     recovered = application.apply_local_update_decision_v1(
         store=store,
         scope=scope,

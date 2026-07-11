@@ -3,9 +3,13 @@
 """Closed, deterministic policy kernel for local Memory update experiments.
 
 The policy receives only an opaque scope token, a cutoff-bounded projection of
-persisted evidence, and the currently released base memories.  It does not
-receive a case index, future query, arm label, scorer truth, reward, utility,
-outcome, database path, or store capability.
+persisted evidence, the durable evidence snapshot that proves that projection
+complete, and the currently released base memories.  It does not receive a case
+index, future query, arm label, scorer truth, reward, utility, outcome, database
+path, or store capability.
+
+Every exposed base memory is also replayed to its ADD root, and every revision
+in that lineage must be grounded by ID and full hash in the same snapshot.
 
 This module deliberately stops before persistence and scoring.  A later runner
 can turn a validated decision into candidates, revisions, and a release, then
@@ -16,6 +20,10 @@ truth or reward callback hidden in the update API.
 The boundary is an honest-code dataflow contract, not a malicious Python
 sandbox.  A policy that imports experiment internals or exploits global state is
 outside the claim made here.
+
+This experimental V1 wire has not been released independently: the durable
+snapshot fields and the original policy DTO land as one contract.  A legacy
+pre-snapshot shape is deliberately rejected instead of being reinterpreted.
 """
 
 from __future__ import annotations
@@ -26,7 +34,16 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from areal.v2.memory_service import EvidenceKind, MemoryScope
+from areal.v2.memory_service import (
+    EvidenceKind,
+    EvidenceRecord,
+    EvidenceSnapshot,
+    EvidenceSnapshotMember,
+    EvidenceSnapshotSpec,
+    MemoryRevision,
+    MemoryScope,
+    RevisionOperation,
+)
 from areal.v2.memory_service.errors import MemoryServiceError
 from areal.v2.memory_service.sqlite_store import SQLiteMemoryStore
 
@@ -44,6 +61,7 @@ __all__ = [
     "policy_decision_wire_v1",
     "policy_input_sha256_v1",
     "policy_input_wire_v1",
+    "project_policy_input_from_snapshot_v1",
     "run_local_update_policy_v1",
     "validate_local_update_decision_v1",
 ]
@@ -90,6 +108,9 @@ class PolicyInputV1:
     policy_scope_token: str
     base_release_id: str
     base_release_content_sha256: str
+    evidence_snapshot_id: str
+    evidence_snapshot_content_hash: str
+    evidence_snapshot_members: tuple[EvidenceSnapshotMember, ...]
     cutoff_utc: str
     evidence: tuple[PolicyEvidenceV1, ...]
     base_memories: tuple[BaseMemoryV1, ...]
@@ -122,6 +143,7 @@ _EVIDENCE_ID_PATTERN = re.compile(r"evd_[0-9a-f]{24}")
 _MEMORY_ID_PATTERN = re.compile(r"mem_[0-9a-f]{24}")
 _REVISION_ID_PATTERN = re.compile(r"rev_[0-9a-f]{24}")
 _RELEASE_ID_PATTERN = re.compile(r"rel_[0-9a-f]{24}")
+_EVIDENCE_SNAPSHOT_ID_PATTERN = re.compile(r"esnap_[0-9a-f]{24}")
 _SCOPE_TOKEN_PATTERN = re.compile(r"scope_[0-9a-f]{64}")
 _KEY_PATTERN = re.compile(r"project-[abcdefghjklmnpqrstuvwxyz23456789]{6}")
 _VALUE_PATTERN = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}")
@@ -249,6 +271,25 @@ def _validate_base_memory(value: object) -> BaseMemoryV1:
     return value
 
 
+def _validate_evidence_snapshot_member(
+    value: object,
+) -> EvidenceSnapshotMember:
+    if (
+        type(value) is not EvidenceSnapshotMember
+        or type(value.evidence_id) is not str
+        or _EVIDENCE_ID_PATTERN.fullmatch(value.evidence_id) is None
+        or type(value.evidence_content_hash) is not str
+        or _SHA256_PATTERN.fullmatch(value.evidence_content_hash) is None
+        or type(value.ingest_order) is not int
+        or value.ingest_order < 0
+        or value.ingest_order > 2**63 - 1
+    ):
+        raise LocalUpdatePolicyError("closed_schema")
+    if value.evidence_id != f"evd_{value.evidence_content_hash[:24]}":
+        raise LocalUpdatePolicyError("input_invariant")
+    return value
+
+
 def _validate_policy_input(value: object) -> PolicyInputV1:
     if (
         type(value) is not PolicyInputV1
@@ -260,15 +301,32 @@ def _validate_policy_input(value: object) -> PolicyInputV1:
         or _RELEASE_ID_PATTERN.fullmatch(value.base_release_id) is None
         or type(value.base_release_content_sha256) is not str
         or _SHA256_PATTERN.fullmatch(value.base_release_content_sha256) is None
+        or type(value.evidence_snapshot_id) is not str
+        or _EVIDENCE_SNAPSHOT_ID_PATTERN.fullmatch(value.evidence_snapshot_id) is None
+        or type(value.evidence_snapshot_content_hash) is not str
+        or _SHA256_PATTERN.fullmatch(value.evidence_snapshot_content_hash) is None
+        or type(value.evidence_snapshot_members) is not tuple
         or type(value.evidence) is not tuple
         or type(value.base_memories) is not tuple
     ):
         raise LocalUpdatePolicyError("closed_schema")
     cutoff = _parse_canonical_utc_text(value.cutoff_utc)
+    members = tuple(
+        _validate_evidence_snapshot_member(item)
+        for item in value.evidence_snapshot_members
+    )
     evidence = tuple(_validate_policy_evidence(item) for item in value.evidence)
     bases = tuple(_validate_base_memory(item) for item in value.base_memories)
     if (
-        evidence != tuple(sorted(evidence, key=_evidence_sort_key))
+        value.base_release_id
+        != f"rel_{value.base_release_content_sha256[:24]}"
+        or value.evidence_snapshot_id
+        != f"esnap_{value.evidence_snapshot_content_hash[:24]}"
+        or len({item.evidence_id for item in members}) != len(members)
+        or len({item.ingest_order for item in members}) != len(members)
+        or tuple(item.evidence_id for item in members)
+        != tuple(item.evidence_id for item in evidence)
+        or evidence != tuple(sorted(evidence, key=_evidence_sort_key))
         or len({item.evidence_id for item in evidence}) != len(evidence)
         or any(
             _parse_canonical_utc_text(item.observed_at_utc) > cutoff
@@ -299,6 +357,16 @@ def _policy_input_value(value: PolicyInputV1) -> dict[str, object]:
             for item in value.base_memories
         ],
         "cutoff_utc": value.cutoff_utc,
+        "evidence_snapshot_content_hash": value.evidence_snapshot_content_hash,
+        "evidence_snapshot_id": value.evidence_snapshot_id,
+        "evidence_snapshot_members": [
+            {
+                "evidence_content_hash": item.evidence_content_hash,
+                "evidence_id": item.evidence_id,
+                "ingest_order": item.ingest_order,
+            }
+            for item in value.evidence_snapshot_members
+        ],
         "evidence": [
             {
                 "evidence_id": item.evidence_id,
@@ -324,23 +392,54 @@ def policy_input_sha256_v1(value: PolicyInputV1) -> str:
     return hashlib.sha256(_INPUT_HASH_DOMAIN + policy_input_wire_v1(value)).hexdigest()
 
 
-def make_policy_input_v1(
+def _load_grounded_revision_fact(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    revision: MemoryRevision,
+    snapshot_hash_by_evidence_id: dict[str, str] | None,
+) -> tuple[str, str]:
+    candidate = store.get_candidate(scope, revision.proposal.candidate_id)
+    evidence_records = store.get_candidate_evidence(scope, candidate.candidate_id)
+    parsed = _parse_fact(candidate.proposal.content)
+    if (
+        parsed is None
+        or revision.proposal.scope != scope
+        or candidate.proposal.scope != scope
+        or revision.proposal.candidate_id != candidate.candidate_id
+        or candidate.proposal.evidence_ids
+        != tuple(item.evidence_id for item in evidence_records)
+        or not evidence_records
+        or any(item.event.scope != scope for item in evidence_records)
+        or (
+            snapshot_hash_by_evidence_id is not None
+            and any(
+                snapshot_hash_by_evidence_id.get(item.evidence_id)
+                != item.content_hash
+                for item in evidence_records
+            )
+        )
+        or any(_parse_fact(item.event.payload) != parsed for item in evidence_records)
+    ):
+        raise LocalUpdatePolicyError("base_release_invalid")
+    return parsed
+
+
+def _load_base_release_projection(
     *,
     store: SQLiteMemoryStore,
     scope: MemoryScope,
     base_release_id: str,
-    cutoff: datetime,
-) -> PolicyInputV1:
-    """Project one same-scope release and pre-evaluation evidence snapshot."""
-
-    if (
-        type(store) is not SQLiteMemoryStore
-        or type(scope) is not MemoryScope
-        or type(base_release_id) is not str
-        or _RELEASE_ID_PATTERN.fullmatch(base_release_id) is None
-    ):
-        raise LocalUpdatePolicyError("closed_schema")
-    cutoff_text = _canonical_utc_text(cutoff)
+    evidence_snapshot_members: tuple[EvidenceSnapshotMember, ...] | None = None,
+) -> tuple[str, str, tuple[BaseMemoryV1, ...]]:
+    snapshot_hash_by_evidence_id = (
+        None
+        if evidence_snapshot_members is None
+        else {
+            member.evidence_id: member.evidence_content_hash
+            for member in evidence_snapshot_members
+        }
+    )
     try:
         release = store.get_release(scope, base_release_id)
         revisions = store.get_release_revisions(scope, base_release_id)
@@ -353,27 +452,52 @@ def make_policy_input_v1(
             raise LocalUpdatePolicyError("base_release_invalid")
         base_memories: list[BaseMemoryV1] = []
         for revision in revisions:
-            candidate = store.get_candidate(scope, revision.proposal.candidate_id)
-            evidence_records = store.get_candidate_evidence(
-                scope, candidate.candidate_id
-            )
-            parsed = _parse_fact(candidate.proposal.content)
-            if (
-                parsed is None
-                or revision.proposal.scope != scope
-                or candidate.proposal.scope != scope
-                or revision.proposal.candidate_id != candidate.candidate_id
-                or candidate.proposal.evidence_ids
-                != tuple(item.evidence_id for item in evidence_records)
-                or not evidence_records
-                or any(item.event.scope != scope for item in evidence_records)
-                or any(
-                    _parse_fact(item.event.payload) != parsed
-                    for item in evidence_records
+            current = revision
+            expected_generation = revision.generation
+            lineage_revision_ids: set[str] = set()
+            exposed_fact: tuple[str, str] | None = None
+            while True:
+                if (
+                    type(current) is not MemoryRevision
+                    or current.revision_id in lineage_revision_ids
+                    or current.memory_id != revision.memory_id
+                    or current.generation != expected_generation
+                ):
+                    raise LocalUpdatePolicyError("base_release_invalid")
+                lineage_revision_ids.add(current.revision_id)
+                parsed = _load_grounded_revision_fact(
+                    store=store,
+                    scope=scope,
+                    revision=current,
+                    snapshot_hash_by_evidence_id=snapshot_hash_by_evidence_id,
                 )
-            ):
+                if exposed_fact is None:
+                    exposed_fact = parsed
+                if current.proposal.operation is RevisionOperation.ADD:
+                    if current.proposal.parent_revision_id is not None:
+                        raise LocalUpdatePolicyError("base_release_invalid")
+                    break
+                if (
+                    current.proposal.operation is not RevisionOperation.SUPERSEDE
+                    or current.proposal.parent_revision_id is None
+                    or expected_generation <= 0
+                ):
+                    raise LocalUpdatePolicyError("base_release_invalid")
+                parent = store.get_revision(
+                    scope,
+                    current.proposal.parent_revision_id,
+                )
+                if (
+                    parent.revision_id != current.proposal.parent_revision_id
+                    or parent.memory_id != current.memory_id
+                    or parent.generation != expected_generation - 1
+                ):
+                    raise LocalUpdatePolicyError("base_release_invalid")
+                current = parent
+                expected_generation -= 1
+            if expected_generation != 0 or exposed_fact is None:
                 raise LocalUpdatePolicyError("base_release_invalid")
-            key, fact_value = parsed
+            key, fact_value = exposed_fact
             base_memories.append(
                 BaseMemoryV1(
                     key=key,
@@ -383,16 +507,114 @@ def make_policy_input_v1(
                     generation=revision.generation,
                 )
             )
-        records = tuple(
-            record
-            for record in store.list(scope)
-            if record.event.observed_at <= cutoff.astimezone(UTC)
-            and record.event.kind.value in POLICY_EVIDENCE_KINDS
-        )
     except LocalUpdatePolicyError:
         raise
-    except (MemoryServiceError, TypeError, ValueError, OverflowError) as error:
+    except (
+        AttributeError,
+        MemoryServiceError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ) as error:
         raise LocalUpdatePolicyError("base_release_invalid") from error
+    return (
+        release.release_id,
+        release.content_hash,
+        tuple(sorted(base_memories, key=lambda item: item.key)),
+    )
+
+
+def _load_evidence_snapshot_projection(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    evidence_snapshot_id: str,
+) -> tuple[EvidenceSnapshot, tuple[EvidenceRecord, ...]]:
+    try:
+        snapshot = store.get_evidence_snapshot(scope, evidence_snapshot_id)
+        records = store.get_evidence_snapshot_evidence(
+            scope,
+            evidence_snapshot_id,
+        )
+        if type(snapshot) is not EvidenceSnapshot:
+            raise LocalUpdatePolicyError("evidence_snapshot_invalid")
+        expected_spec = EvidenceSnapshotSpec(
+            scope=scope,
+            allowed_kinds=tuple(
+                EvidenceKind(kind) for kind in POLICY_EVIDENCE_KINDS
+            ),
+            cutoff=snapshot.spec.cutoff,
+        )
+        expected_content_hash = hashlib.sha256(snapshot.canonical_bytes()).hexdigest()
+        if (
+            snapshot.snapshot_id != evidence_snapshot_id
+            or snapshot.spec != expected_spec
+            or snapshot.content_hash != expected_content_hash
+            or snapshot.snapshot_id != f"esnap_{expected_content_hash[:24]}"
+            or type(records) is not tuple
+            or tuple(
+                (record.evidence_id, record.content_hash) for record in records
+            )
+            != tuple(
+                (member.evidence_id, member.evidence_content_hash)
+                for member in snapshot.members
+            )
+            or any(
+                record.event.scope != scope
+                or record.event.kind.value not in POLICY_EVIDENCE_KINDS
+                or record.event.observed_at > snapshot.spec.cutoff
+                or record.content_hash
+                != hashlib.sha256(record.event.canonical_bytes()).hexdigest()
+                or record.evidence_id != f"evd_{record.content_hash[:24]}"
+                for record in records
+            )
+        ):
+            raise LocalUpdatePolicyError("evidence_snapshot_invalid")
+    except LocalUpdatePolicyError:
+        raise
+    except (
+        AttributeError,
+        MemoryServiceError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ) as error:
+        raise LocalUpdatePolicyError("evidence_snapshot_invalid") from error
+    return snapshot, records
+
+
+def project_policy_input_from_snapshot_v1(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    base_release_id: str,
+    evidence_snapshot_id: str,
+) -> PolicyInputV1:
+    """Read one existing snapshot and reconstruct its exact policy input."""
+
+    if (
+        type(store) is not SQLiteMemoryStore
+        or type(scope) is not MemoryScope
+        or type(base_release_id) is not str
+        or _RELEASE_ID_PATTERN.fullmatch(base_release_id) is None
+        or type(evidence_snapshot_id) is not str
+        or _EVIDENCE_SNAPSHOT_ID_PATTERN.fullmatch(evidence_snapshot_id) is None
+    ):
+        raise LocalUpdatePolicyError("closed_schema")
+    snapshot, records = _load_evidence_snapshot_projection(
+        store=store,
+        scope=scope,
+        evidence_snapshot_id=evidence_snapshot_id,
+    )
+    release_id, release_content_hash, base_memories = (
+        _load_base_release_projection(
+            store=store,
+            scope=scope,
+            base_release_id=base_release_id,
+            evidence_snapshot_members=snapshot.members,
+        )
+    )
+    cutoff_text = _canonical_utc_text(snapshot.spec.cutoff)
 
     projected = tuple(
         PolicyEvidenceV1(
@@ -407,13 +629,84 @@ def make_policy_input_v1(
     result = PolicyInputV1(
         schema_version=_SCHEMA_VERSION,
         policy_scope_token=_scope_token(scope),
-        base_release_id=release.release_id,
-        base_release_content_sha256=release.content_hash,
+        base_release_id=release_id,
+        base_release_content_sha256=release_content_hash,
+        evidence_snapshot_id=snapshot.snapshot_id,
+        evidence_snapshot_content_hash=snapshot.content_hash,
+        evidence_snapshot_members=snapshot.members,
         cutoff_utc=cutoff_text,
-        evidence=tuple(sorted(projected, key=_evidence_sort_key)),
-        base_memories=tuple(sorted(base_memories, key=lambda item: item.key)),
+        evidence=projected,
+        base_memories=base_memories,
     )
     return _validate_policy_input(result)
+
+
+def make_policy_input_v1(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    base_release_id: str,
+    cutoff: datetime,
+    evidence_snapshot_idempotency_key: str,
+) -> PolicyInputV1:
+    """Validate the base, seal complete evidence, then project the snapshot."""
+
+    if (
+        type(store) is not SQLiteMemoryStore
+        or type(scope) is not MemoryScope
+        or type(base_release_id) is not str
+        or _RELEASE_ID_PATTERN.fullmatch(base_release_id) is None
+        or type(evidence_snapshot_idempotency_key) is not str
+        or not evidence_snapshot_idempotency_key.strip()
+    ):
+        raise LocalUpdatePolicyError("closed_schema")
+    try:
+        evidence_snapshot_idempotency_key.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise LocalUpdatePolicyError("closed_schema") from error
+    cutoff_text = _canonical_utc_text(cutoff)
+    cutoff_utc = _parse_canonical_utc_text(cutoff_text)
+
+    # Validate before sealing so an invalid base release cannot create a durable
+    # snapshot as a side effect.
+    _load_base_release_projection(
+        store=store,
+        scope=scope,
+        base_release_id=base_release_id,
+    )
+    try:
+        snapshot = store.seal_evidence_snapshot(
+            EvidenceSnapshotSpec(
+                scope=scope,
+                allowed_kinds=tuple(
+                    EvidenceKind(kind) for kind in POLICY_EVIDENCE_KINDS
+                ),
+                cutoff=cutoff_utc,
+            ),
+            idempotency_key=evidence_snapshot_idempotency_key,
+        )
+        if type(snapshot) is not EvidenceSnapshot:
+            raise LocalUpdatePolicyError("evidence_snapshot_invalid")
+    except LocalUpdatePolicyError:
+        raise
+    except (
+        AttributeError,
+        MemoryServiceError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ) as error:
+        raise LocalUpdatePolicyError("evidence_snapshot_invalid") from error
+
+    result = project_policy_input_from_snapshot_v1(
+        store=store,
+        scope=scope,
+        base_release_id=base_release_id,
+        evidence_snapshot_id=snapshot.snapshot_id,
+    )
+    if result.cutoff_utc != cutoff_text:
+        raise LocalUpdatePolicyError("evidence_snapshot_invalid")
+    return result
 
 
 def _selected_facts(

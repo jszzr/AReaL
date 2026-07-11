@@ -15,6 +15,7 @@ from areal.v2.memory_service import (
     CandidateProposal,
     EvidenceEvent,
     EvidenceKind,
+    EvidenceSnapshotSpec,
     MemoryScope,
     ReleaseManifest,
     RevisionOperation,
@@ -147,6 +148,7 @@ def _fixture(tmp_path):
         scope=scope,
         base_release_id=release.release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-fixture",
     )
     return store, scope, records, base_memory, value
 
@@ -161,6 +163,36 @@ def _all_mapping_keys(value: object) -> set[str]:
     return set()
 
 
+def _release_from_record(
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    record,
+    *,
+    label: str,
+):
+    candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=record.event.payload,
+            evidence_ids=(record.evidence_id,),
+            idempotency_key=f"candidate-{label}",
+        )
+    )
+    revision = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+            idempotency_key=f"revision-{label}",
+        )
+    )
+    return store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(revision.revision_id,)),
+        idempotency_key=f"release-{label}",
+    )
+
+
 def test_policy_input_is_closed_opaque_cutoff_projection(tmp_path) -> None:
     store, scope, records, base, value = _fixture(tmp_path)
 
@@ -172,6 +204,12 @@ def test_policy_input_is_closed_opaque_cutoff_projection(tmp_path) -> None:
     assert len(value.policy_scope_token) == 70
     assert "opaque-subject-for-tests" not in value.policy_scope_token
     assert value.cutoff_utc == "2026-07-08T00:02:30+00:00"
+    snapshot = store.get_evidence_snapshot(scope, value.evidence_snapshot_id)
+    assert value.evidence_snapshot_content_hash == snapshot.content_hash
+    assert value.evidence_snapshot_members == snapshot.members
+    assert tuple(item.evidence_id for item in value.evidence) == tuple(
+        item.evidence_id for item in value.evidence_snapshot_members
+    )
     release = store.get_release(scope, value.base_release_id)
     assert value.base_release_content_sha256 == release.content_hash
     assert value.base_memories[0].revision_id in release.manifest.revision_ids
@@ -183,6 +221,9 @@ def test_policy_input_is_closed_opaque_cutoff_projection(tmp_path) -> None:
         "base_release_id",
         "cutoff_utc",
         "evidence",
+        "evidence_snapshot_content_hash",
+        "evidence_snapshot_id",
+        "evidence_snapshot_members",
         "policy_scope_token",
         "schema_version",
     }
@@ -276,11 +317,19 @@ def test_projection_and_commitments_are_deterministic(tmp_path) -> None:
         scope=scope,
         base_release_id=value.base_release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-fixture",
     )
     first = policy.run_local_update_policy_v1("feedback_latest", value)
     second = policy.run_local_update_policy_v1("feedback_latest", replayed)
+    read_only = policy.project_policy_input_from_snapshot_v1(
+        store=_store,
+        scope=scope,
+        base_release_id=value.base_release_id,
+        evidence_snapshot_id=value.evidence_snapshot_id,
+    )
 
     assert replayed == value
+    assert read_only == value
     assert policy.policy_input_wire_v1(replayed) == policy.policy_input_wire_v1(value)
     assert policy.policy_input_sha256_v1(replayed) == policy.policy_input_sha256_v1(
         value
@@ -297,16 +346,409 @@ def test_projection_and_commitments_are_deterministic(tmp_path) -> None:
     )
     assert len(policy.policy_input_sha256_v1(value)) == 64
     assert len(policy.policy_decision_sha256_v1(first)) == 64
-    assert len(policy.policy_input_wire_v1(value)) == 1314
+    assert len(policy.policy_input_wire_v1(value)) == 2275
     assert len(policy.policy_decision_wire_v1(first)) == 509
     assert (
         policy.policy_input_sha256_v1(value)
-        == "a96cb41e6b3487166a09d7cdbf3a86f5671c6ba90996312848c969c247ac976f"
+        == "12fd986d834e3154a156ff74c6a3f56301651d269fdd397676b89d52ee92bd5f"
     )
     assert (
         policy.policy_decision_sha256_v1(first)
-        == "496a73dad44c27792ce8e3c1430c4b2671250e5c6057655c1d0f6266a2400eff"
+        == "876af90c5c746d3ecb1b4cf34183de5be3f8ee94f0360e8f5c6db7b4123b4c33"
     )
+
+
+def test_make_never_lists_and_existing_snapshot_projection_never_seals(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store, scope, _records, _base, value = _fixture(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unsealed evidence enumeration is forbidden")
+
+    monkeypatch.setattr(SQLiteMemoryStore, "list", forbidden)
+    assert (
+        policy.make_policy_input_v1(
+            store=store,
+            scope=scope,
+            base_release_id=value.base_release_id,
+            cutoff=_BASE + timedelta(seconds=150),
+            evidence_snapshot_idempotency_key="snapshot-fixture",
+        )
+        == value
+    )
+
+    monkeypatch.setattr(SQLiteMemoryStore, "seal_evidence_snapshot", forbidden)
+    assert (
+        policy.project_policy_input_from_snapshot_v1(
+            store=store,
+            scope=scope,
+            base_release_id=value.base_release_id,
+            evidence_snapshot_id=value.evidence_snapshot_id,
+        )
+        == value
+    )
+
+
+def test_late_backfill_is_frozen_by_old_key_and_included_by_new_key(tmp_path) -> None:
+    store, scope, _records, _base, original = _fixture(tmp_path)
+    backfill = _append(
+        store,
+        scope,
+        label="late-backfill",
+        seconds=-60,
+        sequence_no=9,
+        kind=EvidenceKind.FEEDBACK,
+        payload=f"{_TARGET_KEY} = {_CURRENT}",
+    )
+
+    old_key = policy.make_policy_input_v1(
+        store=store,
+        scope=scope,
+        base_release_id=original.base_release_id,
+        cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-fixture",
+    )
+    new_key = policy.make_policy_input_v1(
+        store=store,
+        scope=scope,
+        base_release_id=original.base_release_id,
+        cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-after-backfill",
+    )
+
+    assert old_key == original
+    assert backfill.evidence_id not in {
+        item.evidence_id for item in old_key.evidence
+    }
+    assert backfill.evidence_id in {item.evidence_id for item in new_key.evidence}
+    assert new_key.evidence_snapshot_id != old_key.evidence_snapshot_id
+    assert new_key.evidence_snapshot_content_hash != (
+        old_key.evidence_snapshot_content_hash
+    )
+    assert tuple(item.evidence_id for item in new_key.evidence) == tuple(
+        item.evidence_id for item in new_key.evidence_snapshot_members
+    )
+
+
+def test_snapshot_projection_rejects_missing_foreign_or_wrong_predicate(
+    tmp_path,
+) -> None:
+    store, scope, _records, _base, original = _fixture(tmp_path)
+    foreign_scope = MemoryScope(
+        tenant_id=scope.tenant_id,
+        namespace=scope.namespace,
+        subject_id="foreign-snapshot-subject",
+    )
+    foreign = store.seal_evidence_snapshot(
+        EvidenceSnapshotSpec(
+            scope=foreign_scope,
+            allowed_kinds=(EvidenceKind.USER_MESSAGE, EvidenceKind.FEEDBACK),
+            cutoff=_BASE + timedelta(seconds=150),
+        ),
+        idempotency_key="foreign-snapshot",
+    )
+    wrong_predicate = store.seal_evidence_snapshot(
+        EvidenceSnapshotSpec(
+            scope=scope,
+            allowed_kinds=(EvidenceKind.OUTCOME,),
+            cutoff=_BASE + timedelta(seconds=150),
+        ),
+        idempotency_key="wrong-predicate-snapshot",
+    )
+
+    for snapshot_id in (
+        "esnap_" + "0" * 24,
+        foreign.snapshot_id,
+        wrong_predicate.snapshot_id,
+    ):
+        with pytest.raises(policy.LocalUpdatePolicyError) as error:
+            policy.project_policy_input_from_snapshot_v1(
+                store=store,
+                scope=scope,
+                base_release_id=original.base_release_id,
+                evidence_snapshot_id=snapshot_id,
+            )
+        assert error.value.reason == "evidence_snapshot_invalid"
+
+
+@pytest.mark.parametrize(
+    ("label", "seconds", "kind"),
+    (
+        ("future-outcome-base", 100, EvidenceKind.OUTCOME),
+        ("after-cutoff-base", 180, EvidenceKind.FEEDBACK),
+    ),
+)
+def test_base_release_cannot_import_evidence_outside_bound_snapshot(
+    tmp_path,
+    label,
+    seconds,
+    kind,
+) -> None:
+    store, scope, _records, _base, _original = _fixture(tmp_path)
+    leaked = _append(
+        store,
+        scope,
+        label=label,
+        seconds=seconds,
+        sequence_no=11,
+        kind=kind,
+        payload=f"{_TARGET_KEY} = {_CURRENT}",
+    )
+    leaked_release = _release_from_record(
+        store,
+        scope,
+        leaked,
+        label=label,
+    )
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.make_policy_input_v1(
+            store=store,
+            scope=scope,
+            base_release_id=leaked_release.release_id,
+            cutoff=_BASE + timedelta(seconds=150),
+            evidence_snapshot_idempotency_key=f"snapshot-{label}",
+        )
+
+    assert error.value.reason == "base_release_invalid"
+
+
+def test_base_release_cannot_use_backfill_ingested_after_bound_snapshot(
+    tmp_path,
+) -> None:
+    store, scope, _records, _base, original = _fixture(tmp_path)
+    backfill = _append(
+        store,
+        scope,
+        label="post-seal-base-backfill",
+        seconds=10,
+        sequence_no=12,
+        kind=EvidenceKind.FEEDBACK,
+        payload=f"{_TARGET_KEY} = {_CURRENT}",
+    )
+    backfilled_release = _release_from_record(
+        store,
+        scope,
+        backfill,
+        label="post-seal-base-backfill",
+    )
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.project_policy_input_from_snapshot_v1(
+            store=store,
+            scope=scope,
+            base_release_id=backfilled_release.release_id,
+            evidence_snapshot_id=original.evidence_snapshot_id,
+        )
+
+    assert error.value.reason == "base_release_invalid"
+
+
+def test_base_release_cannot_hide_out_of_snapshot_evidence_in_parent_lineage(
+    tmp_path,
+) -> None:
+    store, scope, records, _base, original = _fixture(tmp_path)
+    leaked_parent_evidence = _append(
+        store,
+        scope,
+        label="leaked-lineage-parent",
+        seconds=100,
+        sequence_no=13,
+        kind=EvidenceKind.OUTCOME,
+        payload=f"{_TARGET_KEY} = {_WRONG}",
+    )
+    parent_candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=leaked_parent_evidence.event.payload,
+            evidence_ids=(leaked_parent_evidence.evidence_id,),
+            idempotency_key="candidate-leaked-lineage-parent",
+        )
+    )
+    parent = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=parent_candidate.candidate_id,
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+            idempotency_key="revision-leaked-lineage-parent",
+        )
+    )
+    safe_child_evidence = records[2]
+    child_candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=safe_child_evidence.event.payload,
+            evidence_ids=(safe_child_evidence.evidence_id,),
+            idempotency_key="candidate-safe-lineage-child",
+        )
+    )
+    child = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=child_candidate.candidate_id,
+            operation=RevisionOperation.SUPERSEDE,
+            parent_revision_id=parent.revision_id,
+            idempotency_key="revision-safe-lineage-child",
+        )
+    )
+    release = store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(child.revision_id,)),
+        idempotency_key="release-leaked-lineage",
+    )
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.project_policy_input_from_snapshot_v1(
+            store=store,
+            scope=scope,
+            base_release_id=release.release_id,
+            evidence_snapshot_id=original.evidence_snapshot_id,
+        )
+
+    assert error.value.reason == "base_release_invalid"
+
+
+def test_base_release_validates_leaked_middle_of_three_generation_lineage(
+    tmp_path,
+) -> None:
+    store, scope, records, safe_root, original = _fixture(tmp_path)
+    leaked_middle_evidence = _append(
+        store,
+        scope,
+        label="leaked-lineage-middle",
+        seconds=100,
+        sequence_no=14,
+        kind=EvidenceKind.OUTCOME,
+        payload=f"{_TARGET_KEY} = {_WRONG}",
+    )
+    middle_candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=leaked_middle_evidence.event.payload,
+            evidence_ids=(leaked_middle_evidence.evidence_id,),
+            idempotency_key="candidate-leaked-lineage-middle",
+        )
+    )
+    middle = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=middle_candidate.candidate_id,
+            operation=RevisionOperation.SUPERSEDE,
+            parent_revision_id=safe_root.revision_id,
+            idempotency_key="revision-leaked-lineage-middle",
+        )
+    )
+    safe_leaf_evidence = records[2]
+    leaf_candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=safe_leaf_evidence.event.payload,
+            evidence_ids=(safe_leaf_evidence.evidence_id,),
+            idempotency_key="candidate-safe-lineage-leaf",
+        )
+    )
+    leaf = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=leaf_candidate.candidate_id,
+            operation=RevisionOperation.SUPERSEDE,
+            parent_revision_id=middle.revision_id,
+            idempotency_key="revision-safe-lineage-leaf",
+        )
+    )
+    release = store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(leaf.revision_id,)),
+        idempotency_key="release-leaked-lineage-middle",
+    )
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.project_policy_input_from_snapshot_v1(
+            store=store,
+            scope=scope,
+            base_release_id=release.release_id,
+            evidence_snapshot_id=original.evidence_snapshot_id,
+        )
+
+    assert error.value.reason == "base_release_invalid"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: dataclasses.replace(
+            value,
+            evidence_snapshot_members=value.evidence_snapshot_members[:-1],
+        ),
+        lambda value: dataclasses.replace(
+            value,
+            evidence_snapshot_members=(
+                *value.evidence_snapshot_members,
+                value.evidence_snapshot_members[-1],
+            ),
+        ),
+        lambda value: dataclasses.replace(
+            value,
+            evidence_snapshot_members=tuple(
+                reversed(value.evidence_snapshot_members)
+            ),
+        ),
+        lambda value: dataclasses.replace(
+            value,
+            evidence_snapshot_members=(
+                dataclasses.replace(
+                    value.evidence_snapshot_members[0],
+                    evidence_content_hash="0" * 64,
+                ),
+                *value.evidence_snapshot_members[1:],
+            ),
+        ),
+        lambda value: dataclasses.replace(
+            value,
+            evidence_snapshot_content_hash="0" * 64,
+        ),
+    ),
+)
+def test_deleted_added_reordered_or_rehashed_snapshot_members_fail_closed(
+    tmp_path,
+    mutation,
+) -> None:
+    _store, _scope, _records, _base, value = _fixture(tmp_path)
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.policy_input_wire_v1(mutation(value))
+
+    assert error.value.reason in {"closed_schema", "input_invariant"}
+
+
+def test_legacy_policy_input_without_snapshot_binding_fails_closed(tmp_path) -> None:
+    _store, _scope, _records, _base, value = _fixture(tmp_path)
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class LegacyPolicyInputV1:
+        schema_version: int
+        policy_scope_token: str
+        base_release_id: str
+        base_release_content_sha256: str
+        cutoff_utc: str
+        evidence: tuple[policy.PolicyEvidenceV1, ...]
+        base_memories: tuple[policy.BaseMemoryV1, ...]
+
+    legacy = LegacyPolicyInputV1(
+        schema_version=value.schema_version,
+        policy_scope_token=value.policy_scope_token,
+        base_release_id=value.base_release_id,
+        base_release_content_sha256=value.base_release_content_sha256,
+        cutoff_utc=value.cutoff_utc,
+        evidence=value.evidence,
+        base_memories=value.base_memories,
+    )
+
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.policy_input_wire_v1(legacy)  # type: ignore[arg-type]
+
+    assert error.value.reason == "closed_schema"
 
 
 @pytest.mark.parametrize(
@@ -419,6 +861,7 @@ def test_projection_filters_outcomes_future_records_and_foreign_scope(tmp_path) 
         scope=scope,
         base_release_id=original.base_release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-filtered",
     )
     projected_ids = {item.evidence_id for item in projected.evidence}
     assert foreign.evidence_id not in projected_ids
@@ -434,6 +877,7 @@ def test_projection_filters_outcomes_future_records_and_foreign_scope(tmp_path) 
             scope=scope,
             base_release_id=foreign_release.release_id,
             cutoff=_BASE + timedelta(seconds=150),
+            evidence_snapshot_idempotency_key="snapshot-foreign-release",
         )
     assert release_error.value.reason == "base_release_invalid"
 
@@ -474,6 +918,7 @@ def test_base_release_projection_rejects_semantically_ungrounded_candidate(
             scope=scope,
             base_release_id=forged_release.release_id,
             cutoff=_BASE + timedelta(seconds=150),
+            evidence_snapshot_idempotency_key="snapshot-invalid-base",
         )
 
     assert error.value.reason == "base_release_invalid"
@@ -534,6 +979,7 @@ def test_malformed_feedback_is_ignored_and_unchanged_facts_are_not_rewritten(
         scope=scope,
         base_release_id=original.base_release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-unchanged",
     )
 
     trusted = policy.run_local_update_policy_v1("feedback_latest", value)
@@ -572,6 +1018,7 @@ def test_equal_time_and_sequence_conflicts_use_preregistered_evidence_id_tie_bre
         scope=scope,
         base_release_id=original.base_release_id,
         cutoff=_BASE + timedelta(seconds=150),
+        evidence_snapshot_idempotency_key="snapshot-ties",
     )
 
     decision = policy.run_local_update_policy_v1("feedback_latest", value)
