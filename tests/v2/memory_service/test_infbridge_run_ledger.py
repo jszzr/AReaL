@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import sqlite3
 import sys
 from dataclasses import replace
@@ -26,6 +27,7 @@ from examples.memory_service.infbridge_model_adapter import (
 )
 from examples.memory_service.infbridge_run_ledger import (
     RunLedgerError,
+    RunLedgerSessionV1,
     RunLedgerSlotSnapshotV1,
     RunLedgerSnapshotV1,
     initialize_run_ledger,
@@ -460,7 +462,7 @@ async def test_success_artifacts_cannot_be_reassigned_to_another_slot(
             tokenizer,
             envelope,
             bridge,
-        ).submit(0, envelope.call_plans[0].arm)
+        ).submit(1, envelope.call_plans[1].arm)
     finally:
         bridge._send_request = original_send
     receipt_bytes = audited_model_call_receipt_v2_bytes(source_execution.receipt)
@@ -469,7 +471,7 @@ async def test_success_artifacts_cannot_be_reassigned_to_another_slot(
         source_execution.response_evidence
     )
     decoded_response_utf8 = source_execution.response.encode("utf-8")
-    target = snapshot.slots[1]
+    target = snapshot.slots[0]
     leaf_sha256 = ledger_module._slot_leaf_sha256(
         slot_index=target.plan.slot_index,
         plan_sha256=target.plan_sha256,
@@ -486,7 +488,7 @@ async def test_success_artifacts_cannot_be_reassigned_to_another_slot(
         connection.execute(
             "UPDATE run_ledger_slots SET state = 'SUCCEEDED', attempt_count = 1, "
             "receipt_bytes = ?, trace_bytes = ?, response_evidence_bytes = ?, "
-            "decoded_response_utf8 = ?, leaf_sha256 = ? WHERE slot_index = 1",
+            "decoded_response_utf8 = ?, leaf_sha256 = ? WHERE slot_index = 0",
             (
                 sqlite3.Binary(receipt_bytes),
                 sqlite3.Binary(trace_bytes),
@@ -578,6 +580,303 @@ def test_loader_accepts_legal_indeterminate_seal_with_planned_suffix(
     assert loaded.stored_run_root_sha256 == expected_root
     assert loaded.computed_run_root_sha256 == expected_root
     assert loaded.slots[0].state == "INDETERMINATE"
+
+
+def test_session_precommits_started_then_records_fixed_slot_prefix(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "session-attrition.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    for slot_index in range(2):
+        started = session.mark_started(slot_index)
+        assert started.slots[slot_index].state == "STARTED"
+        if slot_index == 0:
+            connection = _connect_raw(database_path)
+            try:
+                assert connection.execute(
+                    "SELECT state, attempt_count FROM run_ledger_slots "
+                    "WHERE slot_index = 0"
+                ).fetchone() == ("STARTED", 1)
+            finally:
+                connection.close()
+        terminal = session.record_attrition(slot_index, "generation_failure")
+        assert terminal.slots[slot_index].state == "ATTRITION"
+    session.mark_started(2)
+    sealed = session.seal_indeterminate(2, "unexpected_failure")
+
+    assert sealed.status == "SEALED"
+    assert sealed.seal_kind == "indeterminate"
+    assert sealed.stored_run_root_sha256 == sealed.computed_run_root_sha256
+    assert [slot.state for slot in sealed.slots[:3]] == [
+        "ATTRITION",
+        "ATTRITION",
+        "INDETERMINATE",
+    ]
+    assert all(slot.state == "PLANNED" for slot in sealed.slots[3:])
+    assert (
+        RunLedgerSessionV1.resume(
+            database_path,
+            manifest,
+            tokenizer,
+            envelope,
+        ).snapshot
+        == sealed
+    )
+
+
+def test_session_seals_lost_started_only_at_current_cursor(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "lost-started.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+
+    with pytest.raises(RunLedgerError) as invalid_error:
+        session.seal_after_lost_started(1)
+    _assert_reason(invalid_error, "ledger_state")
+    sealed = session.seal_after_lost_started(0)
+
+    assert sealed.status == "SEALED"
+    assert sealed.seal_kind == "indeterminate"
+    assert sealed.slots[0].state == "INDETERMINATE"
+    assert sealed.slots[0].attempt_count == 1
+    assert sealed.slots[0].terminal_reason == "started_record_lost"
+    assert load_run_ledger(database_path, manifest, tokenizer, envelope) == sealed
+
+
+def test_session_refresh_rejects_path_replacement_without_mutating_snapshot(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "pinned.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    before = session.snapshot
+    initialize_run_ledger(replacement_path, manifest, tokenizer, envelope)
+    os.replace(replacement_path, database_path)
+
+    with pytest.raises(RunLedgerError) as error:
+        session.refresh()
+
+    _assert_reason(error, "ledger_path")
+    assert session.snapshot is before
+
+
+def test_session_refresh_classifies_unlinked_pinned_file_as_path_failure(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "unlinked.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    before = session.snapshot
+    database_path.unlink()
+
+    with pytest.raises(RunLedgerError) as error:
+        session.refresh()
+
+    _assert_reason(error, "ledger_path")
+    assert session.snapshot is before
+
+
+def test_session_checks_pinned_inode_after_commit(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "commit-pinned.sqlite3"
+    replacement_path = tmp_path / "commit-replacement.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    before = session.snapshot
+    initialize_run_ledger(replacement_path, manifest, tokenizer, envelope)
+    original = ledger_module._require_private_regular_database
+    target = str(database_path)
+    target_calls = 0
+
+    def replace_after_commit(path: str) -> tuple[int, int]:
+        nonlocal target_calls
+        if path == target:
+            target_calls += 1
+            if target_calls == 3:
+                os.replace(replacement_path, database_path)
+        return original(path)
+
+    monkeypatch.setattr(
+        ledger_module,
+        "_require_private_regular_database",
+        replace_after_commit,
+    )
+    with pytest.raises(RunLedgerError) as error:
+        session.mark_started(0)
+
+    _assert_reason(error, "ledger_path")
+    assert target_calls == 3
+    assert session.snapshot is before
+    current = load_run_ledger(database_path, manifest, tokenizer, envelope)
+    assert current.slots[0].state == "PLANNED"
+
+
+def test_final_seal_compares_every_disk_slot_with_session_snapshot(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    session = RunLedgerSessionV1.create(
+        tmp_path / "final-seal-drift.sqlite3",
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    fake_slots = tuple(
+        replace(
+            slot,
+            state="ATTRITION",
+            attempt_count=1,
+            terminal_reason="generation_failure",
+        )
+        for slot in session.snapshot.slots
+    )
+    session._snapshot = replace(session.snapshot, slots=fake_slots)
+
+    with pytest.raises(RunLedgerError) as error:
+        session.seal_complete()
+
+    _assert_reason(error, "ledger_state")
+
+
+def test_indeterminate_seal_validates_non_target_slots(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, _bridge = ledger_inputs
+    database_path = tmp_path / "indeterminate-drift.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    session.mark_started(0)
+    connection = _connect_raw(database_path)
+    try:
+        connection.execute(
+            "UPDATE run_ledger_slots SET leaf_sha256 = ? WHERE slot_index = 1",
+            ("0" * 64,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RunLedgerError) as error:
+        session.seal_indeterminate(0, "unexpected_failure")
+
+    _assert_reason(error, "ledger_corruption")
+
+
+@pytest.mark.asyncio
+async def test_session_persists_one_valid_success_before_indeterminate_seal(
+    tmp_path: Path,
+    ledger_inputs: tuple[
+        helpfulness.ModelRunManifest,
+        _LedgerByteTokenizer,
+        RunEnvelopeV2,
+        InfBridge,
+    ],
+) -> None:
+    manifest, tokenizer, envelope, bridge = ledger_inputs
+    database_path = tmp_path / "session-success.sqlite3"
+    session = RunLedgerSessionV1.create(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    session.mark_started(0)
+    original_send = bridge._send_request
+    bridge._send_request = AsyncMock(return_value=_sglang_response(b"ANSWER"))
+    try:
+        execution = await InfBridgeModelAdapter(
+            manifest,
+            tokenizer,
+            envelope,
+            bridge,
+        ).submit(0, envelope.call_plans[0].arm)
+    finally:
+        bridge._send_request = original_send
+    success = session.record_success(0, execution)
+    assert success.slots[0].state == "SUCCEEDED"
+    session.mark_started(1)
+    sealed = session.seal_indeterminate(1, "unexpected_failure")
+
+    assert sealed.status == "SEALED"
+    assert sealed.slots[0].state == "SUCCEEDED"
+    assert sealed.slots[1].state == "INDETERMINATE"
+    assert load_run_ledger(database_path, manifest, tokenizer, envelope) == sealed
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,10 @@ and ordered run-root calculation.  The single-cursor runner is layered above
 it in a later stage.  Hashes detect accidental corruption and bind exported
 artifacts; without an externally published signature or MAC, they do not
 protect against an adversary who can rewrite the database and recompute hashes.
+The inode checks fail closed on ordinary path replacement during one session;
+they do not defend against malicious ABA replacement or restoration of an old,
+otherwise valid database.  Preventing rollback needs an external monotonic
+anchor or an idempotent remote request registry.
 """
 
 from __future__ import annotations
@@ -20,28 +24,35 @@ import os
 import re
 import sqlite3
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from examples.memory_service import scoped_codebook_eval as helpfulness
 from examples.memory_service.infbridge_model_adapter import (
     AuditedDecoderTokenizer,
+    AuditedModelCallExecutionV2,
     CallPlanV2,
     RunEnvelopeV2,
     audited_model_call_execution_v2_from_artifacts,
+    audited_model_call_receipt_v2_bytes,
     infbridge_run_envelope_v2_bytes,
     infbridge_run_envelope_v2_from_bytes,
     infbridge_run_envelope_v2_sha256,
     validate_infbridge_run_envelope_v2,
 )
 
+from areal.v2.inference_service.client_trace import (
+    generation_physical_trace_bytes,
+    generation_response_evidence_bytes,
+)
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
 __all__ = [
     "RunLedgerError",
     "RunLedgerSlotSnapshotV1",
     "RunLedgerSnapshotV1",
+    "RunLedgerSessionV1",
     "initialize_run_ledger",
     "load_run_ledger",
 ]
@@ -133,9 +144,12 @@ _ATTRITION_REASONS = frozenset(
 )
 _INDETERMINATE_REASONS = frozenset(
     {
+        "artifact_validation_failure",
         "commit_ambiguous",
         "orphan_started",
         "runner_cancelled",
+        "started_record_lost",
+        "terminal_persistence_failure",
         "unexpected_failure",
     }
 )
@@ -278,6 +292,10 @@ _SLOT_SELECT = """SELECT slot_index, case_index, arm, request_id,
 plan_bytes, plan_sha256, state, attempt_count, receipt_bytes, trace_bytes,
 response_evidence_bytes, decoded_response_utf8, terminal_reason, leaf_sha256
 FROM run_ledger_slots ORDER BY slot_index"""
+_SLOT_SELECT_BY_INDEX = """SELECT slot_index, case_index, arm, request_id,
+plan_bytes, plan_sha256, state, attempt_count, receipt_bytes, trace_bytes,
+response_evidence_bytes, decoded_response_utf8, terminal_reason, leaf_sha256
+FROM run_ledger_slots WHERE slot_index = ?"""
 _SLOT_LENGTH_SELECT = """SELECT slot_index, length(plan_bytes),
 coalesce(length(receipt_bytes), 0), coalesce(length(trace_bytes), 0),
 coalesce(length(response_evidence_bytes), 0),
@@ -469,9 +487,8 @@ def _snapshot_database_path(database_path: str | os.PathLike[str]) -> str:
         raise RunLedgerError("ledger_path") from error
     absolute = os.path.abspath(path)
     parent = os.path.dirname(absolute)
-    if os.path.realpath(parent) != parent:
-        raise RunLedgerError("ledger_path")
-    return absolute
+    canonical_parent = os.path.realpath(parent)
+    return os.path.join(canonical_parent, os.path.basename(absolute))
 
 
 def _require_private_regular_database(path: str) -> tuple[int, int]:
@@ -485,9 +502,23 @@ def _require_private_regular_database(path: str) -> tuple[int, int]:
         not stat.S_ISREG(file_stat.st_mode)
         or file_stat.st_nlink != 1
         or file_stat.st_mode & 0o077
+        or (hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid())
     ):
         raise RunLedgerError("ledger_path")
     return file_stat.st_dev, file_stat.st_ino
+
+
+def _require_expected_database(
+    path: str,
+    expected_file_identity: tuple[int, int],
+) -> tuple[int, int]:
+    try:
+        observed = _require_private_regular_database(path)
+    except RunLedgerError as error:
+        raise RunLedgerError("ledger_path") from error
+    if observed != expected_file_identity:
+        raise RunLedgerError("ledger_path")
+    return observed
 
 
 def _fsync_parent_directory(path: str) -> None:
@@ -517,6 +548,7 @@ def _create_private_database_file(path: str) -> tuple[int, int]:
             not stat.S_ISREG(file_stat.st_mode)
             or file_stat.st_nlink != 1
             or file_stat.st_mode & 0o077
+            or (hasattr(os, "geteuid") and file_stat.st_uid != os.geteuid())
         ):
             raise RunLedgerError("ledger_path")
         os.fsync(file_descriptor)
@@ -524,8 +556,7 @@ def _create_private_database_file(path: str) -> tuple[int, int]:
     finally:
         os.close(file_descriptor)
     _fsync_parent_directory(path)
-    if _require_private_regular_database(path) != identity:
-        raise RunLedgerError("ledger_path")
+    _require_expected_database(path, identity)
     return identity
 
 
@@ -534,6 +565,19 @@ def _strict_text_factory(value: bytes) -> str:
         return value.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise RunLedgerError("ledger_corruption") from error
+
+
+def _sqlite_ledger_error(error: sqlite3.Error) -> RunLedgerError:
+    error_code = getattr(error, "sqlite_errorcode", None)
+    base_code = error_code & 0xFF if type(error_code) is int else None
+    corruption_codes = {
+        getattr(sqlite3, "SQLITE_CORRUPT", -1),
+        getattr(sqlite3, "SQLITE_NOTADB", -1),
+    }
+    reason = (
+        "ledger_corruption" if base_code in corruption_codes else "ledger_persistence"
+    )
+    return RunLedgerError(reason)
 
 
 def _read_integer_pragma(cursor: sqlite3.Cursor, name: str) -> int:
@@ -560,10 +604,18 @@ def _acquire_read_lock(cursor: sqlite3.Cursor) -> None:
         raise RunLedgerError("ledger_schema")
 
 
-def _connect(path: str) -> sqlite3.Connection:
+def _connect(
+    path: str,
+    *,
+    expected_file_identity: tuple[int, int] | None = None,
+) -> sqlite3.Connection:
     if sqlite3.sqlite_version_info < _MIN_SQLITE_VERSION:
         raise RunLedgerError("ledger_schema")
-    expected_file_identity = _require_private_regular_database(path)
+    observed_file_identity = (
+        _require_private_regular_database(path)
+        if expected_file_identity is None
+        else _require_expected_database(path, expected_file_identity)
+    )
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
@@ -572,8 +624,7 @@ def _connect(path: str) -> sqlite3.Connection:
             isolation_level=None,
             uri=True,
         )
-        if _require_private_regular_database(path) != expected_file_identity:
-            raise RunLedgerError("ledger_path")
+        _require_expected_database(path, observed_file_identity)
         connection.text_factory = _strict_text_factory
         cursor = connection.cursor()
         _require_delete_journal(cursor)
@@ -598,7 +649,7 @@ def _connect(path: str) -> sqlite3.Connection:
         if isinstance(error, RunLedgerError):
             raise
         if isinstance(error, sqlite3.Error):
-            raise RunLedgerError("ledger_persistence") from error
+            raise _sqlite_ledger_error(error) from error
         raise
 
 
@@ -606,7 +657,7 @@ def _catalog_rows(cursor: sqlite3.Cursor) -> tuple[tuple[str, str, str, str], ..
     try:
         rows = cursor.execute(_CATALOG_SQL).fetchall()
     except sqlite3.Error as error:
-        raise RunLedgerError("ledger_persistence") from error
+        raise _sqlite_ledger_error(error) from error
     result: list[tuple[str, str, str, str]] = []
     for row in rows:
         if len(row) != 4 or any(type(value) is not str for value in row):
@@ -642,7 +693,11 @@ def _initialize_schema_locked(cursor: sqlite3.Cursor) -> None:
     cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
-def _validate_schema_locked(cursor: sqlite3.Cursor) -> None:
+def _validate_schema_locked(
+    cursor: sqlite3.Cursor,
+    *,
+    full_integrity: bool = True,
+) -> None:
     if (
         _read_integer_pragma(cursor, "application_id") != _APPLICATION_ID
         or _read_integer_pragma(cursor, "user_version") != _SCHEMA_VERSION
@@ -669,10 +724,11 @@ def _validate_schema_locked(cursor: sqlite3.Cursor) -> None:
         _EXPECTED_CATALOG_SHA256,
     ):
         raise RunLedgerError("ledger_schema")
-    if cursor.execute("PRAGMA foreign_key_check").fetchall():
-        raise RunLedgerError("ledger_corruption")
-    if cursor.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-        raise RunLedgerError("ledger_corruption")
+    if full_integrity:
+        if cursor.execute("PRAGMA foreign_key_check").fetchall():
+            raise RunLedgerError("ledger_corruption")
+        if cursor.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise RunLedgerError("ledger_corruption")
 
 
 def _initialize_or_validate_schema_locked(
@@ -1100,6 +1156,8 @@ def _close_with_note(
         connection.close()
     except BaseException as close_error:
         if primary_error is None:
+            if isinstance(close_error, sqlite3.Error):
+                raise _sqlite_ledger_error(close_error) from close_error
             raise
         primary_error.add_note(
             "close failed without replacing the primary error: "
@@ -1107,12 +1165,12 @@ def _close_with_note(
         )
 
 
-def initialize_run_ledger(
+def _initialize_run_ledger_snapshot(
     database_path: str | os.PathLike[str],
     manifest: helpfulness.ModelRunManifest,
     tokenizer: AuditedDecoderTokenizer,
     envelope: RunEnvelopeV2,
-) -> RunLedgerSnapshotV1:
+) -> tuple[RunLedgerSnapshotV1, tuple[int, int]]:
     """Exclusively create a new file with all 384 PLANNED slots.
 
     Resumption must call :func:`load_run_ledger`; an existing path is never
@@ -1127,7 +1185,10 @@ def initialize_run_ledger(
     transaction_active = False
     primary_error: BaseException | None = None
     try:
-        connection = _connect(path)
+        connection = _connect(
+            path,
+            expected_file_identity=expected_file_identity,
+        )
         cursor = connection.cursor()
         prelock_page_count = _read_integer_pragma(cursor, "page_count")
         cursor.execute("BEGIN EXCLUSIVE")
@@ -1144,8 +1205,7 @@ def initialize_run_ledger(
         _insert_run_locked(cursor, identity, envelope)
         cursor.execute("COMMIT")
         transaction_active = False
-        if _require_private_regular_database(path) != expected_file_identity:
-            raise RunLedgerError("ledger_path")
+        _require_expected_database(path, expected_file_identity)
     except BaseException as error:
         primary_error = error
         if transaction_active:
@@ -1153,29 +1213,58 @@ def initialize_run_ledger(
         if isinstance(error, RunLedgerError):
             raise
         if isinstance(error, sqlite3.Error):
-            raise RunLedgerError("ledger_persistence") from error
+            raise _sqlite_ledger_error(error) from error
         raise
     finally:
         _close_with_note(connection, primary_error)
-    return load_run_ledger(path, manifest, tokenizer, envelope)
+    snapshot = _load_run_ledger_snapshot(
+        path,
+        manifest,
+        tokenizer,
+        envelope,
+        identity=identity,
+        expected_file_identity=expected_file_identity,
+    )
+    return snapshot, expected_file_identity, identity
 
 
-def load_run_ledger(
+def initialize_run_ledger(
     database_path: str | os.PathLike[str],
     manifest: helpfulness.ModelRunManifest,
     tokenizer: AuditedDecoderTokenizer,
     envelope: RunEnvelopeV2,
 ) -> RunLedgerSnapshotV1:
-    """Load one transactionally consistent snapshot and replay all evidence."""
+    """Exclusively create and return a validated 384-slot ledger."""
 
-    path = _snapshot_database_path(database_path)
-    identity = _run_identity(manifest, tokenizer, envelope)
+    snapshot, _file_identity, _identity = _initialize_run_ledger_snapshot(
+        database_path,
+        manifest,
+        tokenizer,
+        envelope,
+    )
+    return snapshot
+
+
+def _load_run_ledger_snapshot(
+    path: str,
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+    *,
+    identity: _RunIdentity,
+    expected_file_identity: tuple[int, int],
+) -> RunLedgerSnapshotV1:
+    """Load one snapshot while pinning the database path to one inode."""
+
     connection: sqlite3.Connection | None = None
     cursor: sqlite3.Cursor | None = None
     transaction_active = False
     primary_error: BaseException | None = None
     try:
-        connection = _connect(path)
+        connection = _connect(
+            path,
+            expected_file_identity=expected_file_identity,
+        )
         cursor = connection.cursor()
         cursor.execute("BEGIN")
         transaction_active = True
@@ -1191,6 +1280,7 @@ def load_run_ledger(
         )
         cursor.execute("COMMIT")
         transaction_active = False
+        _require_expected_database(path, expected_file_identity)
         return snapshot
     except BaseException as error:
         primary_error = error
@@ -1199,7 +1289,592 @@ def load_run_ledger(
         if isinstance(error, RunLedgerError):
             raise
         if isinstance(error, sqlite3.Error):
-            raise RunLedgerError("ledger_persistence") from error
+            raise _sqlite_ledger_error(error) from error
         raise
     finally:
         _close_with_note(connection, primary_error)
+
+
+def load_run_ledger(
+    database_path: str | os.PathLike[str],
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+) -> RunLedgerSnapshotV1:
+    """Load one transactionally consistent snapshot and replay all evidence."""
+
+    path = _snapshot_database_path(database_path)
+    file_identity = _require_private_regular_database(path)
+    identity = _run_identity(manifest, tokenizer, envelope)
+    return _load_run_ledger_snapshot(
+        path,
+        manifest,
+        tokenizer,
+        envelope,
+        identity=identity,
+        expected_file_identity=file_identity,
+    )
+
+
+def _sql_blob(value: bytes | None) -> sqlite3.Binary | None:
+    return None if value is None else sqlite3.Binary(value)
+
+
+def _snapshot_artifact_bytes(snapshot: RunLedgerSnapshotV1) -> int:
+    total = 0
+    for slot in snapshot.slots:
+        total += len(_plan_bytes(slot.plan))
+        for value in (
+            slot.receipt_bytes,
+            slot.trace_bytes,
+            slot.response_evidence_bytes,
+            slot.decoded_response_utf8,
+        ):
+            if value is not None:
+                total += len(value)
+    return total
+
+
+class RunLedgerSessionV1:
+    """Trusted single-writer state transitions for one validated run ledger.
+
+    This class relies on the runner holding the companion process lock for its
+    whole lifetime.  SQLite transactions still validate the exact schema,
+    current header, target row, and transition readback on every mutation.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        manifest: helpfulness.ModelRunManifest,
+        tokenizer: AuditedDecoderTokenizer,
+        envelope: RunEnvelopeV2,
+        identity: _RunIdentity,
+        file_identity: tuple[int, int],
+        snapshot: RunLedgerSnapshotV1,
+    ) -> None:
+        self._path = path
+        self._manifest = manifest
+        self._tokenizer = tokenizer
+        self._envelope = envelope
+        self._identity = identity
+        self._file_identity = file_identity
+        self._snapshot = snapshot
+
+    @classmethod
+    def create(
+        cls,
+        database_path: str | os.PathLike[str],
+        manifest: helpfulness.ModelRunManifest,
+        tokenizer: AuditedDecoderTokenizer,
+        envelope: RunEnvelopeV2,
+    ) -> RunLedgerSessionV1:
+        path = _snapshot_database_path(database_path)
+        snapshot, file_identity, identity = _initialize_run_ledger_snapshot(
+            path,
+            manifest,
+            tokenizer,
+            envelope,
+        )
+        return cls(
+            path,
+            manifest,
+            tokenizer,
+            envelope,
+            identity,
+            file_identity,
+            snapshot,
+        )
+
+    @classmethod
+    def resume(
+        cls,
+        database_path: str | os.PathLike[str],
+        manifest: helpfulness.ModelRunManifest,
+        tokenizer: AuditedDecoderTokenizer,
+        envelope: RunEnvelopeV2,
+    ) -> RunLedgerSessionV1:
+        path = _snapshot_database_path(database_path)
+        file_identity = _require_private_regular_database(path)
+        identity = _run_identity(manifest, tokenizer, envelope)
+        snapshot = _load_run_ledger_snapshot(
+            path,
+            manifest,
+            tokenizer,
+            envelope,
+            identity=identity,
+            expected_file_identity=file_identity,
+        )
+        return cls(
+            path,
+            manifest,
+            tokenizer,
+            envelope,
+            identity,
+            file_identity,
+            snapshot,
+        )
+
+    @property
+    def snapshot(self) -> RunLedgerSnapshotV1:
+        return self._snapshot
+
+    @property
+    def database_file_identity(self) -> tuple[int, int]:
+        """Pinned ``(device, inode)`` used by the local run coordinator."""
+
+        return self._file_identity
+
+    def refresh(self) -> RunLedgerSnapshotV1:
+        _require_expected_database(self._path, self._file_identity)
+        snapshot = _load_run_ledger_snapshot(
+            self._path,
+            self._manifest,
+            self._tokenizer,
+            self._envelope,
+            identity=self._identity,
+            expected_file_identity=self._file_identity,
+        )
+        _require_expected_database(self._path, self._file_identity)
+        self._snapshot = snapshot
+        return snapshot
+
+    def _next_snapshot(
+        self,
+        *,
+        changed_slot: RunLedgerSlotSnapshotV1 | None,
+        status: LedgerRunStatus,
+        seal_kind: str | None,
+    ) -> RunLedgerSnapshotV1:
+        slots = list(self._snapshot.slots)
+        if changed_slot is not None:
+            slots[changed_slot.plan.slot_index] = changed_slot
+        frozen_slots = tuple(slots)
+        _validate_slot_sequence(status, seal_kind, frozen_slots)
+        root = _run_root_sha256(
+            run_id=self._identity.run_id,
+            manifest_sha256=self._identity.manifest_sha256,
+            run_envelope_sha256=self._identity.envelope_sha256,
+            status=status,
+            seal_kind=seal_kind,
+            slots=frozen_slots,
+        )
+        snapshot = replace(
+            self._snapshot,
+            status=status,
+            seal_kind=seal_kind,
+            stored_run_root_sha256=root if status == "SEALED" else None,
+            computed_run_root_sha256=root,
+            slots=frozen_slots,
+        )
+        if _snapshot_artifact_bytes(snapshot) > _MAX_TOTAL_SLOT_ARTIFACT_BYTES:
+            raise RunLedgerError("ledger_artifact")
+        return snapshot
+
+    def _commit_snapshot(
+        self,
+        next_snapshot: RunLedgerSnapshotV1,
+        *,
+        changed_slot_index: int | None,
+    ) -> RunLedgerSnapshotV1:
+        connection: sqlite3.Connection | None = None
+        cursor: sqlite3.Cursor | None = None
+        transaction_active = False
+        primary_error: BaseException | None = None
+        try:
+            connection = _connect(
+                self._path,
+                expected_file_identity=self._file_identity,
+            )
+            cursor = connection.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            transaction_active = True
+            _require_delete_journal(cursor)
+            _validate_schema_locked(
+                cursor,
+                full_integrity=next_snapshot.status == "SEALED",
+            )
+            header_rows = cursor.execute(_HEADER_SELECT).fetchall()
+            if len(header_rows) != 1:
+                raise RunLedgerError("ledger_corruption")
+            current_header = _require_header_identity(
+                header_rows[0],
+                self._identity,
+            )
+            if current_header != (
+                self._snapshot.status,
+                self._snapshot.seal_kind,
+                self._snapshot.stored_run_root_sha256,
+            ):
+                raise RunLedgerError("ledger_state")
+            if changed_slot_index is not None:
+                if type(
+                    changed_slot_index
+                ) is not int or changed_slot_index not in range(_CALL_COUNT):
+                    raise RunLedgerError("ledger_state")
+                current_rows = cursor.execute(
+                    _SLOT_SELECT_BY_INDEX,
+                    (changed_slot_index,),
+                ).fetchall()
+                if len(current_rows) != 1:
+                    raise RunLedgerError("ledger_corruption")
+                current_slot = _load_slot(
+                    current_rows[0],
+                    self._envelope.call_plans[changed_slot_index],
+                )
+                if current_slot != self._snapshot.slots[changed_slot_index]:
+                    raise RunLedgerError("ledger_state")
+                next_slot = next_snapshot.slots[changed_slot_index]
+                update = cursor.execute(
+                    "UPDATE run_ledger_slots SET state = ?, attempt_count = ?, "
+                    "receipt_bytes = ?, trace_bytes = ?, response_evidence_bytes = ?, "
+                    "decoded_response_utf8 = ?, terminal_reason = ?, leaf_sha256 = ? "
+                    "WHERE slot_index = ? AND state = ? AND leaf_sha256 = ?",
+                    (
+                        next_slot.state,
+                        next_slot.attempt_count,
+                        _sql_blob(next_slot.receipt_bytes),
+                        _sql_blob(next_slot.trace_bytes),
+                        _sql_blob(next_slot.response_evidence_bytes),
+                        _sql_blob(next_slot.decoded_response_utf8),
+                        next_slot.terminal_reason,
+                        next_slot.leaf_sha256,
+                        changed_slot_index,
+                        current_slot.state,
+                        current_slot.leaf_sha256,
+                    ),
+                )
+                if update.rowcount != 1:
+                    raise RunLedgerError("ledger_state")
+            if next_snapshot.status == "SEALED":
+                _validate_blob_budgets_locked(cursor)
+                current_rows = cursor.execute(_SLOT_SELECT).fetchall()
+                if len(current_rows) != _CALL_COUNT:
+                    raise RunLedgerError("ledger_corruption")
+                current_slots = tuple(
+                    _load_slot(row, self._envelope.call_plans[index])
+                    for index, row in enumerate(current_rows)
+                )
+                if current_slots != next_snapshot.slots:
+                    raise RunLedgerError("ledger_state")
+            if (
+                next_snapshot.status,
+                next_snapshot.seal_kind,
+                next_snapshot.stored_run_root_sha256,
+            ) != current_header:
+                header_update = cursor.execute(
+                    "UPDATE run_ledger_header SET status = ?, seal_kind = ?, "
+                    "run_root_sha256 = ? WHERE singleton = 1 AND status = ?",
+                    (
+                        next_snapshot.status,
+                        next_snapshot.seal_kind,
+                        next_snapshot.stored_run_root_sha256,
+                        self._snapshot.status,
+                    ),
+                )
+                if header_update.rowcount != 1:
+                    raise RunLedgerError("ledger_state")
+            if changed_slot_index is not None:
+                readback_rows = cursor.execute(
+                    _SLOT_SELECT_BY_INDEX,
+                    (changed_slot_index,),
+                ).fetchall()
+                if (
+                    len(readback_rows) != 1
+                    or _load_slot(
+                        readback_rows[0],
+                        self._envelope.call_plans[changed_slot_index],
+                    )
+                    != next_snapshot.slots[changed_slot_index]
+                ):
+                    raise RunLedgerError("ledger_corruption")
+            header_readback = cursor.execute(_HEADER_SELECT).fetchall()
+            if len(header_readback) != 1 or _require_header_identity(
+                header_readback[0],
+                self._identity,
+            ) != (
+                next_snapshot.status,
+                next_snapshot.seal_kind,
+                next_snapshot.stored_run_root_sha256,
+            ):
+                raise RunLedgerError("ledger_corruption")
+            cursor.execute("COMMIT")
+            transaction_active = False
+            _require_expected_database(self._path, self._file_identity)
+            self._snapshot = next_snapshot
+            return next_snapshot
+        except BaseException as error:
+            primary_error = error
+            if transaction_active:
+                _rollback_with_note(cursor, error)
+            if isinstance(error, RunLedgerError):
+                raise
+            if isinstance(error, sqlite3.Error):
+                raise _sqlite_ledger_error(error) from error
+            raise
+        finally:
+            _close_with_note(connection, primary_error)
+
+    def mark_started(self, slot_index: int) -> RunLedgerSnapshotV1:
+        if self._snapshot.status != "OPEN" or type(slot_index) is not int:
+            raise RunLedgerError("ledger_state")
+        planned_indexes = tuple(
+            slot.plan.slot_index
+            for slot in self._snapshot.slots
+            if slot.state == "PLANNED"
+        )
+        if (
+            not planned_indexes
+            or planned_indexes[0] != slot_index
+            or any(slot.state == "STARTED" for slot in self._snapshot.slots)
+        ):
+            raise RunLedgerError("ledger_state")
+        current = self._snapshot.slots[slot_index]
+        leaf = _slot_leaf_sha256(
+            slot_index=slot_index,
+            plan_sha256=current.plan_sha256,
+            state="STARTED",
+            attempt_count=1,
+            receipt_bytes=None,
+            trace_bytes=None,
+            response_evidence_bytes=None,
+            decoded_response_utf8=None,
+            terminal_reason=None,
+        )
+        changed = replace(
+            current,
+            state="STARTED",
+            attempt_count=1,
+            leaf_sha256=leaf,
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=changed,
+                status="OPEN",
+                seal_kind=None,
+            ),
+            changed_slot_index=slot_index,
+        )
+
+    def record_success(
+        self,
+        slot_index: int,
+        execution: AuditedModelCallExecutionV2,
+    ) -> RunLedgerSnapshotV1:
+        if (
+            self._snapshot.status != "OPEN"
+            or type(slot_index) is not int
+            or slot_index not in range(_CALL_COUNT)
+            or self._snapshot.slots[slot_index].state != "STARTED"
+            or type(execution) is not AuditedModelCallExecutionV2
+        ):
+            raise RunLedgerError("ledger_state")
+        try:
+            receipt_bytes = audited_model_call_receipt_v2_bytes(execution.receipt)
+            trace_bytes = generation_physical_trace_bytes(execution.trace)
+            response_evidence_bytes = generation_response_evidence_bytes(
+                execution.response_evidence
+            )
+            decoded_response_utf8 = execution.response.encode("utf-8", errors="strict")
+            reloaded = audited_model_call_execution_v2_from_artifacts(
+                self._manifest,
+                self._tokenizer,
+                self._envelope,
+                receipt_bytes=receipt_bytes,
+                trace_bytes=trace_bytes,
+                response_evidence_bytes=response_evidence_bytes,
+                decoded_response_utf8=decoded_response_utf8,
+                backend=SGLangBridgeBackend(),
+            )
+        except Exception as error:
+            raise RunLedgerError("ledger_artifact") from error
+        current = self._snapshot.slots[slot_index]
+        receipt = reloaded.receipt
+        if (
+            reloaded != execution
+            or receipt.slot_index != slot_index
+            or receipt.case_index != current.plan.case_index
+            or receipt.arm != current.plan.arm
+            or receipt.request_id != current.plan.request_id
+            or len(receipt_bytes) > _MAX_RECEIPT_BYTES
+            or len(trace_bytes) > _MAX_TRACE_BYTES
+            or len(response_evidence_bytes) > _MAX_RESPONSE_EVIDENCE_BYTES
+            or len(decoded_response_utf8) > _MAX_DECODED_RESPONSE_BYTES
+        ):
+            raise RunLedgerError("ledger_artifact")
+        leaf = _slot_leaf_sha256(
+            slot_index=slot_index,
+            plan_sha256=current.plan_sha256,
+            state="SUCCEEDED",
+            attempt_count=1,
+            receipt_bytes=receipt_bytes,
+            trace_bytes=trace_bytes,
+            response_evidence_bytes=response_evidence_bytes,
+            decoded_response_utf8=decoded_response_utf8,
+            terminal_reason=None,
+        )
+        changed = replace(
+            current,
+            state="SUCCEEDED",
+            receipt_bytes=receipt_bytes,
+            trace_bytes=trace_bytes,
+            response_evidence_bytes=response_evidence_bytes,
+            decoded_response_utf8=decoded_response_utf8,
+            leaf_sha256=leaf,
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=changed,
+                status="OPEN",
+                seal_kind=None,
+            ),
+            changed_slot_index=slot_index,
+        )
+
+    def record_attrition(
+        self,
+        slot_index: int,
+        reason: str,
+    ) -> RunLedgerSnapshotV1:
+        if (
+            self._snapshot.status != "OPEN"
+            or type(slot_index) is not int
+            or slot_index not in range(_CALL_COUNT)
+            or self._snapshot.slots[slot_index].state != "STARTED"
+            or reason not in _ATTRITION_REASONS
+        ):
+            raise RunLedgerError("ledger_state")
+        current = self._snapshot.slots[slot_index]
+        leaf = _slot_leaf_sha256(
+            slot_index=slot_index,
+            plan_sha256=current.plan_sha256,
+            state="ATTRITION",
+            attempt_count=1,
+            receipt_bytes=None,
+            trace_bytes=None,
+            response_evidence_bytes=None,
+            decoded_response_utf8=None,
+            terminal_reason=reason,
+        )
+        changed = replace(
+            current,
+            state="ATTRITION",
+            attempt_count=1,
+            terminal_reason=reason,
+            leaf_sha256=leaf,
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=changed,
+                status="OPEN",
+                seal_kind=None,
+            ),
+            changed_slot_index=slot_index,
+        )
+
+    def seal_indeterminate(
+        self,
+        slot_index: int,
+        reason: str,
+    ) -> RunLedgerSnapshotV1:
+        if (
+            self._snapshot.status != "OPEN"
+            or type(slot_index) is not int
+            or slot_index not in range(_CALL_COUNT)
+            or self._snapshot.slots[slot_index].state != "STARTED"
+            or reason not in _INDETERMINATE_REASONS
+        ):
+            raise RunLedgerError("ledger_state")
+        current = self._snapshot.slots[slot_index]
+        leaf = _slot_leaf_sha256(
+            slot_index=slot_index,
+            plan_sha256=current.plan_sha256,
+            state="INDETERMINATE",
+            attempt_count=1,
+            receipt_bytes=None,
+            trace_bytes=None,
+            response_evidence_bytes=None,
+            decoded_response_utf8=None,
+            terminal_reason=reason,
+        )
+        changed = replace(
+            current,
+            state="INDETERMINATE",
+            attempt_count=1,
+            terminal_reason=reason,
+            leaf_sha256=leaf,
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=changed,
+                status="SEALED",
+                seal_kind="indeterminate",
+            ),
+            changed_slot_index=slot_index,
+        )
+
+    def seal_after_lost_started(self, slot_index: int) -> RunLedgerSnapshotV1:
+        """Fail closed if a post-call readback has regressed to PLANNED."""
+
+        planned_indexes = tuple(
+            slot.plan.slot_index
+            for slot in self._snapshot.slots
+            if slot.state == "PLANNED"
+        )
+        if (
+            self._snapshot.status != "OPEN"
+            or type(slot_index) is not int
+            or slot_index not in range(_CALL_COUNT)
+            or self._snapshot.slots[slot_index].state != "PLANNED"
+            or not planned_indexes
+            or planned_indexes[0] != slot_index
+            or any(slot.state == "STARTED" for slot in self._snapshot.slots)
+        ):
+            raise RunLedgerError("ledger_state")
+        current = self._snapshot.slots[slot_index]
+        leaf = _slot_leaf_sha256(
+            slot_index=slot_index,
+            plan_sha256=current.plan_sha256,
+            state="INDETERMINATE",
+            attempt_count=1,
+            receipt_bytes=None,
+            trace_bytes=None,
+            response_evidence_bytes=None,
+            decoded_response_utf8=None,
+            terminal_reason="started_record_lost",
+        )
+        changed = replace(
+            current,
+            state="INDETERMINATE",
+            attempt_count=1,
+            terminal_reason="started_record_lost",
+            leaf_sha256=leaf,
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=changed,
+                status="SEALED",
+                seal_kind="indeterminate",
+            ),
+            changed_slot_index=slot_index,
+        )
+
+    def seal_complete(self) -> RunLedgerSnapshotV1:
+        if self._snapshot.status != "OPEN" or any(
+            slot.state not in ("SUCCEEDED", "ATTRITION")
+            for slot in self._snapshot.slots
+        ):
+            raise RunLedgerError("ledger_state")
+        seal_kind = (
+            "complete_with_attrition"
+            if any(slot.state == "ATTRITION" for slot in self._snapshot.slots)
+            else "complete"
+        )
+        return self._commit_snapshot(
+            self._next_snapshot(
+                changed_slot=None,
+                status="SEALED",
+                seal_kind=seal_kind,
+            ),
+            changed_slot_index=None,
+        )
