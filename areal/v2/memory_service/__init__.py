@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public contracts for immutable Memory Service evidence, history, and releases."""
+"""Public contracts for immutable evidence, snapshots, history, and releases."""
 
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
     CandidateNotFoundError,
     EvidenceConflictError,
     EvidenceNotFoundError,
+    EvidenceSnapshotConflictError,
+    EvidenceSnapshotNotFoundError,
     MemoryServiceError,
     ReleaseConflictError,
     ReleaseNotFoundError,
@@ -29,7 +31,17 @@ from areal.v2.memory_service.release_store import (
     MemoryReleaseStore,
 )
 from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
-from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
+from areal.v2.memory_service.snapshot_types import (
+    EVIDENCE_SNAPSHOT_ORDERING_POLICY,
+    EvidenceSnapshot,
+    EvidenceSnapshotMember,
+    EvidenceSnapshotSpec,
+)
+from areal.v2.memory_service.store import (
+    EvidenceSnapshotStore,
+    EvidenceStore,
+    InMemoryEvidenceStore,
+)
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -41,11 +53,18 @@ __all__ = [
     "CandidateConflictError",
     "CandidateNotFoundError",
     "CandidateProposal",
+    "EVIDENCE_SNAPSHOT_ORDERING_POLICY",
     "EvidenceConflictError",
     "EvidenceEvent",
     "EvidenceKind",
     "EvidenceNotFoundError",
     "EvidenceRecord",
+    "EvidenceSnapshot",
+    "EvidenceSnapshotConflictError",
+    "EvidenceSnapshotMember",
+    "EvidenceSnapshotNotFoundError",
+    "EvidenceSnapshotSpec",
+    "EvidenceSnapshotStore",
     "EvidenceStore",
     "InMemoryEvidenceStore",
     "InMemoryMemoryHistoryStore",

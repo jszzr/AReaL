@@ -244,17 +244,24 @@ def test_public_module_exports_stable_memory_contracts() -> None:
     )
 
     assert memory_service.__doc__ == (
-        "Public contracts for immutable Memory Service evidence, history, and releases."
+        "Public contracts for immutable evidence, snapshots, history, and releases."
     )
     assert memory_service.__all__ == [
         "CandidateConflictError",
         "CandidateNotFoundError",
         "CandidateProposal",
+        "EVIDENCE_SNAPSHOT_ORDERING_POLICY",
         "EvidenceConflictError",
         "EvidenceEvent",
         "EvidenceKind",
         "EvidenceNotFoundError",
         "EvidenceRecord",
+        "EvidenceSnapshot",
+        "EvidenceSnapshotConflictError",
+        "EvidenceSnapshotMember",
+        "EvidenceSnapshotNotFoundError",
+        "EvidenceSnapshotSpec",
+        "EvidenceSnapshotStore",
         "EvidenceStore",
         "InMemoryEvidenceStore",
         "InMemoryMemoryHistoryStore",

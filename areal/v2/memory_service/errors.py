@@ -17,6 +17,14 @@ class EvidenceConflictError(MemoryServiceError):
     """Raised when evidence conflicts with an existing immutable record."""
 
 
+class EvidenceSnapshotNotFoundError(MemoryServiceError):
+    """Raised when an evidence snapshot is unavailable in the requested scope."""
+
+
+class EvidenceSnapshotConflictError(MemoryServiceError):
+    """Raised when an evidence snapshot conflicts with an immutable seal."""
+
+
 class CandidateNotFoundError(MemoryServiceError):
     """Raised when a candidate is unavailable in the requested scope."""
 

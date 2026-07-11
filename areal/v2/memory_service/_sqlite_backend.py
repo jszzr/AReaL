@@ -10,6 +10,7 @@ import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Literal
 
 from areal.v2.memory_service.errors import (
@@ -21,7 +22,8 @@ from areal.v2.memory_service.errors import (
 from areal.v2.memory_service.types import MemoryScope
 
 _APPLICATION_ID = 1095912787
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SCHEMA_V1_VERSION = 1
 _MIN_SQLITE_VERSION = (3, 7, 17)
 _BUSY_TIMEOUT_MS = 5000
 _MAX_SIGNED_64 = 2**63 - 1
@@ -29,7 +31,7 @@ _MAX_SIGNED_64 = 2**63 - 1
 _SCHEMA_SHA256 = hashlib.sha256
 _RECORD_SHA256 = hashlib.sha256
 
-_SCHEMA_DDL = (
+_SCHEMA_V1_DDL = (
     """CREATE TABLE memory_schema_metadata (
     singleton INTEGER NOT NULL PRIMARY KEY
         CHECK (typeof(singleton) = 'integer') CHECK (singleton = 1),
@@ -187,7 +189,63 @@ _SCHEMA_DDL = (
 )""",
 )
 
-_REQUIRED_TABLES = frozenset(
+_SCHEMA_V2_ADDITIONS = (
+    """CREATE TABLE memory_evidence_ingest_orders (
+    ingest_order INTEGER NOT NULL PRIMARY KEY CHECK (typeof(ingest_order) = 'integer')
+        CHECK (ingest_order BETWEEN 0 AND 9223372036854775807),
+    scope_id INTEGER NOT NULL CHECK (typeof(scope_id) = 'integer'),
+    evidence_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(evidence_id) = 'text'),
+    binding_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(binding_hash) = 'text') CHECK (length(binding_hash) = 64),
+    UNIQUE (scope_id, evidence_id),
+    UNIQUE (scope_id, evidence_id, ingest_order),
+    FOREIGN KEY (scope_id, evidence_id)
+        REFERENCES memory_evidence (scope_id, evidence_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE TABLE memory_evidence_snapshots (
+    scope_id INTEGER NOT NULL CHECK (typeof(scope_id) = 'integer'),
+    snapshot_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(snapshot_id) = 'text'),
+    canonical BLOB NOT NULL CHECK (typeof(canonical) = 'blob'),
+    content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(content_hash) = 'text') CHECK (length(content_hash) = 64),
+    created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text'),
+    storage_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(storage_hash) = 'text') CHECK (length(storage_hash) = 64),
+    allowed_kinds_canonical BLOB NOT NULL
+        CHECK (typeof(allowed_kinds_canonical) = 'blob'),
+    cutoff_utc TEXT NOT NULL COLLATE BINARY CHECK (typeof(cutoff_utc) = 'text'),
+    evidence_high_watermark INTEGER NOT NULL
+        CHECK (typeof(evidence_high_watermark) = 'integer')
+        CHECK (evidence_high_watermark BETWEEN -1 AND 9223372036854775807),
+    ordering_policy TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(ordering_policy) = 'text'),
+    member_count INTEGER NOT NULL CHECK (typeof(member_count) = 'integer')
+        CHECK (member_count BETWEEN 0 AND 9223372036854775807),
+    PRIMARY KEY (scope_id, snapshot_id),
+    FOREIGN KEY (scope_id) REFERENCES memory_scopes (scope_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE TABLE memory_evidence_snapshot_aliases (
+    scope_id INTEGER NOT NULL CHECK (typeof(scope_id) = 'integer'),
+    idempotency_key TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(idempotency_key) = 'text'),
+    snapshot_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(snapshot_id) = 'text'),
+    binding_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(binding_hash) = 'text') CHECK (length(binding_hash) = 64),
+    PRIMARY KEY (scope_id, idempotency_key),
+    FOREIGN KEY (scope_id, snapshot_id)
+        REFERENCES memory_evidence_snapshots (scope_id, snapshot_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE INDEX idx_memory_evidence_ingest_scope ON memory_evidence_ingest_orders (
+    scope_id, ingest_order
+)""",
+)
+
+_SCHEMA_DDL = _SCHEMA_V1_DDL + _SCHEMA_V2_ADDITIONS
+
+_V1_REQUIRED_TABLES = frozenset(
     {
         "memory_schema_metadata",
         "memory_scopes",
@@ -200,7 +258,19 @@ _REQUIRED_TABLES = frozenset(
         "memory_release_revisions",
     }
 )
-_REQUIRED_INDEXES = frozenset({"idx_memory_evidence_sort", "idx_memory_revisions_sort"})
+_V1_REQUIRED_INDEXES = frozenset(
+    {"idx_memory_evidence_sort", "idx_memory_revisions_sort"}
+)
+_REQUIRED_TABLES = _V1_REQUIRED_TABLES | frozenset(
+    {
+        "memory_evidence_ingest_orders",
+        "memory_evidence_snapshots",
+        "memory_evidence_snapshot_aliases",
+    }
+)
+_REQUIRED_INDEXES = _V1_REQUIRED_INDEXES | frozenset(
+    {"idx_memory_evidence_ingest_scope"}
+)
 
 _CATALOG_SQL = """SELECT type, name, tbl_name, sql
 FROM main.sqlite_master
@@ -219,11 +289,16 @@ def _compact_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _schema_spec_digest() -> str:
-    return _SCHEMA_SHA256(_compact_json_bytes(_SCHEMA_DDL)).hexdigest()
+def _schema_spec_digest(ddl: tuple[str, ...] = _SCHEMA_DDL) -> str:
+    return _SCHEMA_SHA256(_compact_json_bytes(ddl)).hexdigest()
 
 
-_SCHEMA_SPEC_HASH = _schema_spec_digest()
+_SCHEMA_V1_SPEC_HASH = (
+    "445a839fb37b9db29842f018f75887debcbb96997a1391b73068ea23e2f355c0"
+)
+_SCHEMA_SPEC_HASH = (
+    "28ce8fc78297c4d4b046ccd7be272b5d4de7318005fe277c8383f44e83ea9a0a"
+)
 
 
 def _snapshot_database_path(database_path: str | os.PathLike[str]) -> str:
@@ -356,7 +431,7 @@ def _read_integer_pragma(cursor: sqlite3.Cursor, pragma: str) -> int:
     return row[0]
 
 
-def _initialize_v1_locked(cursor: sqlite3.Cursor) -> None:
+def _initialize_v2_locked(cursor: sqlite3.Cursor) -> None:
     for statement in _SCHEMA_DDL:
         cursor.execute(statement)
     catalog_hash = _catalog_hash(cursor)
@@ -367,23 +442,31 @@ def _initialize_v1_locked(cursor: sqlite3.Cursor) -> None:
     )
     cursor.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
     cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-    _validate_v1_locked(cursor)
+    _validate_v2_locked(cursor)
 
 
-def _validate_v1_locked(cursor: sqlite3.Cursor) -> None:
+def _validate_schema_locked(
+    cursor: sqlite3.Cursor,
+    *,
+    version: int,
+    ddl: tuple[str, ...],
+    spec_hash: str,
+    required_tables: frozenset[str],
+    required_indexes: frozenset[str],
+) -> None:
     application_id = _read_integer_pragma(cursor, "application_id")
     if application_id != _APPLICATION_ID:
         raise MemoryPersistenceSchemaError(
             "SQLite application_id does not identify a Memory Service database"
         )
     user_version = _read_integer_pragma(cursor, "user_version")
-    if user_version != _SCHEMA_VERSION:
+    if user_version != version:
         raise MemoryPersistenceSchemaError(
             f"unsupported Memory Service SQLite user_version {user_version}"
         )
 
-    current_spec_hash = _schema_spec_digest()
-    if current_spec_hash != _SCHEMA_SPEC_HASH:
+    current_spec_hash = _schema_spec_digest(ddl)
+    if current_spec_hash != spec_hash:
         raise MemoryPersistenceSchemaError(
             "compiled Memory Service schema specification hash changed"
         )
@@ -394,12 +477,12 @@ def _validate_v1_locked(cursor: sqlite3.Cursor) -> None:
         name for kind, name, _table_name, _sql in catalog_rows if kind == "index"
     }
     if (
-        tables != _REQUIRED_TABLES
-        or indexes != _REQUIRED_INDEXES
-        or len(catalog_rows) != len(_REQUIRED_TABLES) + len(_REQUIRED_INDEXES)
+        tables != required_tables
+        or indexes != required_indexes
+        or len(catalog_rows) != len(required_tables) + len(required_indexes)
     ):
         raise MemoryPersistenceSchemaError(
-            "Memory Service SQLite schema catalog does not match version 1"
+            f"Memory Service SQLite schema catalog does not match version {version}"
         )
 
     metadata_rows = cursor.execute("SELECT * FROM memory_schema_metadata").fetchall()
@@ -408,7 +491,7 @@ def _validate_v1_locked(cursor: sqlite3.Cursor) -> None:
             "Memory Service SQLite schema metadata must contain one row"
         )
     singleton, stored_spec_hash, stored_catalog_hash = metadata_rows[0]
-    if singleton != 1 or stored_spec_hash != _SCHEMA_SPEC_HASH:
+    if singleton != 1 or stored_spec_hash != spec_hash:
         raise MemoryPersistenceSchemaError(
             "Memory Service schema specification metadata does not match"
         )
@@ -423,6 +506,171 @@ def _validate_v1_locked(cursor: sqlite3.Cursor) -> None:
         )
 
 
+def _validate_v1_locked(cursor: sqlite3.Cursor) -> None:
+    _validate_schema_locked(
+        cursor,
+        version=_SCHEMA_V1_VERSION,
+        ddl=_SCHEMA_V1_DDL,
+        spec_hash=_SCHEMA_V1_SPEC_HASH,
+        required_tables=_V1_REQUIRED_TABLES,
+        required_indexes=_V1_REQUIRED_INDEXES,
+    )
+
+
+def _validate_ingest_orders_locked(cursor: sqlite3.Cursor) -> None:
+    evidence_rows = cursor.execute(
+        "SELECT scope_id, evidence_id FROM memory_evidence"
+    ).fetchall()
+    ingest_rows = cursor.execute(
+        "SELECT ingest_order, scope_id, evidence_id, binding_hash "
+        "FROM memory_evidence_ingest_orders ORDER BY ingest_order"
+    ).fetchall()
+    if any(
+        len(row) != 2 or type(row[0]) is not int or type(row[1]) is not str
+        for row in evidence_rows
+    ) or any(
+        len(row) != 4
+        or type(row[0]) is not int
+        or not 0 <= row[0] <= _MAX_SIGNED_64
+        or type(row[1]) is not int
+        or type(row[2]) is not str
+        or type(row[3]) is not str
+        for row in ingest_rows
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "evidence ingest-order rows have invalid storage classes"
+        )
+    evidence_addresses = {(row[0], row[1]) for row in evidence_rows}
+    ingest_addresses = {(row[1], row[2]) for row in ingest_rows}
+    ingest_orders = tuple(row[0] for row in ingest_rows)
+    if (
+        evidence_addresses != ingest_addresses
+        or len(evidence_addresses) != len(evidence_rows)
+        or len(ingest_addresses) != len(ingest_rows)
+        or ingest_orders != tuple(range(len(ingest_rows)))
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "evidence ingest-order mapping is incomplete or non-contiguous"
+        )
+    scope_rows = cursor.execute(
+        "SELECT scope_id, tenant_id, namespace, subject_id FROM memory_scopes"
+    ).fetchall()
+    scopes: dict[int, MemoryScope] = {}
+    for row in scope_rows:
+        if (
+            len(row) != 4
+            or type(row[0]) is not int
+            or any(type(value) is not str for value in row[1:])
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence ingest-order scope has invalid storage classes"
+            )
+        try:
+            scopes[row[0]] = MemoryScope(
+                tenant_id=row[1],
+                namespace=row[2],
+                subject_id=row[3],
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "evidence ingest-order scope failed public validation"
+            ) from error
+    for ingest_order, scope_id, evidence_id, binding_hash in ingest_rows:
+        scope = scopes.get(scope_id)
+        if scope is None or binding_hash != _evidence_ingest_binding_hash(
+            scope=scope,
+            evidence_id=evidence_id,
+            ingest_order=ingest_order,
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence ingest-order binding hash is invalid"
+            )
+
+
+def _validate_v2_locked(cursor: sqlite3.Cursor) -> None:
+    _validate_schema_locked(
+        cursor,
+        version=_SCHEMA_VERSION,
+        ddl=_SCHEMA_DDL,
+        spec_hash=_SCHEMA_SPEC_HASH,
+        required_tables=_REQUIRED_TABLES,
+        required_indexes=_REQUIRED_INDEXES,
+    )
+    _validate_ingest_orders_locked(cursor)
+
+
+def _migrate_v1_to_v2_locked(cursor: sqlite3.Cursor) -> None:
+    _validate_v1_locked(cursor)
+    for statement in _SCHEMA_V2_ADDITIONS:
+        cursor.execute(statement)
+    rows = cursor.execute(
+        "SELECT scope_id, evidence_id, created_at FROM memory_evidence "
+        "ORDER BY created_at COLLATE BINARY, evidence_id COLLATE BINARY, scope_id"
+    ).fetchall()
+    for ingest_order, row in enumerate(rows):
+        if (
+            len(row) != 3
+            or type(row[0]) is not int
+            or type(row[1]) is not str
+            or type(row[2]) is not str
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "v1 evidence addresses cannot be migrated"
+            )
+        scope_id, evidence_id, created_at_text = row
+        try:
+            created_at = datetime.fromisoformat(created_at_text).astimezone(UTC)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "v1 evidence created_at cannot be migrated"
+            ) from error
+        if created_at.isoformat() != created_at_text:
+            raise MemoryPersistenceCorruptionError(
+                "v1 evidence created_at is not canonical UTC text"
+            )
+        scope_row = cursor.execute(
+            "SELECT tenant_id, namespace, subject_id FROM memory_scopes "
+            "WHERE scope_id = ?",
+            (scope_id,),
+        ).fetchone()
+        if (
+            scope_row is None
+            or len(scope_row) != 3
+            or any(type(value) is not str for value in scope_row)
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "v1 evidence scope cannot be migrated"
+            )
+        try:
+            scope = MemoryScope(
+                tenant_id=scope_row[0],
+                namespace=scope_row[1],
+                subject_id=scope_row[2],
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "v1 evidence scope failed public validation"
+            ) from error
+        binding_hash = _evidence_ingest_binding_hash(
+            scope=scope,
+            evidence_id=evidence_id,
+            ingest_order=ingest_order,
+        )
+        cursor.execute(
+            "INSERT INTO memory_evidence_ingest_orders "
+            "(ingest_order, scope_id, evidence_id, binding_hash) "
+            "VALUES (?, ?, ?, ?)",
+            (ingest_order, scope_id, evidence_id, binding_hash),
+        )
+    cursor.execute(
+        "UPDATE memory_schema_metadata SET schema_spec_hash = ?, "
+        "schema_catalog_hash = ? WHERE singleton = 1",
+        (_SCHEMA_SPEC_HASH, _catalog_hash(cursor)),
+    )
+    cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    _validate_v2_locked(cursor)
+
+
 def _initialize_or_validate_locked(
     cursor: sqlite3.Cursor,
     prelock_page_count: int,
@@ -433,7 +681,10 @@ def _initialize_or_validate_locked(
     catalog_rows = _catalog_rows(cursor)
 
     if application_id == _APPLICATION_ID and user_version == _SCHEMA_VERSION:
-        _validate_v1_locked(cursor)
+        _validate_v2_locked(cursor)
+        return
+    if application_id == _APPLICATION_ID and user_version == _SCHEMA_V1_VERSION:
+        _migrate_v1_to_v2_locked(cursor)
         return
     if (
         prelock_page_count == 0
@@ -442,7 +693,7 @@ def _initialize_or_validate_locked(
         and internal_schema_version == 0
         and not catalog_rows
     ):
-        _initialize_v1_locked(cursor)
+        _initialize_v2_locked(cursor)
         return
     if application_id not in {0, _APPLICATION_ID}:
         raise MemoryPersistenceSchemaError(
@@ -480,7 +731,7 @@ def _add_cleanup_note(
 
 
 def _initialize_database(path: str) -> None:
-    """Initialize one pristine file or validate one exact v1 database."""
+    """Initialize v2, migrate exact v1, or validate one exact v2 database."""
 
     _require_supported_runtime()
     connection: sqlite3.Connection | None = None
@@ -545,7 +796,7 @@ def _transaction(
         if lock_catalog_before_journal:
             cursor.execute("SELECT name FROM main.sqlite_master LIMIT 1").fetchone()
         _require_delete_journal(cursor)
-        _validate_v1_locked(cursor)
+        _validate_v2_locked(cursor)
         yield cursor
         cursor.execute("COMMIT")
         transaction_may_be_active = False
@@ -617,7 +868,9 @@ def _scope_payload(scope: MemoryScope) -> dict[str, str]:
 
 def _record_storage_hash(
     *,
-    record_kind: Literal["evidence", "candidate", "revision", "release"],
+    record_kind: Literal[
+        "evidence", "candidate", "revision", "release", "evidence_snapshot"
+    ],
     scope: MemoryScope,
     record_id: str,
     content_hash: str,
@@ -625,7 +878,13 @@ def _record_storage_hash(
     memory_id: str | None = None,
     generation: int | None = None,
 ) -> str:
-    if record_kind not in {"evidence", "candidate", "revision", "release"}:
+    if record_kind not in {
+        "evidence",
+        "candidate",
+        "revision",
+        "release",
+        "evidence_snapshot",
+    }:
         raise ValueError("record_kind is not supported")
     payload: dict[str, object] = {
         "schema_version": 1,
@@ -659,5 +918,39 @@ def _release_binding_hash(
         "scope": _scope_payload(scope),
         "idempotency_key": idempotency_key,
         "release_id": release_id,
+    }
+    return _record_digest(_compact_json_bytes(payload))
+
+
+def _evidence_ingest_binding_hash(
+    *,
+    scope: MemoryScope,
+    evidence_id: str,
+    ingest_order: int,
+) -> str:
+    if type(ingest_order) is not int or not 0 <= ingest_order <= _MAX_SIGNED_64:
+        raise ValueError("ingest_order must fit the non-negative signed-64 range")
+    payload = {
+        "schema_version": 1,
+        "record_kind": "evidence_ingest_order",
+        "scope": _scope_payload(scope),
+        "evidence_id": evidence_id,
+        "ingest_order": ingest_order,
+    }
+    return _record_digest(_compact_json_bytes(payload))
+
+
+def _snapshot_binding_hash(
+    *,
+    scope: MemoryScope,
+    idempotency_key: str,
+    snapshot_id: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "record_kind": "evidence_snapshot_alias",
+        "scope": _scope_payload(scope),
+        "idempotency_key": idempotency_key,
+        "snapshot_id": snapshot_id,
     }
     return _record_digest(_compact_json_bytes(payload))

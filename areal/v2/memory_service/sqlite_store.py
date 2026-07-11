@@ -4,17 +4,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import UTC, datetime
 from hashlib import sha256
 
 from areal.v2.memory_service._sqlite_backend import (
+    _evidence_ingest_binding_hash,
     _initialize_database,
     _read_transaction,
     _record_storage_hash,
     _release_binding_hash,
+    _snapshot_binding_hash,
     _snapshot_database_path,
+    _validate_ingest_orders_locked,
     _write_transaction,
 )
 from areal.v2.memory_service.errors import (
@@ -22,6 +26,8 @@ from areal.v2.memory_service.errors import (
     CandidateNotFoundError,
     EvidenceConflictError,
     EvidenceNotFoundError,
+    EvidenceSnapshotConflictError,
+    EvidenceSnapshotNotFoundError,
     MemoryPersistenceCorruptionError,
     ReleaseConflictError,
     ReleaseNotFoundError,
@@ -36,6 +42,12 @@ from areal.v2.memory_service.history_types import (
     RevisionProposal,
 )
 from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
+from areal.v2.memory_service.snapshot_types import (
+    EVIDENCE_SNAPSHOT_ORDERING_POLICY,
+    EvidenceSnapshot,
+    EvidenceSnapshotMember,
+    EvidenceSnapshotSpec,
+)
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -63,6 +75,25 @@ _EVIDENCE_ROW_TYPES = (
     str,
     str,
     str,
+)
+
+_EVIDENCE_SNAPSHOT_SELECT = """SELECT snapshot_id, canonical, content_hash,
+       created_at, storage_hash, allowed_kinds_canonical, cutoff_utc,
+       evidence_high_watermark, ordering_policy, member_count
+FROM memory_evidence_snapshots
+WHERE scope_id = ? AND snapshot_id = ?"""
+
+_EVIDENCE_SNAPSHOT_ROW_TYPES = (
+    str,
+    bytes,
+    str,
+    str,
+    str,
+    bytes,
+    str,
+    int,
+    str,
+    int,
 )
 
 _CANDIDATE_SELECT = """SELECT candidate_id, canonical, content_hash,
@@ -344,6 +375,342 @@ def _evidence_sort_key(
         record.event.sequence_no,
         record.event.observed_at,
         record.evidence_id,
+    )
+
+
+def _evidence_snapshot_sort_key(
+    record: EvidenceRecord,
+) -> tuple[datetime, int, str]:
+    return (
+        record.event.observed_at,
+        record.event.sequence_no,
+        record.evidence_id,
+    )
+
+
+def _allowed_kinds_canonical_bytes(
+    allowed_kinds: tuple[EvidenceKind, ...],
+) -> bytes:
+    return json.dumps(
+        [kind.value for kind in allowed_kinds],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _load_ingest_order_index(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+    evidence_by_address: dict[tuple[int, str], EvidenceRecord],
+) -> dict[tuple[int, str], int]:
+    rows = cursor.execute(
+        "SELECT ingest_order, scope_id, evidence_id, binding_hash "
+        "FROM memory_evidence_ingest_orders ORDER BY ingest_order"
+    ).fetchall()
+    ingest_order_by_address: dict[tuple[int, str], int] = {}
+    observed_orders: list[int] = []
+    for row in rows:
+        if (
+            len(row) != 4
+            or type(row[0]) is not int
+            or not 0 <= row[0] <= _MAX_SCOPE_ID
+            or type(row[1]) is not int
+            or type(row[2]) is not str
+            or type(row[3]) is not str
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence ingest-order row failed integrity validation"
+            )
+        ingest_order, scope_id, evidence_id, binding_hash = row
+        scope = scope_by_id.get(scope_id)
+        address = (scope_id, evidence_id)
+        if (
+            scope is None
+            or address not in evidence_by_address
+            or address in ingest_order_by_address
+            or binding_hash
+            != _evidence_ingest_binding_hash(
+                scope=scope,
+                evidence_id=evidence_id,
+                ingest_order=ingest_order,
+            )
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence ingest-order row failed integrity validation"
+            )
+        ingest_order_by_address[address] = ingest_order
+        observed_orders.append(ingest_order)
+    if (
+        set(ingest_order_by_address) != set(evidence_by_address)
+        or tuple(observed_orders) != tuple(range(len(observed_orders)))
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "evidence ingest-order mapping is incomplete or non-contiguous"
+        )
+    return ingest_order_by_address
+
+
+def _snapshot_members_from_state(
+    *,
+    spec: EvidenceSnapshotSpec,
+    scope_id: int,
+    evidence_high_watermark: int,
+    evidence_by_address: dict[tuple[int, str], EvidenceRecord],
+    ingest_order_by_address: dict[tuple[int, str], int],
+) -> tuple[EvidenceSnapshotMember, ...]:
+    selected = tuple(
+        record
+        for address, record in evidence_by_address.items()
+        if address[0] == scope_id
+        and ingest_order_by_address[address] <= evidence_high_watermark
+        and record.event.kind in spec.allowed_kinds
+        and record.event.observed_at <= spec.cutoff
+    )
+    ordered = tuple(sorted(selected, key=_evidence_snapshot_sort_key))
+    return tuple(
+        EvidenceSnapshotMember(
+            evidence_id=record.evidence_id,
+            evidence_content_hash=record.content_hash,
+            ingest_order=ingest_order_by_address[(scope_id, record.evidence_id)],
+        )
+        for record in ordered
+    )
+
+
+def _load_evidence_snapshot_addresses(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+) -> tuple[tuple[int, str], ...]:
+    rows = cursor.execute(
+        "SELECT scope_id, snapshot_id FROM memory_evidence_snapshots"
+    ).fetchall()
+    addresses: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        if len(row) != 2:
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot address row does not contain exactly two values"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "evidence snapshot address contains an invalid scope ID",
+        )
+        snapshot_id = row[1]
+        if type(snapshot_id) is not str:
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot address contains a non-text identifier"
+            )
+        address = (scope_id, snapshot_id)
+        if scope_id not in scope_by_id or address in seen:
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot address failed integrity validation"
+            )
+        seen.add(address)
+        addresses.append(address)
+    return tuple(addresses)
+
+
+def _load_evidence_snapshot(
+    cursor: sqlite3.Cursor,
+    *,
+    scope: MemoryScope,
+    scope_id: int,
+    snapshot_id: str,
+    evidence_by_address: dict[tuple[int, str], EvidenceRecord],
+    ingest_order_by_address: dict[tuple[int, str], int],
+) -> EvidenceSnapshot | None:
+    row = cursor.execute(
+        _EVIDENCE_SNAPSHOT_SELECT,
+        (scope_id, snapshot_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        if len(row) != len(_EVIDENCE_SNAPSHOT_ROW_TYPES):
+            raise ValueError("evidence snapshot row has the wrong field count")
+        for index, (value, expected_type) in enumerate(
+            zip(row, _EVIDENCE_SNAPSHOT_ROW_TYPES, strict=True)
+        ):
+            if type(value) is not expected_type:
+                raise TypeError(
+                    f"evidence snapshot field {index} has the wrong storage class"
+                )
+        (
+            stored_snapshot_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            allowed_kinds_canonical,
+            cutoff_utc,
+            evidence_high_watermark,
+            ordering_policy,
+            member_count,
+        ) = row
+        if stored_snapshot_id != snapshot_id:
+            raise ValueError("loaded evidence snapshot ID differs from requested ID")
+        if evidence_high_watermark > len(ingest_order_by_address) - 1:
+            raise ValueError("evidence snapshot watermark exceeds current ingestion")
+        decoded_kinds = json.loads(allowed_kinds_canonical.decode("utf-8"))
+        if type(decoded_kinds) is not list or any(
+            type(value) is not str for value in decoded_kinds
+        ):
+            raise ValueError("allowed evidence kinds are not a JSON string list")
+        allowed_kinds = tuple(EvidenceKind(value) for value in decoded_kinds)
+        spec = EvidenceSnapshotSpec(
+            scope=scope,
+            allowed_kinds=allowed_kinds,
+            cutoff=datetime.fromisoformat(cutoff_utc),
+        )
+        if (
+            _allowed_kinds_canonical_bytes(spec.allowed_kinds)
+            != allowed_kinds_canonical
+            or spec.cutoff.isoformat() != cutoff_utc
+        ):
+            raise ValueError("evidence snapshot projections are not canonical")
+        members = _snapshot_members_from_state(
+            spec=spec,
+            scope_id=scope_id,
+            evidence_high_watermark=evidence_high_watermark,
+            evidence_by_address=evidence_by_address,
+            ingest_order_by_address=ingest_order_by_address,
+        )
+        if member_count != len(members):
+            raise ValueError("evidence snapshot member count is inconsistent")
+        snapshot = EvidenceSnapshot(
+            snapshot_id=stored_snapshot_id,
+            spec=spec,
+            evidence_high_watermark=evidence_high_watermark,
+            ordering_policy=ordering_policy,
+            members=members,
+            content_hash=content_hash,
+            created_at=datetime.fromisoformat(created_at_text),
+        )
+        if snapshot.created_at.isoformat() != created_at_text:
+            raise ValueError("snapshot created_at is not exact UTC isoformat text")
+        if snapshot.canonical_bytes() != canonical:
+            raise ValueError("canonical snapshot bytes disagree with projections")
+        calculated_hash = sha256(canonical).hexdigest()
+        if content_hash != calculated_hash:
+            raise ValueError("snapshot content hash disagrees with canonical bytes")
+        if stored_snapshot_id != f"esnap_{calculated_hash[:24]}":
+            raise ValueError("snapshot ID disagrees with its content hash")
+        calculated_storage_hash = _record_storage_hash(
+            record_kind="evidence_snapshot",
+            scope=scope,
+            record_id=stored_snapshot_id,
+            content_hash=content_hash,
+            created_at_text=created_at_text,
+        )
+        if storage_hash != calculated_storage_hash:
+            raise ValueError("snapshot storage hash disagrees with stored metadata")
+        return snapshot
+    except MemoryPersistenceCorruptionError:
+        raise
+    except (TypeError, ValueError, OverflowError) as error:
+        raise MemoryPersistenceCorruptionError(
+            "stored evidence snapshot row failed integrity validation"
+        ) from error
+
+
+def _load_evidence_snapshot_aliases(
+    cursor: sqlite3.Cursor,
+    scope_by_id: dict[int, MemoryScope],
+    snapshot_by_address: dict[tuple[int, str], EvidenceSnapshot],
+) -> dict[tuple[int, str], EvidenceSnapshot]:
+    rows = cursor.execute(
+        "SELECT scope_id, idempotency_key, snapshot_id, binding_hash "
+        "FROM memory_evidence_snapshot_aliases"
+    ).fetchall()
+    snapshot_by_alias: dict[tuple[int, str], EvidenceSnapshot] = {}
+    for row in rows:
+        if (
+            len(row) != 4
+            or type(row[0]) is not int
+            or any(type(value) is not str for value in row[1:])
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot alias row failed integrity validation"
+            )
+        scope_id, idempotency_key, snapshot_id, binding_hash = row
+        scope = scope_by_id.get(scope_id)
+        try:
+            idempotency_key = _validate_string(idempotency_key, "idempotency_key")
+        except (TypeError, ValueError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "stored evidence snapshot alias failed integrity validation"
+            ) from error
+        snapshot = snapshot_by_address.get((scope_id, snapshot_id))
+        alias_address = (scope_id, idempotency_key)
+        if (
+            scope is None
+            or snapshot is None
+            or alias_address in snapshot_by_alias
+            or binding_hash
+            != _snapshot_binding_hash(
+                scope=scope,
+                idempotency_key=idempotency_key,
+                snapshot_id=snapshot_id,
+            )
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot alias failed integrity validation"
+            )
+        snapshot_by_alias[alias_address] = snapshot
+    aliased_snapshot_addresses = {
+        (scope_id, snapshot.snapshot_id)
+        for (scope_id, _idempotency_key), snapshot in snapshot_by_alias.items()
+    }
+    if aliased_snapshot_addresses != set(snapshot_by_address):
+        raise MemoryPersistenceCorruptionError(
+            "evidence snapshot exists without an idempotency alias"
+        )
+    return snapshot_by_alias
+
+
+def _load_evidence_snapshot_state(
+    cursor: sqlite3.Cursor,
+) -> tuple[
+    dict[int, MemoryScope],
+    dict[tuple[int, str], EvidenceRecord],
+    dict[tuple[int, str], int],
+    dict[tuple[int, str], EvidenceSnapshot],
+    dict[tuple[int, str], EvidenceSnapshot],
+]:
+    scope_by_id = _load_scope_index(cursor)
+    evidence_by_address = _load_evidence_index(cursor, scope_by_id)
+    ingest_order_by_address = _load_ingest_order_index(
+        cursor,
+        scope_by_id,
+        evidence_by_address,
+    )
+    snapshot_addresses = _load_evidence_snapshot_addresses(cursor, scope_by_id)
+    snapshot_by_address: dict[tuple[int, str], EvidenceSnapshot] = {}
+    for scope_id, snapshot_id in snapshot_addresses:
+        snapshot = _load_evidence_snapshot(
+            cursor,
+            scope=scope_by_id[scope_id],
+            scope_id=scope_id,
+            snapshot_id=snapshot_id,
+            evidence_by_address=evidence_by_address,
+            ingest_order_by_address=ingest_order_by_address,
+        )
+        if snapshot is None:
+            raise MemoryPersistenceCorruptionError(
+                "evidence snapshot address refers to a missing row"
+            )
+        snapshot_by_address[(scope_id, snapshot_id)] = snapshot
+    snapshot_by_alias = _load_evidence_snapshot_aliases(
+        cursor,
+        scope_by_id,
+        snapshot_by_address,
+    )
+    return (
+        scope_by_id,
+        evidence_by_address,
+        ingest_order_by_address,
+        snapshot_by_address,
+        snapshot_by_alias,
     )
 
 
@@ -1241,6 +1608,34 @@ class SQLiteMemoryStore:
                     event.idempotency_key,
                 ),
             )
+            row = cursor.execute(
+                "SELECT MAX(ingest_order) FROM memory_evidence_ingest_orders"
+            ).fetchone()
+            if row is None or len(row) != 1 or type(row[0]) not in {int, type(None)}:
+                raise MemoryPersistenceCorruptionError(
+                    "evidence ingest-order maximum is invalid"
+                )
+            ingest_order = 0 if row[0] is None else row[0] + 1
+            if not 0 <= ingest_order <= 2**63 - 1:
+                raise MemoryPersistenceCorruptionError(
+                    "evidence ingest-order range is exhausted"
+                )
+            cursor.execute(
+                """INSERT INTO memory_evidence_ingest_orders (
+    ingest_order, scope_id, evidence_id, binding_hash
+) VALUES (?, ?, ?, ?)""",
+                (
+                    ingest_order,
+                    scope_id,
+                    evidence_id,
+                    _evidence_ingest_binding_hash(
+                        scope=event.scope,
+                        evidence_id=evidence_id,
+                        ingest_order=ingest_order,
+                    ),
+                ),
+            )
+            _validate_ingest_orders_locked(cursor)
             inserted = _load_evidence(
                 cursor,
                 event.scope,
@@ -1307,6 +1702,219 @@ class SQLiteMemoryStore:
                 and (run_id is None or record.event.run_id == run_id)
             )
             return tuple(sorted(records, key=_evidence_sort_key))
+
+    def seal_evidence_snapshot(
+        self,
+        spec: EvidenceSnapshotSpec,
+        *,
+        idempotency_key: str,
+    ) -> EvidenceSnapshot:
+        """Atomically seal the complete predicate match at one ingest watermark."""
+
+        if type(spec) is not EvidenceSnapshotSpec:
+            raise TypeError("spec must be an EvidenceSnapshotSpec")
+        idempotency_key = _validate_string(idempotency_key, "idempotency_key")
+
+        with _write_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                evidence_by_address,
+                ingest_order_by_address,
+                snapshot_by_address,
+                snapshot_by_alias,
+            ) = _load_evidence_snapshot_state(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, spec.scope)
+            existing = (
+                None
+                if scope_id is None
+                else snapshot_by_alias.get((scope_id, idempotency_key))
+            )
+            if existing is not None:
+                if existing.spec == spec:
+                    return existing
+                raise EvidenceSnapshotConflictError(
+                    "scoped snapshot idempotency key already refers to a "
+                    "different specification"
+                )
+
+            if scope_id is None:
+                scope_id = _ensure_scope_id(cursor, spec.scope)
+                scope_by_id[scope_id] = spec.scope
+            evidence_high_watermark = len(ingest_order_by_address) - 1
+            members = _snapshot_members_from_state(
+                spec=spec,
+                scope_id=scope_id,
+                evidence_high_watermark=evidence_high_watermark,
+                evidence_by_address=evidence_by_address,
+                ingest_order_by_address=ingest_order_by_address,
+            )
+            provisional = EvidenceSnapshot(
+                snapshot_id="pending",
+                spec=spec,
+                evidence_high_watermark=evidence_high_watermark,
+                ordering_policy=EVIDENCE_SNAPSHOT_ORDERING_POLICY,
+                members=members,
+                content_hash="pending",
+                created_at=datetime.now(UTC),
+            )
+            canonical = provisional.canonical_bytes()
+            content_hash = sha256(canonical).hexdigest()
+            snapshot_id = f"esnap_{content_hash[:24]}"
+            existing = snapshot_by_address.get((scope_id, snapshot_id))
+            if existing is not None:
+                if existing.canonical_bytes() != canonical:
+                    raise EvidenceSnapshotConflictError(
+                        f"evidence snapshot ID collision for {snapshot_id!r}"
+                    )
+                snapshot = existing
+            else:
+                created_at = provisional.created_at
+                created_at_text = created_at.isoformat()
+                storage_hash = _record_storage_hash(
+                    record_kind="evidence_snapshot",
+                    scope=spec.scope,
+                    record_id=snapshot_id,
+                    content_hash=content_hash,
+                    created_at_text=created_at_text,
+                )
+                cursor.execute(
+                    """INSERT INTO memory_evidence_snapshots (
+    scope_id, snapshot_id, canonical, content_hash, created_at, storage_hash,
+    allowed_kinds_canonical, cutoff_utc, evidence_high_watermark,
+    ordering_policy, member_count
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        scope_id,
+                        snapshot_id,
+                        canonical,
+                        content_hash,
+                        created_at_text,
+                        storage_hash,
+                        _allowed_kinds_canonical_bytes(spec.allowed_kinds),
+                        spec.cutoff.isoformat(),
+                        evidence_high_watermark,
+                        EVIDENCE_SNAPSHOT_ORDERING_POLICY,
+                        len(members),
+                    ),
+                )
+                snapshot = EvidenceSnapshot(
+                    snapshot_id=snapshot_id,
+                    spec=spec,
+                    evidence_high_watermark=evidence_high_watermark,
+                    ordering_policy=EVIDENCE_SNAPSHOT_ORDERING_POLICY,
+                    members=members,
+                    content_hash=content_hash,
+                    created_at=created_at,
+                )
+            cursor.execute(
+                """INSERT INTO memory_evidence_snapshot_aliases (
+    scope_id, idempotency_key, snapshot_id, binding_hash
+) VALUES (?, ?, ?, ?)""",
+                (
+                    scope_id,
+                    idempotency_key,
+                    snapshot_id,
+                    _snapshot_binding_hash(
+                        scope=spec.scope,
+                        idempotency_key=idempotency_key,
+                        snapshot_id=snapshot_id,
+                    ),
+                ),
+            )
+            (
+                _scope_by_id,
+                _evidence_by_address,
+                _ingest_order_by_address,
+                _snapshot_by_address,
+                reloaded_by_alias,
+            ) = _load_evidence_snapshot_state(cursor)
+            reloaded = reloaded_by_alias.get((scope_id, idempotency_key))
+            if reloaded is None or reloaded != snapshot:
+                raise MemoryPersistenceCorruptionError(
+                    "inserted evidence snapshot could not be reloaded exactly"
+                )
+            return reloaded
+
+    def get_evidence_snapshot(
+        self,
+        scope: MemoryScope,
+        snapshot_id: str,
+    ) -> EvidenceSnapshot:
+        """Load an evidence snapshot only from its exact public scope."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        snapshot_id = _validate_string(
+            snapshot_id,
+            "snapshot_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                _evidence_by_address,
+                _ingest_order_by_address,
+                snapshot_by_address,
+                _snapshot_by_alias,
+            ) = _load_evidence_snapshot_state(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            snapshot = (
+                None
+                if scope_id is None
+                else snapshot_by_address.get((scope_id, snapshot_id))
+            )
+            if snapshot is None:
+                raise EvidenceSnapshotNotFoundError(
+                    f"evidence snapshot {snapshot_id!r} was not found"
+                )
+            return snapshot
+
+    def get_evidence_snapshot_evidence(
+        self,
+        scope: MemoryScope,
+        snapshot_id: str,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Load exactly the records committed by one evidence snapshot."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        snapshot_id = _validate_string(
+            snapshot_id,
+            "snapshot_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            (
+                scope_by_id,
+                evidence_by_address,
+                _ingest_order_by_address,
+                snapshot_by_address,
+                _snapshot_by_alias,
+            ) = _load_evidence_snapshot_state(cursor)
+            scope_id = _find_scope_id_in_index(scope_by_id, scope)
+            snapshot = (
+                None
+                if scope_id is None
+                else snapshot_by_address.get((scope_id, snapshot_id))
+            )
+            if snapshot is None or scope_id is None:
+                raise EvidenceSnapshotNotFoundError(
+                    f"evidence snapshot {snapshot_id!r} was not found"
+                )
+            records = tuple(
+                evidence_by_address[(scope_id, member.evidence_id)]
+                for member in snapshot.members
+            )
+            if tuple(
+                (record.evidence_id, record.content_hash) for record in records
+            ) != tuple(
+                (member.evidence_id, member.evidence_content_hash)
+                for member in snapshot.members
+            ):
+                raise MemoryPersistenceCorruptionError(
+                    "evidence snapshot records disagree with committed members"
+                )
+            return records
 
     def append_candidate(self, proposal: CandidateProposal) -> MemoryCandidate:
         """Persist one evidence-grounded candidate or return its exact retry."""

@@ -1583,9 +1583,28 @@ def test_sqlite_get_validates_scope_snapshot_before_evidence_id_absence(
 
     connection = sqlite3.connect(database_path, isolation_level=None)
     try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        ingest_order = connection.execute(
+            "SELECT ingest_order FROM memory_evidence_ingest_orders "
+            "WHERE evidence_id = ?",
+            (record.evidence_id,),
+        ).fetchone()[0]
         connection.execute(
             "UPDATE memory_evidence SET evidence_id = ? WHERE evidence_id = ?",
             (moved_evidence_id, record.evidence_id),
+        )
+        connection.execute(
+            "UPDATE memory_evidence_ingest_orders SET evidence_id = ?, "
+            "binding_hash = ? WHERE evidence_id = ?",
+            (
+                moved_evidence_id,
+                sqlite_backend._evidence_ingest_binding_hash(
+                    scope=event.scope,
+                    evidence_id=moved_evidence_id,
+                    ingest_order=ingest_order,
+                ),
+                record.evidence_id,
+            ),
         )
     finally:
         connection.close()
@@ -1666,6 +1685,7 @@ def test_sqlite_operations_validate_global_evidence_before_scope_absence(
 
     connection = sqlite3.connect(database_path, isolation_level=None)
     try:
+        connection.execute("PRAGMA foreign_keys = OFF")
         destination_scope_id = connection.execute(
             "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
             "AND namespace = ? AND subject_id = ?",
@@ -1678,6 +1698,24 @@ def test_sqlite_operations_validate_global_evidence_before_scope_absence(
         connection.execute(
             "UPDATE memory_evidence SET scope_id = ? WHERE evidence_id = ?",
             (destination_scope_id, source_record.evidence_id),
+        )
+        ingest_order = connection.execute(
+            "SELECT ingest_order FROM memory_evidence_ingest_orders "
+            "WHERE evidence_id = ?",
+            (source_record.evidence_id,),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE memory_evidence_ingest_orders SET scope_id = ?, "
+            "binding_hash = ? WHERE evidence_id = ?",
+            (
+                destination_scope_id,
+                sqlite_backend._evidence_ingest_binding_hash(
+                    scope=destination_scope,
+                    evidence_id=source_record.evidence_id,
+                    ingest_order=ingest_order,
+                ),
+                source_record.evidence_id,
+            ),
         )
     finally:
         connection.close()
@@ -1730,9 +1768,32 @@ def test_sqlite_operations_validate_evidence_before_rewritten_scope_absence(
 
     connection = sqlite3.connect(database_path, isolation_level=None)
     try:
+        scope_id, ingest_order = connection.execute(
+            "SELECT scope_id, ingest_order FROM memory_evidence_ingest_orders "
+            "WHERE evidence_id = ?",
+            (record.evidence_id,),
+        ).fetchone()
         connection.execute(
             "UPDATE memory_scopes SET subject_id = ? WHERE subject_id = ?",
             (rewritten_subject_id, event.scope.subject_id),
+        )
+        rewritten_scope = MemoryScope(
+            event.scope.tenant_id,
+            event.scope.namespace,
+            rewritten_subject_id,
+        )
+        connection.execute(
+            "UPDATE memory_evidence_ingest_orders SET binding_hash = ? "
+            "WHERE scope_id = ? AND evidence_id = ?",
+            (
+                sqlite_backend._evidence_ingest_binding_hash(
+                    scope=rewritten_scope,
+                    evidence_id=record.evidence_id,
+                    ingest_order=ingest_order,
+                ),
+                scope_id,
+                record.evidence_id,
+            ),
         )
     finally:
         connection.close()
@@ -1954,6 +2015,25 @@ def test_sqlite_evidence_loader_rejects_each_semantic_column_drift(
             sql,
             (changed_value, scope_id, event.idempotency_key),
         )
+        if column == "evidence_id":
+            ingest_order = connection.execute(
+                "SELECT ingest_order FROM memory_evidence_ingest_orders "
+                "WHERE evidence_id = ?",
+                (record.evidence_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE memory_evidence_ingest_orders SET evidence_id = ?, "
+                "binding_hash = ? WHERE evidence_id = ?",
+                (
+                    changed_id,
+                    sqlite_backend._evidence_ingest_binding_hash(
+                        scope=event.scope,
+                        evidence_id=changed_id,
+                        ingest_order=ingest_order,
+                    ),
+                    record.evidence_id,
+                ),
+            )
     finally:
         connection.close()
 
@@ -2578,7 +2658,7 @@ def test_runtime_floor_is_checked_before_connect(
     assert not (tmp_path / "memory.sqlite3").exists()
 
 
-def test_new_database_has_exact_v1_header_catalog_and_metadata(
+def test_new_database_has_exact_v2_header_catalog_and_metadata(
     tmp_path: Path,
 ) -> None:
     path = str(tmp_path / "memory.sqlite3")
@@ -2597,7 +2677,9 @@ def test_new_database_has_exact_v1_header_catalog_and_metadata(
                 "SELECT name FROM main.sqlite_master WHERE sql IS NOT NULL"
             )
         }
-        assert len(sqlite_backend._SCHEMA_DDL) == 11
+        assert len(sqlite_backend._SCHEMA_V1_DDL) == 11
+        assert len(sqlite_backend._SCHEMA_V2_ADDITIONS) == 4
+        assert len(sqlite_backend._SCHEMA_DDL) == 15
         assert names == (
             sqlite_backend._REQUIRED_TABLES | sqlite_backend._REQUIRED_INDEXES
         )
@@ -2609,6 +2691,15 @@ def test_new_database_has_exact_v1_header_catalog_and_metadata(
             sqlite_backend._catalog_hash(connection.cursor()),
         )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence_ingest_orders"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence_snapshots"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_evidence_snapshot_aliases"
+        ).fetchone() == (0,)
     finally:
         connection.close()
 
@@ -2948,7 +3039,7 @@ def test_initializer_uses_begin_exclusive_without_executescript(
     normalized = [_normalize_sql(statement) for statement in statements]
     assert "BEGIN EXCLUSIVE" in normalized
     assert normalized.index("PRAGMA APPLICATION_ID = 1095912787") < normalized.index(
-        "PRAGMA USER_VERSION = 1"
+        "PRAGMA USER_VERSION = 2"
     )
     assert normalized[-1] == "COMMIT"
 
@@ -2962,7 +3053,7 @@ def test_interrupted_initialization_rolls_back_every_boundary(
     ] + [
         "INSERT INTO memory_schema_metadata",
         "PRAGMA application_id = 1095912787",
-        "PRAGMA user_version = 1",
+        "PRAGMA user_version = 2",
     ]
 
     for index, marker in enumerate(markers):
@@ -3032,7 +3123,7 @@ def test_two_initializers_converge(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA application_id").fetchone() == (
             sqlite_backend._APPLICATION_ID,
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         assert connection.execute(
             "SELECT schema_catalog_hash FROM memory_schema_metadata"
         ).fetchone() == (sqlite_backend._catalog_hash(connection.cursor()),)
@@ -3045,7 +3136,7 @@ def test_two_initializers_converge(tmp_path: Path) -> None:
     [
         "CREATE TABLE memory_revisions",
         "PRAGMA application_id = 1095912787",
-        "PRAGMA user_version = 1",
+        "PRAGMA user_version = 2",
     ],
     ids=["ddl", "application-id", "user-version"],
 )
@@ -3287,7 +3378,7 @@ def test_wrong_application_id_is_rejected(tmp_path: Path) -> None:
         sqlite_backend._initialize_database(database_path)
 
 
-@pytest.mark.parametrize("version", [2, 2**31 - 1])
+@pytest.mark.parametrize("version", [3, 2**31 - 1])
 def test_unknown_schema_version_is_rejected(tmp_path: Path, version: int) -> None:
     database_path = str(tmp_path / f"memory-{version}.sqlite3")
     sqlite_backend._initialize_database(database_path)
@@ -3305,7 +3396,9 @@ def test_unknown_schema_version_is_rejected(tmp_path: Path, version: int) -> Non
     "mutation",
     [
         "DROP TABLE memory_release_aliases",
+        "DROP TABLE memory_evidence_snapshots",
         "DROP INDEX idx_memory_revisions_sort",
+        "DROP INDEX idx_memory_evidence_ingest_scope",
         "CREATE VIEW unexpected_memory_view AS SELECT scope_id FROM memory_scopes",
     ],
 )
@@ -3431,7 +3524,7 @@ def test_empty_wal_database_is_rejected_without_conversion(tmp_path: Path) -> No
         connection.close()
 
 
-def test_v1_switched_to_wal_is_rejected_without_conversion(tmp_path: Path) -> None:
+def test_v2_switched_to_wal_is_rejected_without_conversion(tmp_path: Path) -> None:
     database_path = str(tmp_path / "memory.sqlite3")
     sqlite_backend._initialize_database(database_path)
     connection = sqlite3.connect(database_path, isolation_level=None)
@@ -3504,6 +3597,16 @@ def test_record_and_alias_hashes_match_golden_wire_vectors(
         == "540a7bddb3093f79dd1f34782c7679942b285bece6ba32702b1c404a29a2cbac"
     )
     assert (
+        sqlite_backend._record_storage_hash(
+            record_kind="evidence_snapshot",
+            scope=scope,
+            record_id="esnap_a",
+            content_hash="c" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+        )
+        == "2d82659f84c45b88e71110c1486dd6e3743263df9df0e5d0a837697de4553ff3"
+    )
+    assert (
         sqlite_backend._release_binding_hash(
             scope=scope,
             idempotency_key="alias-a",
@@ -3511,15 +3614,37 @@ def test_record_and_alias_hashes_match_golden_wire_vectors(
         )
         == "f61c2a3ef34cfe876c675f843c18508e7134c64b3fed251e48ad9885459e71aa"
     )
+    assert (
+        sqlite_backend._evidence_ingest_binding_hash(
+            scope=scope,
+            evidence_id="evd_a",
+            ingest_order=7,
+        )
+        == "4392800f39feb7aada54d810b2b67af79ee7293916e3eb7586ba0b757bdbad84"
+    )
+    assert (
+        sqlite_backend._snapshot_binding_hash(
+            scope=scope,
+            idempotency_key="snapshot-alias-a",
+            snapshot_id="esnap_a",
+        )
+        == "798788f2f670cad7af183b4b47d466e0c6e37d72ae5d94abbda42a1a16dc1252"
+    )
 
     assert seen == [
         b'{"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"2026-07-08T00:00:00+00:00","record_id":"evd_a","record_kind":"evidence","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"content_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created_at":"2026-07-08T00:00:00+00:00","generation":7,"memory_id":"mem_a","record_id":"rev_a","record_kind":"revision","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"content_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","created_at":"2026-07-08T00:00:00+00:00","record_id":"esnap_a","record_kind":"evidence_snapshot","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"idempotency_key":"alias-a","record_kind":"release_alias","release_id":"rel_a","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"evidence_id":"evd_a","ingest_order":7,"record_kind":"evidence_ingest_order","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"idempotency_key":"snapshot-alias-a","record_kind":"evidence_snapshot_alias","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"},"snapshot_id":"esnap_a"}',
     ]
 
 
-@pytest.mark.parametrize("record_kind", ["evidence", "candidate", "release"])
+@pytest.mark.parametrize(
+    "record_kind",
+    ["evidence", "candidate", "release", "evidence_snapshot"],
+)
 def test_nonrevision_storage_hash_rejects_revision_binding_fields(
     record_kind: str,
 ) -> None:
@@ -4989,8 +5114,8 @@ def test_sqlite_candidate_snapshot_validates_unrelated_evidence_before_any_candi
 
         connection = sqlite3.connect(database_path, isolation_level=None)
         try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
+            connection.execute("PRAGMA foreign_keys = OFF")
+            assert connection.execute("PRAGMA foreign_keys").fetchone() == (0,)
             unrelated_scope_id = connection.execute(
                 "SELECT scope_id FROM memory_scopes WHERE tenant_id = ? "
                 "AND namespace = ? AND subject_id = ?",
@@ -5005,6 +5130,25 @@ def test_sqlite_candidate_snapshot_validates_unrelated_evidence_before_any_candi
                 "WHERE scope_id = ? AND evidence_id = ?",
                 (
                     moved_evidence_id,
+                    unrelated_scope_id,
+                    unrelated_evidence.evidence_id,
+                ),
+            )
+            ingest_order = connection.execute(
+                "SELECT ingest_order FROM memory_evidence_ingest_orders "
+                "WHERE scope_id = ? AND evidence_id = ?",
+                (unrelated_scope_id, unrelated_evidence.evidence_id),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE memory_evidence_ingest_orders SET evidence_id = ?, "
+                "binding_hash = ? WHERE scope_id = ? AND evidence_id = ?",
+                (
+                    moved_evidence_id,
+                    sqlite_backend._evidence_ingest_binding_hash(
+                        scope=unrelated_scope,
+                        evidence_id=moved_evidence_id,
+                        ingest_order=ingest_order,
+                    ),
                     unrelated_scope_id,
                     unrelated_evidence.evidence_id,
                 ),
@@ -7712,10 +7856,31 @@ def test_sqlite_revision_snapshot_validates_unrelated_lower_graph_first(
                 if corruption_kind == "evidence":
                     moved_id = f"evd_{'0' * 24}"
                     assert moved_id != unrelated_evidence.evidence_id
+                    scope_id, ingest_order = connection.execute(
+                        "SELECT scope_id, ingest_order "
+                        "FROM memory_evidence_ingest_orders "
+                        "WHERE evidence_id = ?",
+                        (unrelated_evidence.evidence_id,),
+                    ).fetchone()
                     connection.execute(
                         "UPDATE memory_evidence SET evidence_id = ? "
                         "WHERE evidence_id = ?",
                         (moved_id, unrelated_evidence.evidence_id),
+                    )
+                    connection.execute(
+                        "UPDATE memory_evidence_ingest_orders "
+                        "SET evidence_id = ?, binding_hash = ? "
+                        "WHERE scope_id = ? AND evidence_id = ?",
+                        (
+                            moved_id,
+                            sqlite_backend._evidence_ingest_binding_hash(
+                                scope=evidence_scope,
+                                evidence_id=moved_id,
+                                ingest_order=ingest_order,
+                            ),
+                            scope_id,
+                            unrelated_evidence.evidence_id,
+                        ),
                     )
                 elif corruption_kind == "candidate":
                     moved_id = f"cand_{'0' * 24}"
