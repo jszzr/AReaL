@@ -10,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,7 @@ UNKNOWN = "UNKNOWN"
 FAST_PROFILE_NAME = "fast-two-child-v1"
 MODEL_CASE_COUNT = 64
 MODEL_ATTEMPT_LIMIT = 100_000
+_MAX_MODEL_CAPTURE_DATABASE_BYTES = 64 * 1024 * 1024
 MODEL_BOOTSTRAP_RESAMPLES = 10_000
 MODEL_BOOTSTRAP_SEED = 20_260_708
 MODEL_BOOTSTRAP_MATRIX_SHA256 = (
@@ -563,6 +565,43 @@ class CaptureChildRequest:
 class CaptureChildResponse:
     case_index: int
     references: CaseDatabaseReferences
+    pid: int
+    process_instance_id: str
+    isolated_mode: bool
+    areal_module_path: str
+    visible_forbidden_environment: tuple[str, ...]
+    environment_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaptureChildRequest:
+    """One preregistered model candidate to persist in an isolated process."""
+
+    case_index: int
+    model_attempt: int
+    case_manifest_sha256: str
+    database_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaptureDatabaseReceipt:
+    """Raw-file commitment for the freshly published capture database."""
+
+    device: int
+    inode: int
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaptureChildResponse:
+    """Persisted model candidate plus child-owned process-isolation facts."""
+
+    case_index: int
+    model_attempt: int
+    case_manifest_sha256: str
+    references: CaseDatabaseReferences
+    database_receipt: ModelCaptureDatabaseReceipt
     pid: int
     process_instance_id: str
     isolated_mode: bool
@@ -3763,6 +3802,27 @@ def _wire_string(value: object) -> str:
     return value
 
 
+def _wire_sha256(value: object) -> str:
+    digest = _wire_string(value)
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise WireProtocolError("closed_schema")
+    return digest
+
+
+def _wire_database_path(value: object) -> str:
+    path = _wire_string(value)
+    if (
+        not path.strip()
+        or "\x00" in path
+        or path == ":memory:"
+        or not os.path.isabs(path)
+        or os.path.normpath(path) != path
+        or not os.path.basename(path)
+    ):
+        raise WireProtocolError("closed_schema")
+    return path
+
+
 def _wire_integer(value: object) -> int:
     if type(value) is not int:
         raise WireProtocolError("closed_schema")
@@ -4443,6 +4503,143 @@ def _capture_response_from_wire(value: object) -> CaptureChildResponse:
     return CaptureChildResponse(
         case_index=_wire_integer(item["case_index"]),
         references=_database_references_from_wire(item["references"]),
+        pid=_wire_integer(item["pid"]),
+        process_instance_id=_wire_string(item["process_instance_id"]),
+        isolated_mode=_wire_boolean(item["isolated_mode"]),
+        areal_module_path=_wire_string(item["areal_module_path"]),
+        visible_forbidden_environment=tuple(
+            _wire_string(part)
+            for part in _wire_list(item["visible_forbidden_environment"])
+        ),
+        environment_clean=_wire_boolean(item["environment_clean"]),
+    )
+
+
+def _model_capture_request_to_wire(
+    value: ModelCaptureChildRequest,
+) -> dict[str, object]:
+    return {
+        "case_index": _wire_integer(value.case_index),
+        "case_manifest_sha256": _wire_sha256(value.case_manifest_sha256),
+        "database_path": _wire_database_path(value.database_path),
+        "model_attempt": _wire_integer(value.model_attempt),
+    }
+
+
+def _model_capture_request_from_wire(value: object) -> ModelCaptureChildRequest:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "case_index",
+                "model_attempt",
+                "case_manifest_sha256",
+                "database_path",
+            }
+        ),
+    )
+    case_index = _wire_integer(item["case_index"])
+    model_attempt = _wire_integer(item["model_attempt"])
+    if case_index not in range(MODEL_CASE_COUNT) or model_attempt not in range(
+        MODEL_ATTEMPT_LIMIT
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelCaptureChildRequest(
+        case_index=case_index,
+        model_attempt=model_attempt,
+        case_manifest_sha256=_wire_sha256(item["case_manifest_sha256"]),
+        database_path=_wire_database_path(item["database_path"]),
+    )
+
+
+def _model_capture_database_receipt_to_wire(
+    value: ModelCaptureDatabaseReceipt,
+) -> dict[str, object]:
+    if type(value) is not ModelCaptureDatabaseReceipt:
+        raise WireProtocolError("closed_schema")
+    return {
+        "device": _wire_integer(value.device),
+        "inode": _wire_integer(value.inode),
+        "sha256": _wire_sha256(value.sha256),
+        "size_bytes": _wire_integer(value.size_bytes),
+    }
+
+
+def _model_capture_database_receipt_from_wire(
+    value: object,
+) -> ModelCaptureDatabaseReceipt:
+    item = _wire_object(
+        value,
+        frozenset({"device", "inode", "size_bytes", "sha256"}),
+    )
+    device = _wire_integer(item["device"])
+    inode = _wire_integer(item["inode"])
+    size_bytes = _wire_integer(item["size_bytes"])
+    if device < 0 or inode <= 0 or size_bytes <= 0:
+        raise WireProtocolError("closed_schema")
+    return ModelCaptureDatabaseReceipt(
+        device=device,
+        inode=inode,
+        size_bytes=size_bytes,
+        sha256=_wire_sha256(item["sha256"]),
+    )
+
+
+def _model_capture_response_to_wire(
+    value: ModelCaptureChildResponse,
+) -> dict[str, object]:
+    return {
+        "areal_module_path": _wire_string(value.areal_module_path),
+        "case_index": _wire_integer(value.case_index),
+        "case_manifest_sha256": _wire_sha256(value.case_manifest_sha256),
+        "database_receipt": _model_capture_database_receipt_to_wire(
+            value.database_receipt
+        ),
+        "environment_clean": _wire_boolean(value.environment_clean),
+        "isolated_mode": _wire_boolean(value.isolated_mode),
+        "model_attempt": _wire_integer(value.model_attempt),
+        "pid": _wire_integer(value.pid),
+        "process_instance_id": _wire_string(value.process_instance_id),
+        "references": _database_references_to_wire(value.references),
+        "visible_forbidden_environment": [
+            _wire_string(name) for name in value.visible_forbidden_environment
+        ],
+    }
+
+
+def _model_capture_response_from_wire(value: object) -> ModelCaptureChildResponse:
+    item = _wire_object(
+        value,
+        frozenset(
+            {
+                "case_index",
+                "model_attempt",
+                "case_manifest_sha256",
+                "references",
+                "database_receipt",
+                "pid",
+                "process_instance_id",
+                "isolated_mode",
+                "areal_module_path",
+                "visible_forbidden_environment",
+                "environment_clean",
+            }
+        ),
+    )
+    case_index = _wire_integer(item["case_index"])
+    model_attempt = _wire_integer(item["model_attempt"])
+    if case_index not in range(MODEL_CASE_COUNT) or model_attempt not in range(
+        MODEL_ATTEMPT_LIMIT
+    ):
+        raise WireProtocolError("closed_schema")
+    return ModelCaptureChildResponse(
+        case_index=case_index,
+        model_attempt=model_attempt,
+        case_manifest_sha256=_wire_sha256(item["case_manifest_sha256"]),
+        references=_database_references_from_wire(item["references"]),
+        database_receipt=_model_capture_database_receipt_from_wire(
+            item["database_receipt"]
+        ),
         pid=_wire_integer(item["pid"]),
         process_instance_id=_wire_string(item["process_instance_id"]),
         isolated_mode=_wire_boolean(item["isolated_mode"]),
@@ -5635,6 +5832,14 @@ _WIRE_ENCODERS: dict[type[object], tuple[str, Callable[[Any], dict[str, object]]
     CaptureBatchResponse: ("capture_batch_response", _capture_batch_response_to_wire),
     CaptureChildRequest: ("capture_child_request", _capture_request_to_wire),
     CaptureChildResponse: ("capture_child_response", _capture_response_to_wire),
+    ModelCaptureChildRequest: (
+        "model_capture_child_request",
+        _model_capture_request_to_wire,
+    ),
+    ModelCaptureChildResponse: (
+        "model_capture_child_response",
+        _model_capture_response_to_wire,
+    ),
     FutureBatchRequest: ("future_batch_request", _future_batch_request_to_wire),
     FutureBatchResponse: ("future_batch_response", _future_batch_response_to_wire),
     FutureChildRequest: ("future_child_request", _future_request_to_wire),
@@ -5656,6 +5861,8 @@ _WIRE_DECODERS: dict[str, Callable[[object], object]] = {
     "capture_batch_response": _capture_batch_response_from_wire,
     "capture_child_request": _capture_request_from_wire,
     "capture_child_response": _capture_response_from_wire,
+    "model_capture_child_request": _model_capture_request_from_wire,
+    "model_capture_child_response": _model_capture_response_from_wire,
     "future_batch_request": _future_batch_request_from_wire,
     "future_batch_response": _future_batch_response_from_wire,
     "future_child_request": _future_request_from_wire,
@@ -5843,6 +6050,327 @@ def execute_capture_child_request(
     return CaptureChildResponse(
         case_index=request.case_index,
         references=references,
+        pid=os.getpid(),
+        process_instance_id=PROCESS_INSTANCE_ID,
+        isolated_mode=bool(sys.flags.isolated),
+        areal_module_path=_areal_module_path(),
+        visible_forbidden_environment=visible,
+        environment_clean=not visible,
+    )
+
+
+def _model_capture_assignment(
+    request: ModelCaptureChildRequest,
+) -> tuple[CodebookCase, CaseDatabaseReferences]:
+    """Reconstruct one committed model case without touching its database."""
+
+    if type(request) is not ModelCaptureChildRequest:
+        raise WireProtocolError("closed_schema")
+    _model_capture_request_from_wire(_model_capture_request_to_wire(request))
+    case = _generate_model_candidate(
+        request.case_index,
+        model_attempt=request.model_attempt,
+    )
+    if (
+        case is None
+        or not _model_case_schema_is_valid(case)
+        or case_manifest_sha256(case) != request.case_manifest_sha256
+    ):
+        raise ChildExecutionValidationError("assignment_mismatch")
+    return case, derive_case_database_references(case)
+
+
+def _model_capture_file_identity(file_stat: os.stat_result) -> tuple[int, int]:
+    owner_matches = not hasattr(os, "geteuid") or file_stat.st_uid == os.geteuid()
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+        or file_stat.st_nlink != 1
+        or not owner_matches
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _model_capture_directory_identity(directory_path: str) -> tuple[int, int]:
+    try:
+        resolved = str(Path(directory_path).resolve(strict=True))
+        directory_stat = os.lstat(directory_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    owner_matches = not hasattr(os, "geteuid") or directory_stat.st_uid == os.geteuid()
+    if (
+        resolved != directory_path
+        or not stat.S_ISDIR(directory_stat.st_mode)
+        or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        or not owner_matches
+    ):
+        raise ChildExecutionValidationError("state_reuse")
+    return directory_stat.st_dev, directory_stat.st_ino
+
+
+def _require_model_capture_directory(
+    directory_path: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    if _model_capture_directory_identity(directory_path) != expected_identity:
+        raise ChildExecutionValidationError("state_reuse")
+
+
+def _fsync_model_capture_directory(
+    directory_path: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(directory_path, flags)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    try:
+        directory_stat = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or (directory_stat.st_dev, directory_stat.st_ino) != expected_identity
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    finally:
+        os.close(directory_descriptor)
+    _require_model_capture_directory(directory_path, expected_identity)
+
+
+def _require_model_capture_file(
+    database_path: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        file_stat = os.lstat(database_path)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    if _model_capture_file_identity(file_stat) != expected_identity:
+        raise ChildExecutionValidationError("state_reuse")
+
+
+def _reserve_model_capture_file(database_path: str) -> tuple[int, int]:
+    """Claim one fresh private leaf without following or reusing an old file."""
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_descriptor = os.open(database_path, flags, 0o600)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    created_identity: tuple[int, int] | None = None
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        file_stat = os.fstat(file_descriptor)
+        created_identity = (file_stat.st_dev, file_stat.st_ino)
+        identity = _model_capture_file_identity(file_stat)
+        os.fsync(file_descriptor)
+    except BaseException:
+        try:
+            os.close(file_descriptor)
+        finally:
+            try:
+                file_stat = os.lstat(database_path)
+            except OSError:
+                pass
+            else:
+                if (file_stat.st_dev, file_stat.st_ino) == created_identity:
+                    os.unlink(database_path)
+        raise
+    else:
+        os.close(file_descriptor)
+    _require_model_capture_file(database_path, identity)
+    return identity
+
+
+def _model_capture_database_receipt(
+    database_path: str,
+    *,
+    expected_identity: tuple[int, int],
+    durable: bool,
+) -> ModelCaptureDatabaseReceipt:
+    flags = (
+        (os.O_RDWR if durable else os.O_RDONLY)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        file_descriptor = os.open(database_path, flags)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    try:
+        before = os.fstat(file_descriptor)
+        identity = _model_capture_file_identity(before)
+        if (
+            identity != expected_identity
+            or before.st_size <= 0
+            or before.st_size > _MAX_MODEL_CAPTURE_DATABASE_BYTES
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+        if durable:
+            os.fsync(file_descriptor)
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            part = os.read(file_descriptor, min(remaining, 1024 * 1024))
+            if not part:
+                raise ChildExecutionValidationError("state_reuse")
+            digest.update(part)
+            remaining -= len(part)
+        if os.read(file_descriptor, 1):
+            raise ChildExecutionValidationError("state_reuse")
+        after = os.fstat(file_descriptor)
+        if (
+            _model_capture_file_identity(after) != expected_identity
+            or after.st_size != before.st_size
+        ):
+            raise ChildExecutionValidationError("state_reuse")
+        _require_model_capture_file(database_path, expected_identity)
+        return ModelCaptureDatabaseReceipt(
+            device=identity[0],
+            inode=identity[1],
+            size_bytes=before.st_size,
+            sha256=digest.hexdigest(),
+        )
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+    finally:
+        os.close(file_descriptor)
+
+
+def _cleanup_model_capture_staging(
+    staging_directory: str,
+    staging_path: str,
+    staging_identity: tuple[int, int] | None,
+) -> None:
+    if staging_identity is not None:
+        try:
+            file_stat = os.lstat(staging_path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ChildExecutionValidationError("state_reuse") from error
+        else:
+            if (file_stat.st_dev, file_stat.st_ino) != staging_identity:
+                raise ChildExecutionValidationError("state_reuse")
+            try:
+                os.unlink(staging_path)
+            except OSError as error:
+                raise ChildExecutionValidationError("state_reuse") from error
+    try:
+        if os.listdir(staging_directory):
+            raise ChildExecutionValidationError("state_reuse")
+        os.rmdir(staging_directory)
+    except OSError as error:
+        raise ChildExecutionValidationError("state_reuse") from error
+
+
+def execute_model_capture_child_request(
+    request: ModelCaptureChildRequest,
+) -> ModelCaptureChildResponse:
+    """Persist exactly the preregistered candidate after a write-free hash gate.
+
+    The destination parent must be one canonical, owner-only ``0700`` POSIX
+    directory.  SQLite is built under a private sibling staging directory and
+    published with a non-overwriting hard link, so an existing destination is
+    never opened or modified.
+    """
+
+    case, expected_references = _model_capture_assignment(request)
+    parent_directory = os.path.dirname(request.database_path)
+    parent_identity = _model_capture_directory_identity(parent_directory)
+    staging_directory: str | None = None
+    try:
+        staging_directory = tempfile.mkdtemp(
+            prefix=".areal-model-capture-",
+            dir=parent_directory,
+        )
+        os.chmod(staging_directory, 0o700)
+        _model_capture_directory_identity(staging_directory)
+    except BaseException as error:
+        if staging_directory is not None:
+            try:
+                os.rmdir(staging_directory)
+            except OSError as cleanup_error:
+                error.add_note(
+                    "model capture staging directory cleanup failed without "
+                    "replacing the primary error: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, ChildExecutionValidationError):
+            raise
+        raise ChildExecutionValidationError("state_reuse") from error
+    if staging_directory is None:
+        raise AssertionError("model capture staging directory must exist")
+    staging_path = os.path.join(staging_directory, "database.sqlite3")
+    staging_identity: tuple[int, int] | None = None
+    try:
+        staging_identity = _reserve_model_capture_file(staging_path)
+        references = build_case_database(case, staging_path)
+        _require_model_capture_file(staging_path, staging_identity)
+        if references != expected_references:
+            raise ChildExecutionValidationError("assignment_mismatch")
+        staged_receipt = _model_capture_database_receipt(
+            staging_path,
+            expected_identity=staging_identity,
+            durable=True,
+        )
+        _require_model_capture_directory(parent_directory, parent_identity)
+        try:
+            os.link(
+                staging_path,
+                request.database_path,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ChildExecutionValidationError("state_reuse") from error
+        _cleanup_model_capture_staging(
+            staging_directory,
+            staging_path,
+            staging_identity,
+        )
+        staging_identity = None
+        _require_model_capture_directory(parent_directory, parent_identity)
+        _fsync_model_capture_directory(parent_directory, parent_identity)
+        _require_model_capture_file(
+            request.database_path,
+            expected_identity=(
+                staged_receipt.device,
+                staged_receipt.inode,
+            ),
+        )
+        database_receipt = _model_capture_database_receipt(
+            request.database_path,
+            expected_identity=(staged_receipt.device, staged_receipt.inode),
+            durable=False,
+        )
+        if database_receipt != staged_receipt:
+            raise ChildExecutionValidationError("state_reuse")
+    except BaseException as error:
+        try:
+            _cleanup_model_capture_staging(
+                staging_directory,
+                staging_path,
+                staging_identity,
+            )
+        except BaseException as cleanup_error:
+            error.add_note(
+                "model capture staging cleanup failed without replacing the "
+                f"primary error: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+    visible = _visible_forbidden_environment()
+    return ModelCaptureChildResponse(
+        case_index=request.case_index,
+        model_attempt=request.model_attempt,
+        case_manifest_sha256=request.case_manifest_sha256,
+        references=references,
+        database_receipt=database_receipt,
         pid=os.getpid(),
         process_instance_id=PROCESS_INSTANCE_ID,
         isolated_mode=bool(sys.flags.isolated),
@@ -6266,6 +6794,7 @@ def execute_future_batch_request(
 def run_isolated_child_raw(
     request: CaptureBatchRequest
     | CaptureChildRequest
+    | ModelCaptureChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -6280,7 +6809,12 @@ def run_isolated_child_raw(
         or role not in {"capture-child", "future-child"}
         or (
             role == "capture-child"
-            and type(request) not in {CaptureBatchRequest, CaptureChildRequest}
+            and type(request)
+            not in {
+                CaptureBatchRequest,
+                CaptureChildRequest,
+                ModelCaptureChildRequest,
+            }
         )
         or (
             role == "future-child"
@@ -6338,6 +6872,7 @@ def _is_canonical_uuid4(value: object) -> bool:
 def _validate_child_process_response(
     response: CaptureBatchResponse
     | CaptureChildResponse
+    | ModelCaptureChildResponse
     | FutureBatchResponse
     | FutureChildResponse,
     *,
@@ -6378,6 +6913,7 @@ def _validate_child_process_response(
 def run_isolated_child(
     request: CaptureBatchRequest
     | CaptureChildRequest
+    | ModelCaptureChildRequest
     | FutureBatchRequest
     | FutureChildRequest,
     *,
@@ -6386,6 +6922,7 @@ def run_isolated_child(
 ) -> (
     CaptureBatchResponse
     | CaptureChildResponse
+    | ModelCaptureChildResponse
     | FutureBatchResponse
     | FutureChildResponse
 ):
@@ -6406,6 +6943,7 @@ def run_isolated_child(
     expected_type = {
         CaptureBatchRequest: CaptureBatchResponse,
         CaptureChildRequest: CaptureChildResponse,
+        ModelCaptureChildRequest: ModelCaptureChildResponse,
         FutureBatchRequest: FutureBatchResponse,
         FutureChildRequest: FutureChildResponse,
     }[type(request)]
@@ -6419,6 +6957,24 @@ def run_isolated_child(
             raise ChildExecutionValidationError("assignment_mismatch")
     elif type(request) is CaptureChildRequest:
         if response.case_index != request.case_index:
+            raise ChildExecutionValidationError("assignment_mismatch")
+    elif type(request) is ModelCaptureChildRequest:
+        case, expected_references = _model_capture_assignment(request)
+        receipt = response.database_receipt
+        _model_capture_directory_identity(os.path.dirname(request.database_path))
+        observed_receipt = _model_capture_database_receipt(
+            request.database_path,
+            expected_identity=(receipt.device, receipt.inode),
+            durable=False,
+        )
+        if (
+            response.case_index != request.case_index
+            or response.model_attempt != request.model_attempt
+            or response.case_manifest_sha256 != request.case_manifest_sha256
+            or response.references != expected_references
+            or case_manifest_sha256(case) != request.case_manifest_sha256
+            or observed_receipt != receipt
+        ):
             raise ChildExecutionValidationError("assignment_mismatch")
     elif type(request) is FutureBatchRequest:
         expected_index_sequence = tuple(item.execution_index for item in request.items)
@@ -10741,6 +11297,8 @@ def _child_main() -> int:
                 response: object = execute_capture_batch_request(request)
             elif type(request) is CaptureChildRequest:
                 response = execute_capture_child_request(request)
+            elif type(request) is ModelCaptureChildRequest:
+                response = execute_model_capture_child_request(request)
             else:
                 raise WireProtocolError("closed_schema")
         else:
