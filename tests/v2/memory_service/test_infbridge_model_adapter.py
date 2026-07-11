@@ -30,9 +30,12 @@ from examples.memory_service.infbridge_model_adapter import (
     ModelAdapterDecodingV2,
     RunEnvelopeV2,
     RuntimeConfigV2,
+    audited_model_call_execution_v2_from_artifacts,
     audited_model_call_receipt_v2_bytes,
+    audited_model_call_receipt_v2_from_bytes,
     audited_model_call_receipt_v2_sha256,
     infbridge_run_envelope_v2_bytes,
+    infbridge_run_envelope_v2_from_bytes,
     infbridge_run_envelope_v2_sha256,
     prepare_infbridge_run_envelope_v2,
     validate_infbridge_model_call_v2,
@@ -41,6 +44,7 @@ from examples.memory_service.infbridge_model_adapter import (
 from areal.v2.inference_service.client_trace import (
     GenerationPhysicalTrace,
     GenerationResponseEvidence,
+    generation_physical_trace_bytes,
     generation_physical_trace_sha256,
     generation_response_evidence_bytes,
     generation_response_evidence_sha256,
@@ -363,6 +367,7 @@ async def test_envelope_is_deterministic_canonical_ascii(
             separators=(",", ":"),
             allow_nan=False,
         ).encode("ascii")
+        assert infbridge_run_envelope_v2_from_bytes(encoded) == first
         assert set(value) == {
             "adapter_algorithm",
             "call_plans",
@@ -461,6 +466,83 @@ async def test_envelope_is_deterministic_canonical_ascii(
 
 
 @pytest.mark.asyncio
+async def test_envelope_loader_rejects_noncanonical_and_closed_schema_values(
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: _ByteTokenizer,
+) -> None:
+    bridge = _make_bridge()
+    try:
+        envelope = prepare_infbridge_run_envelope_v2(
+            manifest,
+            tokenizer,
+            bridge,
+            max_new_tokens=32,
+        )
+        encoded = infbridge_run_envelope_v2_bytes(envelope)
+        unknown_field = json.loads(encoded)
+        unknown_field["unknown"] = 1
+        wrong_nested_type = json.loads(encoded)
+        wrong_nested_type["decoding"]["stop_token_ids"] = {}
+        variants = (
+            b" " + encoded,
+            b'{"adapter_algorithm":"duplicate",' + encoded[1:],
+            json.dumps(
+                unknown_field,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+            json.dumps(
+                wrong_nested_type,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+        )
+        for variant in variants:
+            with pytest.raises(InfBridgeModelAdapterError) as error:
+                infbridge_run_envelope_v2_from_bytes(variant)
+            _assert_reason(error, "run_envelope")
+    finally:
+        await bridge.aclose()
+
+
+def test_receipt_loader_rejects_noncanonical_and_closed_schema_values() -> None:
+    receipt = AuditedModelCallReceiptV2(
+        schema_version=2,
+        manifest_sha256="a" * 64,
+        run_envelope_sha256="b" * 64,
+        slot_index=0,
+        case_index=0,
+        arm=helpfulness.MODEL_ARMS[0],
+        request_id="request-id",
+        generation_trace_sha256="c" * 64,
+        generation_response_evidence_sha256="d" * 64,
+        generation_response_evidence_byte_count=1,
+        decoded_response_utf8_sha256="e" * 64,
+        decoded_response_utf8_bytes=0,
+    )
+    encoded = audited_model_call_receipt_v2_bytes(receipt)
+    assert audited_model_call_receipt_v2_from_bytes(encoded) == receipt
+    unknown_field = json.loads(encoded)
+    unknown_field["unknown"] = 1
+    variants = (
+        encoded + b"\n",
+        b'{"arm":"duplicate",' + encoded[1:],
+        json.dumps(
+            unknown_field,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii"),
+    )
+    for variant in variants:
+        with pytest.raises(InfBridgeModelAdapterError) as error:
+            audited_model_call_receipt_v2_from_bytes(variant)
+        _assert_reason(error, "receipt_mismatch")
+
+
+@pytest.mark.asyncio
 async def test_normal_stop_returns_a_valid_audited_execution_and_v1_projection(
     manifest: helpfulness.ModelRunManifest,
     tokenizer: _ByteTokenizer,
@@ -520,6 +602,9 @@ async def test_normal_stop_returns_a_valid_audited_execution_and_v1_projection(
             == hashlib.sha256(b"ANSWER").hexdigest()
         )
         receipt_bytes = audited_model_call_receipt_v2_bytes(execution.receipt)
+        assert (
+            audited_model_call_receipt_v2_from_bytes(receipt_bytes) == execution.receipt
+        )
         assert set(json.loads(receipt_bytes)) == {
             "arm",
             "case_index",
@@ -568,6 +653,29 @@ async def test_normal_stop_returns_a_valid_audited_execution_and_v1_projection(
             },
             "stream": False,
         }
+        reloaded = audited_model_call_execution_v2_from_artifacts(
+            manifest,
+            tokenizer,
+            envelope,
+            receipt_bytes=receipt_bytes,
+            trace_bytes=generation_physical_trace_bytes(execution.trace),
+            response_evidence_bytes=response_evidence_bytes,
+            decoded_response_utf8=b"ANSWER",
+            backend=SGLangBridgeBackend(),
+        )
+        assert reloaded == execution
+        with pytest.raises(InfBridgeModelAdapterError) as error:
+            audited_model_call_execution_v2_from_artifacts(
+                manifest,
+                tokenizer,
+                envelope,
+                receipt_bytes=receipt_bytes,
+                trace_bytes=generation_physical_trace_bytes(execution.trace),
+                response_evidence_bytes=response_evidence_bytes,
+                decoded_response_utf8=b"DRIFT",
+                backend=SGLangBridgeBackend(),
+            )
+        _assert_reason(error, "receipt_mismatch")
         assert envelope.call_plans[0].first_prepared_request_json_sha256 == (
             prepared_request_json_sha256(sent_payloads[0])
         )

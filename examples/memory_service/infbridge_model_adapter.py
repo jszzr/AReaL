@@ -36,8 +36,10 @@ from areal.v2.inference_service.client_trace import (
     GenerationResponseEvidence,
     ParsedResponseJSONEvidence,
     generation_physical_trace_bytes,
+    generation_physical_trace_from_bytes,
     generation_physical_trace_sha256,
     generation_response_evidence_bytes,
+    generation_response_evidence_from_bytes,
     generation_response_evidence_sha256,
     generation_response_evidence_values,
     prepared_request_json_sha256,
@@ -62,9 +64,12 @@ __all__ = [
     "ModelAdapterDecodingV2",
     "RunEnvelopeV2",
     "RuntimeConfigV2",
+    "audited_model_call_execution_v2_from_artifacts",
     "audited_model_call_receipt_v2_bytes",
+    "audited_model_call_receipt_v2_from_bytes",
     "audited_model_call_receipt_v2_sha256",
     "infbridge_run_envelope_v2_bytes",
+    "infbridge_run_envelope_v2_from_bytes",
     "infbridge_run_envelope_v2_sha256",
     "prepare_infbridge_run_envelope_v2",
     "validate_infbridge_model_call_v2",
@@ -245,6 +250,60 @@ def _canonical_json_bytes(value: object) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("ascii")
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("non-finite JSON numbers are forbidden")
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON keys are forbidden")
+        value[key] = item
+    return value
+
+
+def _parse_canonical_json_object(
+    value: object,
+    *,
+    max_bytes: int,
+    reason: str,
+) -> dict[str, object]:
+    if type(value) is not bytes or not value or len(value) > max_bytes:
+        raise InfBridgeModelAdapterError(reason)
+    try:
+        text = value.decode("ascii")
+        decoded = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+        if type(decoded) is not dict or _canonical_json_bytes(decoded) != value:
+            raise ValueError("artifact is not one canonical JSON object")
+    except (
+        UnicodeDecodeError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        RecursionError,
+    ) as error:
+        raise InfBridgeModelAdapterError(reason) from error
+    return decoded
+
+
+def _require_json_keys(
+    value: object,
+    expected: frozenset[str],
+    *,
+    reason: str,
+) -> dict[str, object]:
+    if type(value) is not dict or frozenset(value) != expected:
+        raise InfBridgeModelAdapterError(reason)
+    return value
 
 
 def _is_sha256(value: object) -> bool:
@@ -922,6 +981,149 @@ def infbridge_run_envelope_v2_bytes(envelope: RunEnvelopeV2) -> bytes:
     return _canonical_json_bytes(value)
 
 
+def infbridge_run_envelope_v2_from_bytes(value: bytes) -> RunEnvelopeV2:
+    """Strictly load one canonical envelope for the current Python runtime."""
+
+    reason = "run_envelope"
+    decoded = _parse_canonical_json_object(
+        value,
+        max_bytes=8_388_608,
+        reason=reason,
+    )
+    _require_json_keys(
+        decoded,
+        frozenset(
+            {
+                "kind",
+                "schema_version",
+                "adapter_algorithm",
+                "execution_mode",
+                "manifest_sha256",
+                "runtime_config_sha256",
+                "decoding",
+                "evidence_policy",
+                "runtime",
+                "call_plans",
+            }
+        ),
+        reason=reason,
+    )
+    if decoded["kind"] != _ENVELOPE_KIND:
+        raise InfBridgeModelAdapterError(reason)
+    decoding_value = _require_json_keys(
+        decoded["decoding"],
+        frozenset(
+            {
+                "mode",
+                "n_samples",
+                "temperature",
+                "top_p",
+                "top_k",
+                "max_new_tokens",
+                "stop_token_ids",
+                "ignore_eos",
+                "skip_special_tokens",
+                "stop_sequences",
+                "frequency_penalty",
+                "use_beam_search",
+                "with_lora",
+                "decode_policy",
+                "decoder_kind",
+                "tokenizer_id",
+                "tokenizer_artifact_sha256",
+                "decoder_state_sha256",
+                "audit_callable_source_sha256",
+                "audit_callable_runtime_sha256",
+                "decoder_callable_source_sha256",
+                "decoder_callable_runtime_sha256",
+                "python_cache_tag",
+                "python_version",
+            }
+        ),
+        reason=reason,
+    )
+    evidence_value = _require_json_keys(
+        decoded["evidence_policy"],
+        frozenset(
+            {
+                "schema_version",
+                "require_response_preimages",
+                "max_response_json_bytes_per_attempt",
+                "max_response_evidence_bytes_per_call",
+            }
+        ),
+        reason=reason,
+    )
+    runtime_value = _require_json_keys(
+        decoded["runtime"],
+        frozenset(
+            {
+                "backend_kind",
+                "backend_addr_sha256",
+                "configured_attempt_limit",
+                "request_timeout_hex",
+                "resubmit_wait_hex",
+                "pause_state_kind",
+                "expected_client_version",
+                "expected_client_version_epoch",
+            }
+        ),
+        reason=reason,
+    )
+    stop_token_ids = decoding_value["stop_token_ids"]
+    stop_sequences = decoding_value["stop_sequences"]
+    call_plan_values = decoded["call_plans"]
+    if (
+        type(stop_token_ids) is not list
+        or type(stop_sequences) is not list
+        or type(call_plan_values) is not list
+    ):
+        raise InfBridgeModelAdapterError(reason)
+    decoding_arguments = dict(decoding_value)
+    decoding_arguments["stop_token_ids"] = tuple(stop_token_ids)
+    decoding_arguments["stop_sequences"] = tuple(stop_sequences)
+    call_plan_keys = frozenset(
+        {
+            "slot_index",
+            "case_index",
+            "arm",
+            "request_id",
+            "input_token_ids_sha256",
+            "input_token_count",
+            "expected_endpoint",
+            "expected_method",
+            "first_prepared_request_json_sha256",
+        }
+    )
+    call_plans = tuple(
+        CallPlanV2(
+            **_require_json_keys(item, call_plan_keys, reason=reason)  # type: ignore[arg-type]
+        )
+        for item in call_plan_values
+    )
+    envelope = RunEnvelopeV2(
+        schema_version=decoded["schema_version"],  # type: ignore[arg-type]
+        adapter_algorithm=decoded["adapter_algorithm"],  # type: ignore[arg-type]
+        execution_mode=decoded["execution_mode"],  # type: ignore[arg-type]
+        manifest_sha256=decoded["manifest_sha256"],  # type: ignore[arg-type]
+        runtime_config_sha256=decoded["runtime_config_sha256"],  # type: ignore[arg-type]
+        decoding=ModelAdapterDecodingV2(
+            **decoding_arguments,  # type: ignore[arg-type]
+        ),
+        evidence_policy=EvidencePolicyV2(
+            **evidence_value,  # type: ignore[arg-type]
+        ),
+        runtime=RuntimeConfigV2(
+            **runtime_value,  # type: ignore[arg-type]
+        ),
+        call_plans=call_plans,
+    )
+    _validate_envelope_shape(envelope)
+    if infbridge_run_envelope_v2_bytes(envelope) != value:
+        raise InfBridgeModelAdapterError(reason)
+    return envelope
+
+
 def infbridge_run_envelope_v2_sha256(envelope: RunEnvelopeV2) -> str:
     return hashlib.sha256(infbridge_run_envelope_v2_bytes(envelope)).hexdigest()
 
@@ -1316,10 +1518,105 @@ def audited_model_call_receipt_v2_bytes(
     return _canonical_json_bytes(_receipt_value(_validate_receipt_shape(receipt)))
 
 
+def audited_model_call_receipt_v2_from_bytes(
+    value: bytes,
+) -> AuditedModelCallReceiptV2:
+    """Strictly load one canonical audited call receipt."""
+
+    reason = "receipt_mismatch"
+    decoded = _parse_canonical_json_object(
+        value,
+        max_bytes=16_384,
+        reason=reason,
+    )
+    _require_json_keys(
+        decoded,
+        frozenset(
+            {
+                "kind",
+                "schema_version",
+                "manifest_sha256",
+                "run_envelope_sha256",
+                "slot_index",
+                "case_index",
+                "arm",
+                "request_id",
+                "generation_trace_sha256",
+                "generation_response_evidence_sha256",
+                "generation_response_evidence_byte_count",
+                "decoded_response_utf8_sha256",
+                "decoded_response_utf8_bytes",
+            }
+        ),
+        reason=reason,
+    )
+    if decoded["kind"] != _RECEIPT_KIND:
+        raise InfBridgeModelAdapterError(reason)
+    arguments = dict(decoded)
+    del arguments["kind"]
+    receipt = AuditedModelCallReceiptV2(
+        **arguments,  # type: ignore[arg-type]
+    )
+    _validate_receipt_shape(receipt)
+    if audited_model_call_receipt_v2_bytes(receipt) != value:
+        raise InfBridgeModelAdapterError(reason)
+    return receipt
+
+
 def audited_model_call_receipt_v2_sha256(
     receipt: AuditedModelCallReceiptV2,
 ) -> str:
     return hashlib.sha256(audited_model_call_receipt_v2_bytes(receipt)).hexdigest()
+
+
+def audited_model_call_execution_v2_from_artifacts(
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+    *,
+    receipt_bytes: bytes,
+    trace_bytes: bytes,
+    response_evidence_bytes: bytes,
+    decoded_response_utf8: bytes,
+    backend: SGLangBridgeBackend,
+) -> AuditedModelCallExecutionV2:
+    """Strictly load and replay-audit one persisted successful call."""
+
+    try:
+        receipt = audited_model_call_receipt_v2_from_bytes(receipt_bytes)
+        trace = generation_physical_trace_from_bytes(trace_bytes)
+        response_evidence = generation_response_evidence_from_bytes(
+            response_evidence_bytes
+        )
+        if type(decoded_response_utf8) is not bytes:
+            raise TypeError("decoded response must be exact bytes")
+        response = decoded_response_utf8.decode("utf-8", errors="strict")
+    except InfBridgeModelAdapterError:
+        raise
+    except Exception as error:
+        raise InfBridgeModelAdapterError("receipt_mismatch") from error
+    prepared_call, slot_index = _manifest_call(
+        manifest,
+        case_index=receipt.case_index,
+        arm=receipt.arm,
+    )
+    if slot_index != receipt.slot_index:
+        raise InfBridgeModelAdapterError("receipt_mismatch")
+    execution = AuditedModelCallExecutionV2(
+        response=response,
+        trace=trace,
+        response_evidence=response_evidence,
+        receipt=receipt,
+        legacy_execution=_expected_legacy_execution(prepared_call, response),
+    )
+    validate_infbridge_model_call_v2(
+        manifest,
+        tokenizer,
+        envelope,
+        execution,
+        backend=backend,
+    )
+    return execution
 
 
 def _validate_execution_for_plan(
