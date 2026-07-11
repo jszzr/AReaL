@@ -32,10 +32,12 @@ from examples.memory_service import scoped_codebook_eval as helpfulness
 from examples.memory_service.infbridge_model_adapter import (
     AuditedDecoderTokenizer,
     AuditedModelCallExecutionV2,
+    AuditedModelCallReceiptV2,
     CallPlanV2,
     RunEnvelopeV2,
     audited_model_call_execution_v2_from_artifacts,
     audited_model_call_receipt_v2_bytes,
+    audited_model_call_receipt_v2_from_bytes,
     infbridge_run_envelope_v2_bytes,
     infbridge_run_envelope_v2_from_bytes,
     infbridge_run_envelope_v2_sha256,
@@ -49,12 +51,16 @@ from areal.v2.inference_service.client_trace import (
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
 __all__ = [
+    "LedgerArtifactCommitmentV1",
     "RunLedgerError",
+    "RunLedgerReceiptSlotV1",
+    "RunLedgerReceiptSnapshotV1",
     "RunLedgerSlotSnapshotV1",
     "RunLedgerSnapshotV1",
     "RunLedgerSessionV1",
     "initialize_run_ledger",
     "load_run_ledger",
+    "load_run_ledger_receipt_snapshot_v1",
 ]
 
 LedgerSlotState = Literal[
@@ -106,9 +112,51 @@ class RunLedgerSnapshotV1:
     slots: tuple[RunLedgerSlotSnapshotV1, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class LedgerArtifactCommitmentV1:
+    """Content-blind size and digest for one persisted ledger artifact."""
+
+    byte_count: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunLedgerReceiptSlotV1:
+    """One terminal slot projected without returning response content."""
+
+    plan: CallPlanV2
+    plan_sha256: str
+    state: Literal["SUCCEEDED", "ATTRITION"]
+    attempt_count: int
+    canonical_receipt: AuditedModelCallReceiptV2 | None
+    receipt_commitment: LedgerArtifactCommitmentV1 | None
+    trace_commitment: LedgerArtifactCommitmentV1 | None
+    response_evidence_commitment: LedgerArtifactCommitmentV1 | None
+    decoded_response_commitment: LedgerArtifactCommitmentV1 | None
+    terminal_reason: str | None
+    ledger_leaf_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunLedgerReceiptSnapshotV1:
+    """Answer-free validation report, not a capability for later trust."""
+
+    schema_version: int
+    projection_policy: str
+    ledger_policy: str
+    run_id: str
+    manifest_sha256: str
+    run_envelope_sha256: str
+    call_count: int
+    seal_kind: Literal["complete", "complete_with_attrition"]
+    run_root_sha256: str
+    slots: tuple[RunLedgerReceiptSlotV1, ...]
+
+
 _APPLICATION_ID = 0x41524C31  # ASCII "ARL1"
 _SCHEMA_VERSION = 1
 _LEDGER_POLICY = "single-cursor-prewrite-v1"
+_RECEIPT_PROJECTION_POLICY = "sealed-answer-content-blind-receipts-v1"
 _MIN_SQLITE_VERSION = (3, 11, 0)
 _BUSY_TIMEOUT_MS = 5_000
 _CALL_COUNT = helpfulness.MODEL_CASE_COUNT * len(helpfulness.MODEL_ARMS)
@@ -1062,8 +1110,6 @@ def _validate_blob_budgets_locked(cursor: sqlite3.Cursor) -> None:
 def _load_snapshot_locked(
     cursor: sqlite3.Cursor,
     identity: _RunIdentity,
-    manifest: helpfulness.ModelRunManifest,
-    tokenizer: AuditedDecoderTokenizer,
     envelope: RunEnvelopeV2,
 ) -> RunLedgerSnapshotV1:
     _validate_blob_budgets_locked(cursor)
@@ -1082,29 +1128,6 @@ def _load_snapshot_locked(
     if len(slots_list) != _CALL_COUNT:
         raise RunLedgerError("ledger_corruption")
     slots = tuple(slots_list)
-    for slot in slots:
-        if slot.state == "SUCCEEDED":
-            try:
-                execution = audited_model_call_execution_v2_from_artifacts(
-                    manifest,
-                    tokenizer,
-                    envelope,
-                    receipt_bytes=slot.receipt_bytes,  # type: ignore[arg-type]
-                    trace_bytes=slot.trace_bytes,  # type: ignore[arg-type]
-                    response_evidence_bytes=slot.response_evidence_bytes,  # type: ignore[arg-type]
-                    decoded_response_utf8=slot.decoded_response_utf8,  # type: ignore[arg-type]
-                    backend=SGLangBridgeBackend(),
-                )
-                receipt = execution.receipt
-                if (
-                    receipt.slot_index != slot.plan.slot_index
-                    or receipt.case_index != slot.plan.case_index
-                    or receipt.arm != slot.plan.arm
-                    or receipt.request_id != slot.plan.request_id
-                ):
-                    raise RunLedgerError("ledger_corruption")
-            except Exception as error:
-                raise RunLedgerError("ledger_corruption") from error
     _validate_slot_sequence(status, seal_kind, slots)
     computed_root = _run_root_sha256(
         run_id=identity.run_id,
@@ -1129,6 +1152,40 @@ def _load_snapshot_locked(
         computed_run_root_sha256=computed_root,
         slots=slots,
     )
+
+
+def _replay_snapshot_success_artifacts(
+    snapshot: RunLedgerSnapshotV1,
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+) -> None:
+    """Preserve the full loader's semantic replay and answer decoding."""
+
+    for slot in snapshot.slots:
+        if slot.state != "SUCCEEDED":
+            continue
+        try:
+            execution = audited_model_call_execution_v2_from_artifacts(
+                manifest,
+                tokenizer,
+                envelope,
+                receipt_bytes=slot.receipt_bytes,  # type: ignore[arg-type]
+                trace_bytes=slot.trace_bytes,  # type: ignore[arg-type]
+                response_evidence_bytes=slot.response_evidence_bytes,  # type: ignore[arg-type]
+                decoded_response_utf8=slot.decoded_response_utf8,  # type: ignore[arg-type]
+                backend=SGLangBridgeBackend(),
+            )
+            receipt = execution.receipt
+            if (
+                receipt.slot_index != slot.plan.slot_index
+                or receipt.case_index != slot.plan.case_index
+                or receipt.arm != slot.plan.arm
+                or receipt.request_id != slot.plan.request_id
+            ):
+                raise RunLedgerError("ledger_corruption")
+        except Exception as error:
+            raise RunLedgerError("ledger_corruption") from error
 
 
 def _rollback_with_note(
@@ -1253,6 +1310,7 @@ def _load_run_ledger_snapshot(
     *,
     identity: _RunIdentity,
     expected_file_identity: tuple[int, int],
+    replay_success_artifacts: bool = True,
 ) -> RunLedgerSnapshotV1:
     """Load one snapshot while pinning the database path to one inode."""
 
@@ -1274,10 +1332,15 @@ def _load_run_ledger_snapshot(
         snapshot = _load_snapshot_locked(
             cursor,
             identity,
-            manifest,
-            tokenizer,
             envelope,
         )
+        if replay_success_artifacts:
+            _replay_snapshot_success_artifacts(
+                snapshot,
+                manifest,
+                tokenizer,
+                envelope,
+            )
         cursor.execute("COMMIT")
         transaction_active = False
         _require_expected_database(path, expected_file_identity)
@@ -1314,6 +1377,159 @@ def load_run_ledger(
         identity=identity,
         expected_file_identity=file_identity,
     )
+
+
+def _receipt_artifact_commitment(
+    value: bytes,
+) -> LedgerArtifactCommitmentV1:
+    return LedgerArtifactCommitmentV1(
+        byte_count=len(value),
+        sha256=_sha256(value),
+    )
+
+
+def _project_receipt_slot_v1(
+    snapshot: RunLedgerSnapshotV1,
+    slot: RunLedgerSlotSnapshotV1,
+) -> RunLedgerReceiptSlotV1:
+    if slot.state == "ATTRITION":
+        if (
+            slot.attempt_count != 1
+            or slot.receipt_bytes is not None
+            or slot.trace_bytes is not None
+            or slot.response_evidence_bytes is not None
+            or slot.decoded_response_utf8 is not None
+            or slot.terminal_reason not in _ATTRITION_REASONS
+        ):
+            raise RunLedgerError("ledger_corruption")
+        return RunLedgerReceiptSlotV1(
+            plan=slot.plan,
+            plan_sha256=slot.plan_sha256,
+            state="ATTRITION",
+            attempt_count=slot.attempt_count,
+            canonical_receipt=None,
+            receipt_commitment=None,
+            trace_commitment=None,
+            response_evidence_commitment=None,
+            decoded_response_commitment=None,
+            terminal_reason=slot.terminal_reason,
+            ledger_leaf_sha256=slot.leaf_sha256,
+        )
+    if (
+        slot.state != "SUCCEEDED"
+        or slot.attempt_count != 1
+        or slot.receipt_bytes is None
+        or slot.trace_bytes is None
+        or slot.response_evidence_bytes is None
+        or slot.decoded_response_utf8 is None
+        or slot.terminal_reason is not None
+    ):
+        raise RunLedgerError("ledger_state")
+    try:
+        receipt = audited_model_call_receipt_v2_from_bytes(slot.receipt_bytes)
+    except Exception as error:
+        raise RunLedgerError("ledger_corruption") from error
+    plan = slot.plan
+    if (
+        receipt.manifest_sha256 != snapshot.manifest_sha256
+        or receipt.run_envelope_sha256 != snapshot.run_envelope_sha256
+        or receipt.slot_index != plan.slot_index
+        or receipt.case_index != plan.case_index
+        or receipt.arm != plan.arm
+        or receipt.request_id != plan.request_id
+    ):
+        raise RunLedgerError("ledger_corruption")
+    receipt_commitment = _receipt_artifact_commitment(slot.receipt_bytes)
+    trace_commitment = _receipt_artifact_commitment(slot.trace_bytes)
+    response_evidence_commitment = _receipt_artifact_commitment(
+        slot.response_evidence_bytes
+    )
+    decoded_response_commitment = _receipt_artifact_commitment(
+        slot.decoded_response_utf8
+    )
+    if (
+        receipt.generation_trace_sha256 != trace_commitment.sha256
+        or receipt.generation_response_evidence_sha256
+        != response_evidence_commitment.sha256
+        or receipt.generation_response_evidence_byte_count
+        != response_evidence_commitment.byte_count
+        or receipt.decoded_response_utf8_sha256 != decoded_response_commitment.sha256
+        or receipt.decoded_response_utf8_bytes != decoded_response_commitment.byte_count
+    ):
+        raise RunLedgerError("ledger_corruption")
+    return RunLedgerReceiptSlotV1(
+        plan=plan,
+        plan_sha256=slot.plan_sha256,
+        state="SUCCEEDED",
+        attempt_count=slot.attempt_count,
+        canonical_receipt=receipt,
+        receipt_commitment=receipt_commitment,
+        trace_commitment=trace_commitment,
+        response_evidence_commitment=response_evidence_commitment,
+        decoded_response_commitment=decoded_response_commitment,
+        terminal_reason=None,
+        ledger_leaf_sha256=slot.leaf_sha256,
+    )
+
+
+def _project_run_ledger_receipts_v1(
+    snapshot: RunLedgerSnapshotV1,
+) -> RunLedgerReceiptSnapshotV1:
+    if (
+        snapshot.status != "SEALED"
+        or snapshot.seal_kind not in ("complete", "complete_with_attrition")
+        or snapshot.stored_run_root_sha256 is None
+        or snapshot.stored_run_root_sha256 != snapshot.computed_run_root_sha256
+    ):
+        raise RunLedgerError("ledger_state")
+    slots = tuple(_project_receipt_slot_v1(snapshot, slot) for slot in snapshot.slots)
+    if len(slots) != _CALL_COUNT:
+        raise RunLedgerError("ledger_corruption")
+    return RunLedgerReceiptSnapshotV1(
+        schema_version=1,
+        projection_policy=_RECEIPT_PROJECTION_POLICY,
+        ledger_policy=snapshot.ledger_policy,
+        run_id=snapshot.run_id,
+        manifest_sha256=snapshot.manifest_sha256,
+        run_envelope_sha256=snapshot.run_envelope_sha256,
+        call_count=snapshot.call_count,
+        seal_kind=snapshot.seal_kind,  # type: ignore[arg-type]
+        run_root_sha256=snapshot.stored_run_root_sha256,
+        slots=slots,
+    )
+
+
+def load_run_ledger_receipt_snapshot_v1(
+    database_path: str | os.PathLike[str],
+    manifest: helpfulness.ModelRunManifest,
+    tokenizer: AuditedDecoderTokenizer,
+    envelope: RunEnvelopeV2,
+) -> RunLedgerReceiptSnapshotV1:
+    """Load sealed receipt commitments without parsing or decoding answers.
+
+    This projection still verifies SQLite structure, all 384 slot leaves, the
+    sealed run root, canonical audited receipts, and their raw artifact hashes.
+    It deliberately does not parse physical traces or response evidence, invoke
+    the tokenizer decoder, return response bytes, or claim semantic replay.
+    Hashes and lengths are commitments, not confidentiality against guessing.
+    ``load_run_ledger`` remains the stronger full-replay API.
+    Later public joins must reload the database rather than trust this
+    constructible report as proof.
+    """
+
+    path = _snapshot_database_path(database_path)
+    file_identity = _require_private_regular_database(path)
+    identity = _run_identity(manifest, tokenizer, envelope)
+    snapshot = _load_run_ledger_snapshot(
+        path,
+        manifest,
+        tokenizer,
+        envelope,
+        identity=identity,
+        expected_file_identity=file_identity,
+        replay_success_artifacts=False,
+    )
+    return _project_run_ledger_receipts_v1(snapshot)
 
 
 def _sql_blob(value: bytes | None) -> sqlite3.Binary | None:
