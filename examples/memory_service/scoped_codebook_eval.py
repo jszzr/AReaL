@@ -17,7 +17,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -55,6 +55,7 @@ MASKED_VALUE = "XXXXX"
 UNKNOWN = "UNKNOWN"
 FAST_PROFILE_NAME = "fast-two-child-v1"
 MODEL_CASE_COUNT = 64
+MODEL_ATTEMPT_LIMIT = 100_000
 MODEL_BOOTSTRAP_RESAMPLES = 10_000
 MODEL_BOOTSTRAP_SEED = 20_260_708
 MODEL_BOOTSTRAP_MATRIX_SHA256 = (
@@ -67,6 +68,29 @@ MODEL_ARMS = (
     "target_masked",
     "stale_release",
     "oracle",
+)
+MODEL_SYSTEM_PROMPT = (
+    b"Use only the memory below. Reply with exactly the code or UNKNOWN."
+)
+MODEL_QUERY_TEMPLATE = (
+    b"What is the current code for {target_key}? "
+    b"Reply with exactly the code or UNKNOWN."
+)
+MODEL_ARM_ORDER_DOMAIN = b"areal-memory-arm-order-v1-20260708|"
+MODEL_THRESHOLDS = (
+    ("masked_abstention_rate_min", "0.90"),
+    ("delta_masked_off_ci_lower_min", "-0.10"),
+    ("delta_masked_off_ci_upper_max", "0.10"),
+    ("oracle_success_rate_min", "0.90"),
+    ("delta_help_point_min", "0.20"),
+    ("delta_help_ci_lower_strict_min", "0"),
+    ("delta_masked_ci_lower_strict_min", "0"),
+    ("delta_help_ci_upper_negative_max", "0"),
+    ("delta_confident_error_ci_upper_max", "0.05"),
+    ("delta_confident_error_ci_lower_strict_min", "0.05"),
+    ("delta_harm_point_max", "-0.20"),
+    ("delta_harm_ci_upper_negative_max", "0"),
+    ("delta_harm_ci_lower_min", "-0.10"),
 )
 _RENDER_HEADER = (
     b"[memory-codebook/v1]\n[mask=XXXXX means unavailable; answer UNKNOWN]\n"
@@ -171,6 +195,66 @@ class ConsumerResult:
 
     response: str
     input_receipt: ConsumerInputReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPrompt:
+    """Frozen production prompt and its half-open memory byte range."""
+
+    prompt: bytes
+    context_start: int
+    context_end: int
+
+
+class ModelTokenizer(Protocol):
+    """Minimal tokenizer surface required by the local evaluator boundary."""
+
+    def encode(
+        self,
+        value: bytes,
+        *,
+        add_special_tokens: bool,
+    ) -> tuple[int, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedModelCall:
+    """Evaluator-owned prompt, immutable IDs, and independently expected receipts."""
+
+    prompt: bytes
+    context_start: int
+    context_end: int
+    input_token_ids: tuple[int, ...]
+    consumer_input_receipt: ConsumerInputReceipt
+    expected_receipt: ModelCallReceipt
+    rendered_context_token_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelBoundaryOutput:
+    """Response plus receipt measured where the boundary actually submits."""
+
+    response: str
+    receipt: ModelCallReceipt | None
+
+
+class ModelBoundary(Protocol):
+    def submit(
+        self,
+        input_token_ids: tuple[int, ...],
+        *,
+        prepared_call: PreparedModelCall,
+    ) -> ModelBoundaryOutput: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallExecution:
+    response: str
+    consumer_input_receipt: ConsumerInputReceipt
+    model_call_receipt: ModelCallReceipt | None
+    rendered_context_token_count: int
+    valid: bool
+    invalid_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +517,18 @@ class ObservationValidationError(ValueError):
         super().__init__(reason)
 
 
+class ModelProtocolError(ValueError):
+    """A closed tokenizer or model-boundary protocol violation."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ModelBoundaryExecutionError(ModelProtocolError):
+    """A failure originating inside the external model-call boundary."""
+
+
 @dataclass(frozen=True, slots=True)
 class WireSourceSpec:
     """Closed child-side capability assignment without scorer-owned truth."""
@@ -674,6 +770,121 @@ class ModelCaseIdentity:
     case: CodebookCase
     case_manifest_sha256: str
     references: CaseDatabaseReferences
+
+
+@dataclass(frozen=True, slots=True)
+class ModelArmCallRegistration:
+    """One preregistered arm's exact local model-call input."""
+
+    arm: str
+    rendered_context_sha256: str
+    rendered_context_utf8_bytes: int
+    prepared_call: PreparedModelCall
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaseRegistration:
+    """First token-balanced candidate accepted for one fixed subject slot."""
+
+    identity: ModelCaseIdentity
+    model_attempt: int
+    query_sha256: str
+    balanced_context_token_count: int
+    balanced_prompt_token_count: int
+    current_value_token_count: int
+    stale_value_token_count: int
+    arm_calls: tuple[ModelArmCallRegistration, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelManifestFailure:
+    """Explicit preregistration failure; the case slot is never replaced."""
+
+    case_index: int
+    reason: str
+    attempted_model_candidates: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCaseRegistrationResult:
+    registration: ModelCaseRegistration | None
+    failure: ModelManifestFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelThreshold:
+    name: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRunManifest:
+    """Closed 64-case/384-call preregistration for one frozen model run."""
+
+    schema_version: int
+    profile: str
+    case_seed: str
+    case_count: int
+    call_count: int
+    generator_commit_sha: str
+    evaluator_commit_sha: str
+    model_id: str
+    model_weights_sha256: str
+    tokenizer_id: str
+    tokenizer_sha256: str
+    system_prompt_sha256: str
+    prompt_grammar_sha256: str
+    renderer_sha256: str
+    query_template_sha256: str
+    arm_order_algorithm: str
+    arm_order_domain_sha256: str
+    decoding_mode: str
+    decoding_temperature: str
+    decoding_samples: int
+    bootstrap_algorithm: str
+    bootstrap_resamples: int
+    bootstrap_seed: int
+    bootstrap_matrix_sha256: str
+    thresholds: tuple[ModelThreshold, ...]
+    cases: tuple[ModelCaseRegistration, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRunManifestResult:
+    manifest: ModelRunManifest | None
+    failure: ModelManifestFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDryRunCall:
+    case_index: int
+    arm: str
+    attempt_index: int
+    execution: ModelCallExecution | None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDryRunInvalidCall:
+    case_index: int
+    arm: str
+    attempted: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDryRunResult:
+    validity: str
+    invalid_calls: tuple[ModelDryRunInvalidCall, ...]
+    manifest_sha256: str
+    calls: tuple[ModelDryRunCall, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCandidateBalance:
+    context_token_count: int
+    prompt_token_count: int
+    current_value_token_count: int
+    stale_value_token_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1036,6 +1247,117 @@ def generate_case(case_index: int) -> CodebookCase:
     )
 
 
+def _model_candidate_unique_token(
+    *,
+    case_index: int,
+    label: str,
+    item_index: int,
+    model_attempt: int,
+    length: int,
+    used: set[str],
+    lower: bool = False,
+) -> str | None:
+    for collision_attempt in range(256):
+        attempt = model_attempt * 256 + collision_attempt
+        value = _token(
+            CASE_SEED,
+            case_index,
+            label,
+            item_index,
+            attempt,
+            length,
+        )
+        if lower:
+            value = f"project-{value.lower()}"
+        if value not in used and value not in {UNKNOWN, MASKED_VALUE}:
+            used.add(value)
+            return value
+    return None
+
+
+def _generate_model_candidate(
+    case_index: int,
+    *,
+    model_attempt: int,
+) -> CodebookCase | None:
+    """Generate one model candidate with a disjoint 256-attempt collision lane."""
+
+    if (
+        type(case_index) is not int
+        or case_index < 0
+        or type(model_attempt) is not int
+        or model_attempt not in range(MODEL_ATTEMPT_LIMIT)
+    ):
+        raise ValueError("model candidate coordinates")
+    used_keys: set[str] = set()
+    used_values: set[str] = set()
+
+    def key(label: str, item_index: int) -> str | None:
+        return _model_candidate_unique_token(
+            case_index=case_index,
+            label=label,
+            item_index=item_index,
+            model_attempt=model_attempt,
+            length=6,
+            used=used_keys,
+            lower=True,
+        )
+
+    def value(label: str, item_index: int) -> str | None:
+        return _model_candidate_unique_token(
+            case_index=case_index,
+            label=label,
+            item_index=item_index,
+            model_attempt=model_attempt,
+            length=5,
+            used=used_values,
+        )
+
+    target_key = key("target", 0)
+    old_value = value("old", 0)
+    current_value = value("current", 0)
+    shared_keys = tuple(key("shared", item_index) for item_index in range(4))
+    shared_values = tuple(value("shared-value", item_index) for item_index in range(4))
+    padding_key = key("padding", 0)
+    padding_value = value("padding-value", 0)
+    generated = (
+        target_key,
+        old_value,
+        current_value,
+        *shared_keys,
+        *shared_values,
+        padding_key,
+        padding_value,
+    )
+    if any(item is None for item in generated):
+        return None
+    return CodebookCase(
+        schema_version=SCHEMA_VERSION,
+        seed=CASE_SEED,
+        case_id=f"nonce-{case_index:03d}",
+        subject_id=f"nonce-subject-{case_index:03d}",
+        case_index=case_index,
+        target_slot=case_index % 5,
+        target_key=target_key,  # type: ignore[arg-type]
+        old_value=old_value,  # type: ignore[arg-type]
+        current_value=current_value,  # type: ignore[arg-type]
+        masked_value=MASKED_VALUE,
+        shared_entries=tuple(
+            CodebookEntry(key=shared_key, value=shared_value)
+            for shared_key, shared_value in zip(
+                shared_keys,
+                shared_values,
+                strict=True,
+            )
+            if shared_key is not None and shared_value is not None
+        ),
+        padding_entry=CodebookEntry(
+            key=padding_key,  # type: ignore[arg-type]
+            value=padding_value,  # type: ignore[arg-type]
+        ),
+    )
+
+
 def _case_manifest(case: CodebookCase) -> dict[str, Any]:
     return {
         "schema_version": case.schema_version,
@@ -1182,6 +1504,22 @@ def consume_scripted(
         if key == target_key and value != MASKED_VALUE:
             response = value
     return ConsumerResult(response=response, input_receipt=receipt)
+
+
+def compose_model_prompt(rendered_context: bytes, query: bytes) -> ModelPrompt:
+    """Compose the only production model prompt used by this evaluator."""
+
+    if type(rendered_context) is not bytes or type(query) is not bytes:
+        raise TypeError("model prompt inputs must be bytes")
+    _query_key(query)
+    prefix = b"[system]\n" + MODEL_SYSTEM_PROMPT + b"\n[memory]\n"
+    context_start = len(prefix)
+    context_end = context_start + len(rendered_context)
+    return ModelPrompt(
+        prompt=prefix + rendered_context + b"[query]\n" + query + b"\n",
+        context_start=context_start,
+        context_end=context_end,
+    )
 
 
 def normalize_response(response: str) -> str:
@@ -2167,6 +2505,8 @@ def make_model_call_receipt(
         type(token_id) is not int for token_id in input_token_ids
     ):
         raise TypeError("input_token_ids must be a tuple of integers")
+    if not input_token_ids or any(token_id < 0 for token_id in input_token_ids):
+        raise ValueError("input_token_ids must be non-empty and non-negative")
     token_bytes = json.dumps(
         list(input_token_ids),
         separators=(",", ":"),
@@ -2180,6 +2520,125 @@ def make_model_call_receipt(
         ).hexdigest(),
         submitted_input_token_ids_sha256=hashlib.sha256(token_bytes).hexdigest(),
         submitted_input_token_count=len(input_token_ids),
+    )
+
+
+def _encode_model_tokens(
+    tokenizer: ModelTokenizer,
+    value: bytes,
+    *,
+    add_special_tokens: bool,
+    allow_empty: bool = False,
+) -> tuple[int, ...]:
+    try:
+        token_ids = tokenizer.encode(
+            value,
+            add_special_tokens=add_special_tokens,
+        )
+    except Exception as error:
+        raise ModelProtocolError("tokenizer_failure") from error
+    if type(token_ids) is not tuple or any(
+        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    ):
+        raise ModelProtocolError("tokenizer_failure")
+    if (allow_empty and token_ids) or (not allow_empty and not token_ids):
+        raise ModelProtocolError("tokenizer_failure")
+    return token_ids
+
+
+def prepare_model_call(
+    rendered_context: bytes,
+    query: bytes,
+    tokenizer: ModelTokenizer,
+) -> PreparedModelCall:
+    """Tokenize evaluator-owned bytes and freeze the exact call receipts."""
+
+    model_prompt = compose_model_prompt(rendered_context, query)
+    context_token_ids = _encode_model_tokens(
+        tokenizer,
+        rendered_context,
+        add_special_tokens=False,
+        allow_empty=not rendered_context,
+    )
+    prompt_token_ids = _encode_model_tokens(
+        tokenizer,
+        model_prompt.prompt,
+        add_special_tokens=True,
+    )
+    consumer_receipt = _expected_consumer_receipt(rendered_context, query)
+    expected_receipt = make_model_call_receipt(
+        submitted_prompt=model_prompt.prompt,
+        context_start=model_prompt.context_start,
+        context_end=model_prompt.context_end,
+        input_token_ids=prompt_token_ids,
+    )
+    return PreparedModelCall(
+        prompt=model_prompt.prompt,
+        context_start=model_prompt.context_start,
+        context_end=model_prompt.context_end,
+        input_token_ids=prompt_token_ids,
+        consumer_input_receipt=consumer_receipt,
+        expected_receipt=expected_receipt,
+        rendered_context_token_count=len(context_token_ids),
+    )
+
+
+def _model_call_receipt_is_well_typed(value: object) -> bool:
+    if type(value) is not ModelCallReceipt:
+        return False
+    hash_values = (
+        value.submitted_prompt_sha256,
+        value.submitted_prompt_context_sha256,
+        value.submitted_input_token_ids_sha256,
+    )
+    return (
+        all(
+            type(hash_value) is str
+            and _SHA256_PATTERN.fullmatch(hash_value) is not None
+            for hash_value in hash_values
+        )
+        and type(value.submitted_prompt_context_start) is int
+        and type(value.submitted_prompt_context_end) is int
+        and 0
+        <= value.submitted_prompt_context_start
+        <= value.submitted_prompt_context_end
+        and type(value.submitted_input_token_count) is int
+        and value.submitted_input_token_count > 0
+    )
+
+
+def submit_model_call(
+    prepared_call: PreparedModelCall,
+    boundary: ModelBoundary,
+) -> ModelCallExecution:
+    """Submit exactly the prepared tuple and reject absent or forged receipts."""
+
+    if type(prepared_call) is not PreparedModelCall:
+        raise ModelProtocolError("prepared_call")
+    try:
+        output = boundary.submit(
+            prepared_call.input_token_ids,
+            prepared_call=prepared_call,
+        )
+    except Exception as error:
+        raise ModelBoundaryExecutionError("model_call_failure") from error
+    if type(output) is not ModelBoundaryOutput or type(output.response) is not str:
+        raise ModelBoundaryExecutionError("boundary_response")
+    receipt = (
+        output.receipt if _model_call_receipt_is_well_typed(output.receipt) else None
+    )
+    valid = (
+        receipt is not None
+        and _model_call_receipt_is_well_typed(prepared_call.expected_receipt)
+        and receipt == prepared_call.expected_receipt
+    )
+    return ModelCallExecution(
+        response=output.response,
+        consumer_input_receipt=prepared_call.consumer_input_receipt,
+        model_call_receipt=receipt,
+        rendered_context_token_count=prepared_call.rendered_context_token_count,
+        valid=valid,
+        invalid_reason=None if valid else "model_call_receipt",
     )
 
 
@@ -8794,15 +9253,763 @@ def model_arm_order(case_id: str) -> tuple[str, ...]:
 
     if type(case_id) is not str or not case_id:
         raise TypeError("case_id")
-    prefix = "areal-memory-arm-order-v1-20260708|"
     return tuple(
         sorted(
             MODEL_ARMS,
             key=lambda arm: (
-                hashlib.sha256(f"{prefix}{case_id}|{arm}".encode()).digest(),
+                hashlib.sha256(
+                    MODEL_ARM_ORDER_DOMAIN + f"{case_id}|{arm}".encode()
+                ).digest(),
                 arm,
             ),
         )
+    )
+
+
+def _model_preregistration_context(case: CodebookCase, arm: str) -> bytes:
+    values = _model_expected_entry_values(case, arm)
+    entries = tuple(
+        ResolvedEntry(
+            slot=slot,
+            key=key,
+            value=value,
+            source_kind=source_kind,
+        )
+        for slot, key, value, source_kind in values
+    )
+    return render_context(entries).bytes
+
+
+def _model_candidate_balance(
+    case: CodebookCase,
+    tokenizer: ModelTokenizer,
+    *,
+    model_attempt: int,
+) -> _ModelCandidateBalance | None:
+    """Return frozen parity counts, or ``None`` for an ordinary candidate reject."""
+
+    del model_attempt
+    if not _model_case_schema_is_valid(case):
+        return None
+    query = _case_query_bytes(case)
+    balanced_arms = tuple(arm for arm in MODEL_ARMS if arm != "memory_off")
+    contexts = {arm: _model_preregistration_context(case, arm) for arm in balanced_arms}
+    if contexts["current_release"] != contexts["oracle"]:
+        return None
+    context_counts = tuple(
+        len(
+            _encode_model_tokens(
+                tokenizer,
+                contexts[arm],
+                add_special_tokens=False,
+            )
+        )
+        for arm in balanced_arms
+    )
+    prompt_counts = tuple(
+        len(
+            _encode_model_tokens(
+                tokenizer,
+                compose_model_prompt(contexts[arm], query).prompt,
+                add_special_tokens=True,
+            )
+        )
+        for arm in balanced_arms
+    )
+    current_value_token_count = len(
+        _encode_model_tokens(
+            tokenizer,
+            case.current_value.encode("ascii"),
+            add_special_tokens=False,
+        )
+    )
+    stale_value_token_count = len(
+        _encode_model_tokens(
+            tokenizer,
+            case.old_value.encode("ascii"),
+            add_special_tokens=False,
+        )
+    )
+    if (
+        len(set(context_counts)) != 1
+        or len(set(prompt_counts)) != 1
+        or current_value_token_count != stale_value_token_count
+    ):
+        return None
+    return _ModelCandidateBalance(
+        context_token_count=context_counts[0],
+        prompt_token_count=prompt_counts[0],
+        current_value_token_count=current_value_token_count,
+        stale_value_token_count=stale_value_token_count,
+    )
+
+
+def _resolved_entries_from_parent_contract(
+    contract: ParentSourceContract,
+) -> tuple[ResolvedEntry, ...]:
+    return tuple(
+        ResolvedEntry(
+            slot=entry.slot,
+            key=entry.key,
+            value=entry.value,
+            source_kind=entry.source_kind,
+            revision_id=entry.revision_id,
+            candidate_id=entry.candidate_id,
+            evidence_ids=entry.evidence_ids,
+        )
+        for entry in contract.entries
+    )
+
+
+def prepare_model_case_registration(
+    case_index: int,
+    tokenizer: ModelTokenizer,
+) -> ModelCaseRegistrationResult:
+    """Accept the first of exactly 100,000 token-balanced model candidates."""
+
+    if type(case_index) is not int or case_index not in range(MODEL_CASE_COUNT):
+        raise ValueError("model case index")
+    for model_attempt in range(MODEL_ATTEMPT_LIMIT):
+        case = _generate_model_candidate(
+            case_index,
+            model_attempt=model_attempt,
+        )
+        if case is None:
+            continue
+        try:
+            balance = _model_candidate_balance(
+                case,
+                tokenizer,
+                model_attempt=model_attempt,
+            )
+        except ModelProtocolError:
+            return ModelCaseRegistrationResult(
+                registration=None,
+                failure=ModelManifestFailure(
+                    case_index=case_index,
+                    reason="tokenizer_failure",
+                    attempted_model_candidates=model_attempt + 1,
+                ),
+            )
+        if balance is None:
+            continue
+        references = derive_case_database_references(case)
+        identity = ModelCaseIdentity(
+            case=case,
+            case_manifest_sha256=case_manifest_sha256(case),
+            references=references,
+        )
+        query = _case_query_bytes(case)
+        arm_calls: list[ModelArmCallRegistration] = []
+        try:
+            for execution_offset, arm in enumerate(model_arm_order(case.case_id)):
+                schedule = make_parent_schedule_item(
+                    execution_index=case_index * len(MODEL_ARMS) + execution_offset,
+                    case=case,
+                    references=references,
+                    arm=arm,
+                )
+                rendered = render_context(
+                    _resolved_entries_from_parent_contract(schedule.expected_source)
+                )
+                if (
+                    hashlib.sha256(rendered.bytes).hexdigest()
+                    != schedule.expected_source.rendered_context_sha256
+                    or len(rendered.bytes)
+                    != schedule.expected_source.rendered_context_utf8_bytes
+                ):
+                    raise ModelProtocolError("source_contract")
+                arm_calls.append(
+                    ModelArmCallRegistration(
+                        arm=arm,
+                        rendered_context_sha256=hashlib.sha256(
+                            rendered.bytes
+                        ).hexdigest(),
+                        rendered_context_utf8_bytes=len(rendered.bytes),
+                        prepared_call=prepare_model_call(
+                            rendered.bytes,
+                            query,
+                            tokenizer,
+                        ),
+                    )
+                )
+        except ModelProtocolError as error:
+            return ModelCaseRegistrationResult(
+                registration=None,
+                failure=ModelManifestFailure(
+                    case_index=case_index,
+                    reason=error.reason,
+                    attempted_model_candidates=model_attempt + 1,
+                ),
+            )
+        by_arm = {call.arm: call for call in arm_calls}
+        balanced_arms = tuple(arm for arm in MODEL_ARMS if arm != "memory_off")
+        if (
+            any(
+                by_arm[arm].prepared_call.rendered_context_token_count
+                != balance.context_token_count
+                or len(by_arm[arm].prepared_call.input_token_ids)
+                != balance.prompt_token_count
+                for arm in balanced_arms
+            )
+            or by_arm["current_release"].prepared_call.prompt
+            != by_arm["oracle"].prepared_call.prompt
+            or by_arm["current_release"].prepared_call.input_token_ids
+            != by_arm["oracle"].prepared_call.input_token_ids
+        ):
+            return ModelCaseRegistrationResult(
+                registration=None,
+                failure=ModelManifestFailure(
+                    case_index=case_index,
+                    reason="tokenizer_instability",
+                    attempted_model_candidates=model_attempt + 1,
+                ),
+            )
+        return ModelCaseRegistrationResult(
+            registration=ModelCaseRegistration(
+                identity=identity,
+                model_attempt=model_attempt,
+                query_sha256=hashlib.sha256(query).hexdigest(),
+                balanced_context_token_count=balance.context_token_count,
+                balanced_prompt_token_count=balance.prompt_token_count,
+                current_value_token_count=balance.current_value_token_count,
+                stale_value_token_count=balance.stale_value_token_count,
+                arm_calls=tuple(arm_calls),
+            ),
+            failure=None,
+        )
+    return ModelCaseRegistrationResult(
+        registration=None,
+        failure=ModelManifestFailure(
+            case_index=case_index,
+            reason="candidate_exhausted",
+            attempted_model_candidates=MODEL_ATTEMPT_LIMIT,
+        ),
+    )
+
+
+def _model_prompt_grammar_sha256() -> str:
+    grammar = (
+        b"[system]\n"
+        + MODEL_SYSTEM_PROMPT
+        + b"\n[memory]\n{rendered_context}[query]\n{query}\n"
+    )
+    return hashlib.sha256(grammar).hexdigest()
+
+
+def _validate_model_manifest_metadata(
+    *,
+    generator_commit_sha: str,
+    evaluator_commit_sha: str,
+    model_id: str,
+    model_weights_sha256: str,
+    tokenizer_id: str,
+    tokenizer_sha256: str,
+) -> None:
+    if (
+        type(generator_commit_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", generator_commit_sha) is None
+        or type(evaluator_commit_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", evaluator_commit_sha) is None
+        or type(model_weights_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(model_weights_sha256) is None
+        or type(tokenizer_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(tokenizer_sha256) is None
+        or type(model_id) is not str
+        or not model_id
+        or type(tokenizer_id) is not str
+        or not tokenizer_id
+    ):
+        raise ModelProtocolError("manifest_metadata")
+    try:
+        model_id.encode("ascii")
+        tokenizer_id.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ModelProtocolError("manifest_metadata") from error
+
+
+def prepare_model_run_manifest(
+    tokenizer: ModelTokenizer,
+    *,
+    generator_commit_sha: str,
+    evaluator_commit_sha: str,
+    model_id: str,
+    model_weights_sha256: str,
+    tokenizer_id: str,
+    tokenizer_sha256: str,
+) -> ModelRunManifestResult:
+    """Prepare all 64 fixed subjects before any model boundary can be called."""
+
+    _validate_model_manifest_metadata(
+        generator_commit_sha=generator_commit_sha,
+        evaluator_commit_sha=evaluator_commit_sha,
+        model_id=model_id,
+        model_weights_sha256=model_weights_sha256,
+        tokenizer_id=tokenizer_id,
+        tokenizer_sha256=tokenizer_sha256,
+    )
+    registrations: list[ModelCaseRegistration] = []
+    for case_index in range(MODEL_CASE_COUNT):
+        result = prepare_model_case_registration(case_index, tokenizer)
+        if result.failure is not None:
+            return ModelRunManifestResult(
+                manifest=None,
+                failure=result.failure,
+            )
+        if result.registration is None:
+            raise AssertionError("model case result must be closed")
+        registrations.append(result.registration)
+    manifest = ModelRunManifest(
+        schema_version=SCHEMA_VERSION,
+        profile="model-helpfulness-v1",
+        case_seed=CASE_SEED,
+        case_count=MODEL_CASE_COUNT,
+        call_count=MODEL_CASE_COUNT * len(MODEL_ARMS),
+        generator_commit_sha=generator_commit_sha,
+        evaluator_commit_sha=evaluator_commit_sha,
+        model_id=model_id,
+        model_weights_sha256=model_weights_sha256,
+        tokenizer_id=tokenizer_id,
+        tokenizer_sha256=tokenizer_sha256,
+        system_prompt_sha256=hashlib.sha256(MODEL_SYSTEM_PROMPT).hexdigest(),
+        prompt_grammar_sha256=_model_prompt_grammar_sha256(),
+        renderer_sha256=hashlib.sha256(_RENDER_HEADER).hexdigest(),
+        query_template_sha256=hashlib.sha256(MODEL_QUERY_TEMPLATE).hexdigest(),
+        arm_order_algorithm="sha256-domain-sort-v1",
+        arm_order_domain_sha256=hashlib.sha256(MODEL_ARM_ORDER_DOMAIN).hexdigest(),
+        decoding_mode="greedy",
+        decoding_temperature="0",
+        decoding_samples=1,
+        bootstrap_algorithm="paired-pcg64-percentile-linear-type7-v1",
+        bootstrap_resamples=MODEL_BOOTSTRAP_RESAMPLES,
+        bootstrap_seed=MODEL_BOOTSTRAP_SEED,
+        bootstrap_matrix_sha256=MODEL_BOOTSTRAP_MATRIX_SHA256,
+        thresholds=tuple(
+            ModelThreshold(name=name, value=value) for name, value in MODEL_THRESHOLDS
+        ),
+        cases=tuple(registrations),
+    )
+    validate_model_run_manifest(manifest, tokenizer)
+    return ModelRunManifestResult(manifest=manifest, failure=None)
+
+
+def _expected_consumer_receipt(
+    rendered_context: bytes,
+    query: bytes,
+) -> ConsumerInputReceipt:
+    return ConsumerInputReceipt(
+        received_context_sha256=hashlib.sha256(rendered_context).hexdigest(),
+        received_context_utf8_bytes=len(rendered_context),
+        received_query_sha256=hashlib.sha256(query).hexdigest(),
+        received_history_length=0,
+    )
+
+
+def _exact_typed_tree_equal(actual: object, expected: object) -> bool:
+    """Compare frozen trees without bool/int or subclass coercions."""
+
+    if type(actual) is not type(expected):
+        return False
+    if is_dataclass(expected) and not isinstance(expected, type):
+        return all(
+            _exact_typed_tree_equal(
+                getattr(actual, field.name),
+                getattr(expected, field.name),
+            )
+            for field in fields(expected)
+        )
+    if type(expected) is tuple:
+        actual_tuple = actual
+        expected_tuple = expected
+        return len(actual_tuple) == len(expected_tuple) and all(  # type: ignore[arg-type]
+            _exact_typed_tree_equal(actual_part, expected_part)
+            for actual_part, expected_part in zip(  # type: ignore[arg-type]
+                actual_tuple,
+                expected_tuple,
+                strict=True,
+            )
+        )
+    return bool(actual == expected)
+
+
+def validate_model_run_manifest(
+    manifest: ModelRunManifest,
+    tokenizer: ModelTokenizer,
+) -> None:
+    """Fail closed on global metadata or any missing, extra, or moved call slot."""
+
+    if type(manifest) is not ModelRunManifest:
+        raise ModelProtocolError("manifest_completeness")
+    _validate_model_manifest_metadata(
+        generator_commit_sha=manifest.generator_commit_sha,
+        evaluator_commit_sha=manifest.evaluator_commit_sha,
+        model_id=manifest.model_id,
+        model_weights_sha256=manifest.model_weights_sha256,
+        tokenizer_id=manifest.tokenizer_id,
+        tokenizer_sha256=manifest.tokenizer_sha256,
+    )
+    expected_thresholds = tuple(
+        ModelThreshold(name=name, value=value) for name, value in MODEL_THRESHOLDS
+    )
+    try:
+        registered_indexes = tuple(
+            registration.identity.case.case_index for registration in manifest.cases
+        )
+    except Exception as error:
+        raise ModelProtocolError("manifest_completeness") from error
+    if (
+        type(manifest.schema_version) is not int
+        or manifest.schema_version != SCHEMA_VERSION
+        or type(manifest.profile) is not str
+        or manifest.profile != "model-helpfulness-v1"
+        or type(manifest.case_seed) is not str
+        or manifest.case_seed != CASE_SEED
+        or type(manifest.case_count) is not int
+        or manifest.case_count != MODEL_CASE_COUNT
+        or type(manifest.call_count) is not int
+        or manifest.call_count != MODEL_CASE_COUNT * len(MODEL_ARMS)
+        or type(manifest.system_prompt_sha256) is not str
+        or manifest.system_prompt_sha256
+        != hashlib.sha256(MODEL_SYSTEM_PROMPT).hexdigest()
+        or type(manifest.prompt_grammar_sha256) is not str
+        or manifest.prompt_grammar_sha256 != _model_prompt_grammar_sha256()
+        or type(manifest.renderer_sha256) is not str
+        or manifest.renderer_sha256 != hashlib.sha256(_RENDER_HEADER).hexdigest()
+        or type(manifest.query_template_sha256) is not str
+        or manifest.query_template_sha256
+        != hashlib.sha256(MODEL_QUERY_TEMPLATE).hexdigest()
+        or type(manifest.arm_order_algorithm) is not str
+        or manifest.arm_order_algorithm != "sha256-domain-sort-v1"
+        or type(manifest.arm_order_domain_sha256) is not str
+        or manifest.arm_order_domain_sha256
+        != hashlib.sha256(MODEL_ARM_ORDER_DOMAIN).hexdigest()
+        or type(manifest.decoding_mode) is not str
+        or manifest.decoding_mode != "greedy"
+        or type(manifest.decoding_temperature) is not str
+        or manifest.decoding_temperature != "0"
+        or type(manifest.decoding_samples) is not int
+        or manifest.decoding_samples != 1
+        or type(manifest.bootstrap_algorithm) is not str
+        or manifest.bootstrap_algorithm != "paired-pcg64-percentile-linear-type7-v1"
+        or type(manifest.bootstrap_resamples) is not int
+        or manifest.bootstrap_resamples != MODEL_BOOTSTRAP_RESAMPLES
+        or type(manifest.bootstrap_seed) is not int
+        or manifest.bootstrap_seed != MODEL_BOOTSTRAP_SEED
+        or type(manifest.bootstrap_matrix_sha256) is not str
+        or manifest.bootstrap_matrix_sha256 != MODEL_BOOTSTRAP_MATRIX_SHA256
+        or type(manifest.thresholds) is not tuple
+        or any(
+            type(threshold) is not ModelThreshold for threshold in manifest.thresholds
+        )
+        or any(
+            type(threshold.name) is not str or type(threshold.value) is not str
+            for threshold in manifest.thresholds
+        )
+        or manifest.thresholds != expected_thresholds
+        or type(manifest.cases) is not tuple
+        or len(manifest.cases) != MODEL_CASE_COUNT
+        or any(
+            type(registration) is not ModelCaseRegistration
+            for registration in manifest.cases
+        )
+        or registered_indexes != tuple(range(MODEL_CASE_COUNT))
+    ):
+        raise ModelProtocolError("manifest_completeness")
+
+    for case_index, registration in enumerate(manifest.cases):
+        try:
+            if type(registration) is not ModelCaseRegistration:
+                raise ValueError
+            identity = registration.identity
+            case = identity.case
+            query = _case_query_bytes(case)
+            if (
+                type(identity) is not ModelCaseIdentity
+                or not _model_case_schema_is_valid(case)
+                or case.case_index != case_index
+                or identity.case_manifest_sha256 != case_manifest_sha256(case)
+                or identity.references != derive_case_database_references(case)
+                or type(registration.model_attempt) is not int
+                or registration.model_attempt not in range(MODEL_ATTEMPT_LIMIT)
+                or type(registration.query_sha256) is not str
+                or registration.query_sha256 != hashlib.sha256(query).hexdigest()
+                or type(registration.arm_calls) is not tuple
+                or tuple(call.arm for call in registration.arm_calls)
+                != model_arm_order(case.case_id)
+                or type(registration.balanced_context_token_count) is not int
+                or registration.balanced_context_token_count <= 0
+                or type(registration.balanced_prompt_token_count) is not int
+                or registration.balanced_prompt_token_count <= 0
+                or type(registration.current_value_token_count) is not int
+                or registration.current_value_token_count <= 0
+                or type(registration.stale_value_token_count) is not int
+                or registration.stale_value_token_count <= 0
+                or registration.current_value_token_count
+                != registration.stale_value_token_count
+            ):
+                raise ValueError
+            by_arm: dict[str, ModelArmCallRegistration] = {}
+            for execution_offset, call in enumerate(registration.arm_calls):
+                if type(call) is not ModelArmCallRegistration:
+                    raise ValueError
+                schedule = make_parent_schedule_item(
+                    execution_index=case_index * len(MODEL_ARMS) + execution_offset,
+                    case=case,
+                    references=identity.references,
+                    arm=call.arm,
+                )
+                rendered = render_context(
+                    _resolved_entries_from_parent_contract(schedule.expected_source)
+                )
+                prepared = call.prepared_call
+                prompt = compose_model_prompt(rendered.bytes, query)
+                if (
+                    type(call.arm) is not str
+                    or type(call.rendered_context_sha256) is not str
+                    or type(call.rendered_context_utf8_bytes) is not int
+                    or type(prepared) is not PreparedModelCall
+                    or type(prepared.prompt) is not bytes
+                    or type(prepared.context_start) is not int
+                    or type(prepared.context_end) is not int
+                    or type(prepared.input_token_ids) is not tuple
+                    or not prepared.input_token_ids
+                    or any(
+                        type(token_id) is not int or token_id < 0
+                        for token_id in prepared.input_token_ids
+                    )
+                    or type(prepared.rendered_context_token_count) is not int
+                    or prepared.rendered_context_token_count < 0
+                    or (
+                        call.arm == "memory_off"
+                        and prepared.rendered_context_token_count != 0
+                    )
+                    or (
+                        call.arm != "memory_off"
+                        and prepared.rendered_context_token_count <= 0
+                    )
+                    or type(prepared.consumer_input_receipt) is not ConsumerInputReceipt
+                    or type(prepared.consumer_input_receipt.received_context_sha256)
+                    is not str
+                    or type(prepared.consumer_input_receipt.received_context_utf8_bytes)
+                    is not int
+                    or type(prepared.consumer_input_receipt.received_query_sha256)
+                    is not str
+                    or type(prepared.consumer_input_receipt.received_history_length)
+                    is not int
+                    or type(prepared.expected_receipt) is not ModelCallReceipt
+                    or prepared.prompt != prompt.prompt
+                    or prepared.context_start != prompt.context_start
+                    or prepared.context_end != prompt.context_end
+                    or prepared.consumer_input_receipt.received_context_sha256
+                    != call.rendered_context_sha256
+                    or prepared.consumer_input_receipt.received_context_utf8_bytes
+                    != call.rendered_context_utf8_bytes
+                    or prepared.consumer_input_receipt.received_query_sha256
+                    != registration.query_sha256
+                    or prepared.consumer_input_receipt.received_history_length != 0
+                    or prepared.expected_receipt
+                    != make_model_call_receipt(
+                        submitted_prompt=prompt.prompt,
+                        context_start=prompt.context_start,
+                        context_end=prompt.context_end,
+                        input_token_ids=prepared.input_token_ids,
+                    )
+                    or call.rendered_context_sha256
+                    != hashlib.sha256(rendered.bytes).hexdigest()
+                    or call.rendered_context_utf8_bytes != len(rendered.bytes)
+                ):
+                    raise ValueError
+                by_arm[call.arm] = call
+            balanced_arms = tuple(arm for arm in MODEL_ARMS if arm != "memory_off")
+            if (
+                any(
+                    by_arm[arm].prepared_call.rendered_context_token_count
+                    != registration.balanced_context_token_count
+                    or len(by_arm[arm].prepared_call.input_token_ids)
+                    != registration.balanced_prompt_token_count
+                    for arm in balanced_arms
+                )
+                or by_arm["current_release"].prepared_call.prompt
+                != by_arm["oracle"].prepared_call.prompt
+                or by_arm["current_release"].prepared_call.input_token_ids
+                != by_arm["oracle"].prepared_call.input_token_ids
+            ):
+                raise ValueError
+            replay = prepare_model_case_registration(case_index, tokenizer)
+            if (
+                replay.failure is not None
+                and replay.failure.reason == "tokenizer_failure"
+            ):
+                raise ModelProtocolError("tokenizer_failure")
+            if (
+                replay.failure is not None
+                or replay.registration is None
+                or not _exact_typed_tree_equal(registration, replay.registration)
+            ):
+                raise ValueError
+        except ModelProtocolError as error:
+            if error.reason == "tokenizer_failure":
+                raise
+            raise ModelProtocolError("manifest_completeness") from error
+        except Exception as error:
+            raise ModelProtocolError("manifest_completeness") from error
+
+
+def _model_receipt_manifest_value(receipt: ModelCallReceipt) -> dict[str, object]:
+    return {
+        "prompt_sha256": receipt.submitted_prompt_sha256,
+        "context_start": receipt.submitted_prompt_context_start,
+        "context_end": receipt.submitted_prompt_context_end,
+        "context_sha256": receipt.submitted_prompt_context_sha256,
+        "input_token_ids_sha256": receipt.submitted_input_token_ids_sha256,
+        "input_token_count": receipt.submitted_input_token_count,
+    }
+
+
+def _model_run_manifest_bytes_unchecked(manifest: ModelRunManifest) -> bytes:
+    value: dict[str, object] = {
+        "schema_version": manifest.schema_version,
+        "profile": manifest.profile,
+        "case_seed": manifest.case_seed,
+        "case_count": manifest.case_count,
+        "call_count": manifest.call_count,
+        "generator_commit_sha": manifest.generator_commit_sha,
+        "evaluator_commit_sha": manifest.evaluator_commit_sha,
+        "model_id": manifest.model_id,
+        "model_weights_sha256": manifest.model_weights_sha256,
+        "tokenizer_id": manifest.tokenizer_id,
+        "tokenizer_sha256": manifest.tokenizer_sha256,
+        "system_prompt_sha256": manifest.system_prompt_sha256,
+        "prompt_grammar_sha256": manifest.prompt_grammar_sha256,
+        "renderer_sha256": manifest.renderer_sha256,
+        "query_template_sha256": manifest.query_template_sha256,
+        "arm_order": {
+            "algorithm": manifest.arm_order_algorithm,
+            "domain_sha256": manifest.arm_order_domain_sha256,
+        },
+        "decoding": {
+            "mode": manifest.decoding_mode,
+            "temperature": manifest.decoding_temperature,
+            "samples": manifest.decoding_samples,
+        },
+        "bootstrap": {
+            "algorithm": manifest.bootstrap_algorithm,
+            "resamples": manifest.bootstrap_resamples,
+            "seed": manifest.bootstrap_seed,
+            "matrix_sha256": manifest.bootstrap_matrix_sha256,
+        },
+        "thresholds": [
+            {"name": threshold.name, "value": threshold.value}
+            for threshold in manifest.thresholds
+        ],
+        "cases": [
+            {
+                "case_index": registration.identity.case.case_index,
+                "case_id": registration.identity.case.case_id,
+                "case_manifest_sha256": registration.identity.case_manifest_sha256,
+                "model_attempt": registration.model_attempt,
+                "query_sha256": registration.query_sha256,
+                "balanced_context_token_count": (
+                    registration.balanced_context_token_count
+                ),
+                "balanced_prompt_token_count": registration.balanced_prompt_token_count,
+                "current_value_token_count": registration.current_value_token_count,
+                "stale_value_token_count": registration.stale_value_token_count,
+                "arms": [
+                    {
+                        "arm": call.arm,
+                        "rendered_context_sha256": call.rendered_context_sha256,
+                        "rendered_context_utf8_bytes": (
+                            call.rendered_context_utf8_bytes
+                        ),
+                        "rendered_context_token_count": (
+                            call.prepared_call.rendered_context_token_count
+                        ),
+                        **_model_receipt_manifest_value(
+                            call.prepared_call.expected_receipt
+                        ),
+                    }
+                    for call in registration.arm_calls
+                ],
+            }
+            for registration in manifest.cases
+        ],
+    }
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def model_run_manifest_bytes(
+    manifest: ModelRunManifest,
+    tokenizer: ModelTokenizer,
+) -> bytes:
+    """Replay the trusted generator/tokenizer, then return canonical bytes."""
+
+    validate_model_run_manifest(manifest, tokenizer)
+    return _model_run_manifest_bytes_unchecked(manifest)
+
+
+def model_run_manifest_sha256(
+    manifest: ModelRunManifest,
+    tokenizer: ModelTokenizer,
+) -> str:
+    return hashlib.sha256(model_run_manifest_bytes(manifest, tokenizer)).hexdigest()
+
+
+def run_model_dry_run(
+    manifest: ModelRunManifest,
+    tokenizer: ModelTokenizer,
+    boundary: ModelBoundary,
+) -> ModelDryRunResult:
+    """Exercise the supplied model boundary after full preregistration."""
+
+    encoded_manifest = model_run_manifest_bytes(manifest, tokenizer)
+    calls: list[ModelDryRunCall] = []
+    invalid_calls: list[ModelDryRunInvalidCall] = []
+    for case_index, registration in enumerate(manifest.cases):
+        for call in registration.arm_calls:
+            try:
+                execution = submit_model_call(call.prepared_call, boundary)
+            except ModelBoundaryExecutionError:
+                execution = None
+            calls.append(
+                ModelDryRunCall(
+                    case_index=case_index,
+                    arm=call.arm,
+                    attempt_index=0,
+                    execution=execution,
+                )
+            )
+            if execution is None:
+                invalid_calls.append(
+                    ModelDryRunInvalidCall(
+                        case_index=case_index,
+                        arm=call.arm,
+                        attempted=True,
+                        reason="model_call_failure",
+                    )
+                )
+                continue
+            if not execution.valid:
+                if execution.invalid_reason is None:
+                    raise AssertionError("invalid model call must carry a reason")
+                invalid_calls.append(
+                    ModelDryRunInvalidCall(
+                        case_index=case_index,
+                        arm=call.arm,
+                        attempted=True,
+                        reason=execution.invalid_reason,
+                    )
+                )
+    return ModelDryRunResult(
+        validity="invalid" if invalid_calls else "valid",
+        invalid_calls=tuple(invalid_calls),
+        manifest_sha256=hashlib.sha256(encoded_manifest).hexdigest(),
+        calls=tuple(calls),
     )
 
 

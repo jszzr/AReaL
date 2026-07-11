@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import builtins
 import importlib
 import inspect
@@ -6653,3 +6654,1487 @@ def test_future_identity_is_disjoint_from_foreign_capture(
     assert result.validity == "invalid"
     assert result.invalid_reasons == ("process_or_assignment",)
     assert result.summary is None
+
+
+def test_model_prompt_uses_frozen_production_byte_grammar() -> None:
+    case = helpfulness.generate_case(0)
+    context = b"context-bytes"
+    query = _query(case)
+
+    rendered = helpfulness.compose_model_prompt(context, query)
+
+    prefix = b"[system]\n" + helpfulness.MODEL_SYSTEM_PROMPT + b"\n[memory]\n"
+    assert rendered.prompt == prefix + context + b"[query]\n" + query + b"\n"
+    assert rendered.context_start == len(prefix)
+    assert rendered.context_end == len(prefix) + len(context)
+    assert rendered.prompt[rendered.context_start : rendered.context_end] == context
+    assert rendered.prompt.count(context) == 1
+
+
+class _ByteModelTokenizer:
+    def encode(
+        self,
+        value: bytes,
+        *,
+        add_special_tokens: bool,
+    ) -> tuple[int, ...]:
+        if not value and not add_special_tokens:
+            return ()
+        marker = 257 if add_special_tokens else 256
+        return (marker, *value)
+
+
+class _OneGateMismatchTokenizer:
+    """Perturb exactly one preregistration invariant for mutation sensitivity."""
+
+    def __init__(self, case: helpfulness.CodebookCase, gate: str) -> None:
+        self.case = case
+        self.gate = gate
+        self.contexts = {
+            arm: helpfulness._model_preregistration_context(case, arm)
+            for arm in MODEL_ARMS
+            if arm != "memory_off"
+        }
+        query = _query(case)
+        self.prompts = {
+            arm: helpfulness.compose_model_prompt(context, query).prompt
+            for arm, context in self.contexts.items()
+        }
+        self.current_oracle_prompt_calls = 0
+
+    def encode(
+        self,
+        value: bytes,
+        *,
+        add_special_tokens: bool,
+    ) -> tuple[int, ...]:
+        if not value and not add_special_tokens:
+            return ()
+        if add_special_tokens:
+            if self.gate == "prompt_count" and value == self.prompts["stale_release"]:
+                return (10, 11, 12)
+            if (
+                self.gate == "current_oracle_ids"
+                and value == self.prompts["current_release"]
+            ):
+                self.current_oracle_prompt_calls += 1
+                if self.current_oracle_prompt_calls % 2:
+                    return (10, 11)
+                return (11, 10)
+            return (10, 11)
+        if self.gate == "context_count" and value == self.contexts["stale_release"]:
+            return (20, 21, 22)
+        if self.gate == "value_count":
+            if value == self.case.current_value.encode("ascii"):
+                return (30,)
+            if value == self.case.old_value.encode("ascii"):
+                return (30, 31)
+        return (20, 21)
+
+
+class _RecordingModelBoundary:
+    def __init__(self, response: object = "UNKNOWN", *, receipt: bool = True) -> None:
+        self.response = response
+        self.include_receipt = receipt
+        self.received_token_ids: tuple[int, ...] | None = None
+        self.received_prepared: helpfulness.PreparedModelCall | None = None
+
+    def submit(
+        self,
+        input_token_ids: tuple[int, ...],
+        *,
+        prepared_call: helpfulness.PreparedModelCall,
+    ) -> helpfulness.ModelBoundaryOutput:
+        self.received_token_ids = input_token_ids
+        self.received_prepared = prepared_call
+        receipt = (
+            helpfulness.make_model_call_receipt(
+                submitted_prompt=prepared_call.prompt,
+                context_start=prepared_call.context_start,
+                context_end=prepared_call.context_end,
+                input_token_ids=input_token_ids,
+            )
+            if self.include_receipt
+            else None
+        )
+        return helpfulness.ModelBoundaryOutput(
+            response=self.response,  # type: ignore[arg-type]
+            receipt=receipt,
+        )
+
+
+def test_prepared_model_call_owns_receipts_and_submits_same_token_tuple() -> None:
+    case = helpfulness.generate_case(0)
+    context = b"context-bytes"
+    query = _query(case)
+    prepared = helpfulness.prepare_model_call(
+        context,
+        query,
+        _ByteModelTokenizer(),
+    )
+    boundary = _RecordingModelBoundary()
+
+    result = helpfulness.submit_model_call(prepared, boundary)
+
+    assert result.valid is True
+    assert result.invalid_reason is None
+    assert result.response == "UNKNOWN"
+    assert boundary.received_token_ids is prepared.input_token_ids
+    assert boundary.received_prepared is prepared
+    assert result.model_call_receipt == prepared.expected_receipt
+    assert result.consumer_input_receipt == prepared.consumer_input_receipt
+    consumer_receipt = prepared.consumer_input_receipt
+    assert type(consumer_receipt) is helpfulness.ConsumerInputReceipt
+    assert type(consumer_receipt.received_context_sha256) is str
+    assert consumer_receipt.received_context_sha256 == sha256(context).hexdigest()
+    assert type(consumer_receipt.received_context_utf8_bytes) is int
+    assert consumer_receipt.received_context_utf8_bytes == len(context)
+    assert type(consumer_receipt.received_query_sha256) is str
+    assert consumer_receipt.received_query_sha256 == sha256(query).hexdigest()
+    assert type(consumer_receipt.received_history_length) is int
+    assert consumer_receipt.received_history_length == 0
+    assert result.rendered_context_token_count == len(context) + 1
+    assert prepared.expected_receipt.submitted_input_token_count == len(
+        prepared.input_token_ids
+    )
+
+
+def test_receiptless_model_boundary_is_invalid_without_metadata_fallback() -> None:
+    case = helpfulness.generate_case(0)
+    prepared = helpfulness.prepare_model_call(
+        b"context", _query(case), _ByteModelTokenizer()
+    )
+
+    result = helpfulness.submit_model_call(
+        prepared,
+        _RecordingModelBoundary(receipt=False),
+    )
+
+    assert result.valid is False
+    assert result.invalid_reason == "model_call_receipt"
+    assert result.model_call_receipt is None
+
+
+def test_forged_model_boundary_receipt_is_invalid_without_metadata_fallback() -> None:
+    prepared = helpfulness.prepare_model_call(
+        b"context",
+        _query(helpfulness.generate_case(0)),
+        _ByteModelTokenizer(),
+    )
+
+    class ForgedReceiptBoundary(_RecordingModelBoundary):
+        def submit(
+            self,
+            input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            del input_token_ids
+            return helpfulness.ModelBoundaryOutput(
+                response="UNKNOWN",
+                receipt=replace(
+                    prepared_call.expected_receipt,
+                    submitted_prompt_sha256="0" * 64,
+                ),
+            )
+
+    result = helpfulness.submit_model_call(prepared, ForgedReceiptBoundary())
+
+    assert result.valid is False
+    assert result.invalid_reason == "model_call_receipt"
+
+
+def test_equal_comparing_wrong_receipt_type_is_invalid() -> None:
+    prepared = helpfulness.prepare_model_call(
+        b"context",
+        _query(helpfulness.generate_case(0)),
+        _ByteModelTokenizer(),
+    )
+
+    class AlwaysEqualReceipt:
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+    class WrongReceiptBoundary:
+        def submit(
+            self,
+            _input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            del prepared_call
+            return helpfulness.ModelBoundaryOutput(
+                response="UNKNOWN",
+                receipt=AlwaysEqualReceipt(),  # type: ignore[arg-type]
+            )
+
+    result = helpfulness.submit_model_call(prepared, WrongReceiptBoundary())
+
+    assert result.valid is False
+    assert result.invalid_reason == "model_call_receipt"
+    assert result.model_call_receipt is None
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "submitted_prompt_context_start",
+        "submitted_prompt_context_end",
+        "submitted_input_token_count",
+    ],
+)
+def test_model_boundary_receipt_integer_fields_require_exact_int(
+    field_name: str,
+) -> None:
+    prepared = helpfulness.prepare_model_call(
+        b"context",
+        _query(helpfulness.generate_case(0)),
+        _ByteModelTokenizer(),
+    )
+
+    class IntSubclass(int):
+        pass
+
+    wrong_value = IntSubclass(getattr(prepared.expected_receipt, field_name))
+
+    class WrongFieldBoundary:
+        def submit(
+            self,
+            _input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            return helpfulness.ModelBoundaryOutput(
+                response="UNKNOWN",
+                receipt=replace(
+                    prepared_call.expected_receipt,
+                    **{field_name: wrong_value},
+                ),
+            )
+
+    result = helpfulness.submit_model_call(prepared, WrongFieldBoundary())
+
+    assert result.valid is False
+    assert result.model_call_receipt is None
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "submitted_prompt_sha256",
+        "submitted_prompt_context_sha256",
+        "submitted_input_token_ids_sha256",
+    ],
+)
+def test_model_boundary_receipt_hash_fields_require_exact_str(
+    field_name: str,
+) -> None:
+    prepared = helpfulness.prepare_model_call(
+        b"context",
+        _query(helpfulness.generate_case(0)),
+        _ByteModelTokenizer(),
+    )
+
+    class ReceiptHash(str):
+        pass
+
+    class WrongHashBoundary:
+        def submit(
+            self,
+            _input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            return helpfulness.ModelBoundaryOutput(
+                response="UNKNOWN",
+                receipt=replace(
+                    prepared_call.expected_receipt,
+                    **{
+                        field_name: ReceiptHash(
+                            getattr(prepared_call.expected_receipt, field_name)
+                        )
+                    },
+                ),
+            )
+
+    result = helpfulness.submit_model_call(prepared, WrongHashBoundary())
+
+    assert result.valid is False
+    assert result.model_call_receipt is None
+
+
+def test_manifest_rejects_systematically_wrong_consumer_receipt_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrong_receipt = helpfulness.ConsumerInputReceipt(
+        received_context_sha256="0" * 64,
+        received_context_utf8_bytes=999,
+        received_query_sha256="0" * 64,
+        received_history_length=0,
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "_expected_consumer_receipt",
+        lambda _context, _query_bytes: wrong_receipt,
+    )
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.prepare_model_run_manifest(
+            _ByteModelTokenizer(),
+            generator_commit_sha="a" * 40,
+            evaluator_commit_sha="b" * 40,
+            model_id="dry-run-model",
+            model_weights_sha256="c" * 64,
+            tokenizer_id="byte-tokenizer-v1",
+            tokenizer_sha256="d" * 64,
+        )
+
+    assert type(error.value) is helpfulness.ModelProtocolError
+    assert error.value.reason == "manifest_completeness"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "received_context_sha256",
+        "received_context_utf8_bytes",
+        "received_query_sha256",
+        "received_history_length",
+    ],
+)
+def test_manifest_rejects_systematically_wrong_consumer_receipt_exact_type(
+    field_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StrSubclass(str):
+        pass
+
+    class IntSubclass(int):
+        pass
+
+    def wrong_receipt(
+        rendered_context: bytes,
+        query: bytes,
+    ) -> helpfulness.ConsumerInputReceipt:
+        receipt = helpfulness.ConsumerInputReceipt(
+            received_context_sha256=sha256(rendered_context).hexdigest(),
+            received_context_utf8_bytes=len(rendered_context),
+            received_query_sha256=sha256(query).hexdigest(),
+            received_history_length=0,
+        )
+        value = getattr(receipt, field_name)
+        wrong_value = StrSubclass(value) if type(value) is str else IntSubclass(value)
+        return replace(receipt, **{field_name: wrong_value})
+
+    monkeypatch.setattr(helpfulness, "_expected_consumer_receipt", wrong_receipt)
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.prepare_model_run_manifest(
+            _ByteModelTokenizer(),
+            generator_commit_sha="a" * 40,
+            evaluator_commit_sha="b" * 40,
+            model_id="dry-run-model",
+            model_weights_sha256="c" * 64,
+            tokenizer_id="byte-tokenizer-v1",
+            tokenizer_sha256="d" * 64,
+        )
+
+    assert type(error.value) is helpfulness.ModelProtocolError
+    assert error.value.reason == "manifest_completeness"
+
+
+@pytest.mark.parametrize("token_ids", [(), (-1,), (True,)])
+def test_model_tokenizer_rejects_empty_negative_and_bool_ids(
+    token_ids: tuple[object, ...],
+) -> None:
+    class InvalidTokenizer:
+        def encode(
+            self,
+            _value: bytes,
+            *,
+            add_special_tokens: bool,
+        ) -> tuple[object, ...]:
+            del add_special_tokens
+            return token_ids
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.prepare_model_call(
+            b"context",
+            _query(helpfulness.generate_case(0)),
+            InvalidTokenizer(),  # type: ignore[arg-type]
+        )
+
+    assert error.value.reason == "tokenizer_failure"
+
+
+def test_model_boundary_rejects_non_string_response() -> None:
+    prepared = helpfulness.prepare_model_call(
+        b"context",
+        _query(helpfulness.generate_case(0)),
+        _ByteModelTokenizer(),
+    )
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.submit_model_call(
+            prepared,
+            _RecordingModelBoundary(response=object()),
+        )
+
+    assert type(error.value) is helpfulness.ModelBoundaryExecutionError
+    assert error.value.reason == "boundary_response"
+
+
+def test_model_case_registration_freezes_arm_order_and_token_parity() -> None:
+    result = helpfulness.prepare_model_case_registration(0, _ByteModelTokenizer())
+
+    assert result.failure is None
+    assert result.registration is not None
+    registration = result.registration
+    assert registration.model_attempt == 0
+    assert tuple(call.arm for call in registration.arm_calls) == (
+        "oracle",
+        "current_release",
+        "raw_history",
+        "memory_off",
+        "stale_release",
+        "target_masked",
+    )
+    by_arm = {call.arm: call for call in registration.arm_calls}
+    balanced_arms = set(MODEL_ARMS) - {"memory_off"}
+    assert {
+        by_arm[arm].prepared_call.rendered_context_token_count for arm in balanced_arms
+    } == {registration.balanced_context_token_count}
+    assert {
+        len(by_arm[arm].prepared_call.input_token_ids) for arm in balanced_arms
+    } == {registration.balanced_prompt_token_count}
+    assert (
+        registration.current_value_token_count == registration.stale_value_token_count
+    )
+    assert (
+        by_arm["current_release"].prepared_call.prompt
+        == by_arm["oracle"].prepared_call.prompt
+    )
+    assert (
+        by_arm["current_release"].prepared_call.input_token_ids
+        == by_arm["oracle"].prepared_call.input_token_ids
+    )
+    assert (
+        by_arm["current_release"].prepared_call.expected_receipt
+        == by_arm["oracle"].prepared_call.expected_receipt
+    )
+
+
+def test_memory_off_has_zero_context_tokens_but_nonempty_prompt_tokens() -> None:
+    result = helpfulness.prepare_model_case_registration(0, _ByteModelTokenizer())
+
+    assert result.failure is None
+    assert result.registration is not None
+    memory_off = next(
+        call for call in result.registration.arm_calls if call.arm == "memory_off"
+    )
+    assert memory_off.rendered_context_utf8_bytes == 0
+    assert memory_off.prepared_call.rendered_context_token_count == 0
+    assert memory_off.prepared_call.input_token_ids
+
+
+def test_model_candidate_rejects_only_context_token_count_mismatch() -> None:
+    case = helpfulness.generate_case(0)
+    tokenizer = _OneGateMismatchTokenizer(case, "context_count")
+
+    assert (
+        helpfulness._model_candidate_balance(case, tokenizer, model_attempt=0) is None
+    )
+
+
+def test_model_candidate_rejects_only_full_prompt_token_count_mismatch() -> None:
+    case = helpfulness.generate_case(0)
+    tokenizer = _OneGateMismatchTokenizer(case, "prompt_count")
+
+    assert (
+        helpfulness._model_candidate_balance(case, tokenizer, model_attempt=0) is None
+    )
+
+
+def test_model_candidate_rejects_only_standalone_value_token_count_mismatch() -> None:
+    case = helpfulness.generate_case(0)
+    tokenizer = _OneGateMismatchTokenizer(case, "value_count")
+
+    assert (
+        helpfulness._model_candidate_balance(case, tokenizer, model_attempt=0) is None
+    )
+
+
+def test_model_candidate_rejects_equal_length_current_oracle_token_id_mismatch() -> (
+    None
+):
+    case = helpfulness.generate_case(0)
+    balance_tokenizer = _OneGateMismatchTokenizer(case, "current_oracle_ids")
+    assert (
+        helpfulness._model_candidate_balance(
+            case,
+            balance_tokenizer,
+            model_attempt=0,
+        )
+        is not None
+    )
+
+    result = helpfulness.prepare_model_case_registration(
+        0,
+        _OneGateMismatchTokenizer(case, "current_oracle_ids"),
+    )
+
+    assert result.registration is None
+    assert result.failure == helpfulness.ModelManifestFailure(
+        case_index=0,
+        reason="tokenizer_instability",
+        attempted_model_candidates=1,
+    )
+
+
+def test_model_case_search_accepts_first_naturally_matching_candidate() -> None:
+    class FirstCandidateIsUnbalanced(_ByteModelTokenizer):
+        def encode(
+            self,
+            value: bytes,
+            *,
+            add_special_tokens: bool,
+        ) -> tuple[int, ...]:
+            token_ids = super().encode(
+                value,
+                add_special_tokens=add_special_tokens,
+            )
+            if b"project-xk527d" in value and b"GSPFA" in value:
+                return (*token_ids, 999)
+            return token_ids
+
+    result = helpfulness.prepare_model_case_registration(
+        0,
+        FirstCandidateIsUnbalanced(),
+    )
+
+    assert result.failure is None
+    assert result.registration is not None
+    assert result.registration.model_attempt == 1
+    assert result.registration.identity.case.target_key == "project-xhz92s"
+    assert result.registration.identity.case.old_value == "EZDKA"
+    assert result.registration.identity.case.current_value == "BD45A"
+    assert result.registration.identity.case.padding_entry == helpfulness.CodebookEntry(
+        "project-2rwk7w",
+        "NCAJS",
+    )
+    assert result.registration.identity.case_manifest_sha256 == (
+        "1d840c53233cc9fbfe2454b64798357e06f0fd9e14e74160f4b0f15fdeaebe26"
+    )
+
+
+def test_model_case_search_exhausts_exact_fixed_range_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = helpfulness.generate_case(0)
+    attempts: list[int] = []
+
+    def candidate(case_index: int, *, model_attempt: int):
+        assert case_index == 0
+        attempts.append(model_attempt)
+        return baseline
+
+    monkeypatch.setattr(helpfulness, "_generate_model_candidate", candidate)
+    monkeypatch.setattr(
+        helpfulness,
+        "_model_candidate_balance",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "derive_case_database_references",
+        lambda _case: pytest.fail("references derived before candidate acceptance"),
+    )
+
+    result = helpfulness.prepare_model_case_registration(0, _ByteModelTokenizer())
+
+    assert result.registration is None
+    assert result.failure == helpfulness.ModelManifestFailure(
+        case_index=0,
+        reason="candidate_exhausted",
+        attempted_model_candidates=100_000,
+    )
+    assert attempts == list(range(100_000))
+
+
+def test_model_candidate_attempt_formula_is_model_times_256_plus_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_token = helpfulness._token
+    attempts: list[int] = []
+
+    def recording_token(seed, case_index, label, item_index, attempt, length):
+        attempts.append(attempt)
+        return real_token(seed, case_index, label, item_index, attempt, length)
+
+    monkeypatch.setattr(helpfulness, "_token", recording_token)
+
+    case = helpfulness._generate_model_candidate(0, model_attempt=7)
+
+    assert case is not None
+    assert attempts
+    assert all(7 * 256 <= attempt <= 7 * 256 + 255 for attempt in attempts)
+
+
+def test_model_collision_uses_plus_one_and_resets_for_each_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_token = helpfulness._token
+    model_attempt = 3
+    base = model_attempt * 256
+    target_token = real_token(helpfulness.CASE_SEED, 0, "target", 0, base, 6)
+    observed: dict[tuple[str, int], list[int]] = {}
+
+    def collide_shared_zero_once(seed, case_index, label, item_index, attempt, length):
+        observed.setdefault((label, item_index), []).append(attempt)
+        if label == "shared" and item_index == 0 and attempt == base:
+            return target_token
+        return real_token(seed, case_index, label, item_index, attempt, length)
+
+    monkeypatch.setattr(helpfulness, "_token", collide_shared_zero_once)
+
+    case = helpfulness._generate_model_candidate(0, model_attempt=model_attempt)
+
+    assert case is not None
+    assert observed[("shared", 0)][:2] == [base, base + 1]
+    assert observed[("shared", 1)][0] == base
+
+
+@pytest.mark.parametrize(
+    ("last_collision_succeeds", "candidate_exists"),
+    [(True, True), (False, False)],
+)
+def test_model_collision_lane_has_exact_256_attempt_boundary(
+    last_collision_succeeds: bool,
+    candidate_exists: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_token = helpfulness._token
+    model_attempt = 4
+    base = model_attempt * 256
+    target_token = real_token(helpfulness.CASE_SEED, 0, "target", 0, base, 6)
+    shared_zero_attempts: list[int] = []
+
+    def collide_shared_zero(seed, case_index, label, item_index, attempt, length):
+        if label == "shared" and item_index == 0:
+            shared_zero_attempts.append(attempt)
+            if not last_collision_succeeds or attempt < base + 255:
+                return target_token
+        return real_token(seed, case_index, label, item_index, attempt, length)
+
+    monkeypatch.setattr(helpfulness, "_token", collide_shared_zero)
+
+    case = helpfulness._generate_model_candidate(0, model_attempt=model_attempt)
+
+    assert (case is not None) is candidate_exists
+    assert shared_zero_attempts == list(range(base, base + 256))
+
+
+def _build_prepared_model_manifest() -> helpfulness.ModelRunManifest:
+    result = helpfulness.prepare_model_run_manifest(
+        _ByteModelTokenizer(),
+        generator_commit_sha="a" * 40,
+        evaluator_commit_sha="b" * 40,
+        model_id="dry-run-model",
+        model_weights_sha256="c" * 64,
+        tokenizer_id="byte-tokenizer-v1",
+        tokenizer_sha256="d" * 64,
+    )
+    assert result.failure is None
+    assert result.manifest is not None
+    return result.manifest
+
+
+@pytest.fixture(scope="module")
+def prepared_model_manifest() -> helpfulness.ModelRunManifest:
+    """Share only the recursively frozen manifest; tokenizers remain test-local."""
+
+    return _build_prepared_model_manifest()
+
+
+def test_full_model_manifest_is_canonical_complete_and_preregistered() -> None:
+    # Keep one uncached construction as the deterministic end-to-end golden.
+    manifest = _build_prepared_model_manifest()
+    tokenizer = _ByteModelTokenizer()
+
+    encoded = helpfulness.model_run_manifest_bytes(manifest, tokenizer)
+    parsed = json.loads(encoded)
+    assert (
+        helpfulness.model_run_manifest_sha256(manifest, tokenizer)
+        == sha256(encoded).hexdigest()
+    )
+    assert helpfulness.model_run_manifest_sha256(manifest, tokenizer) == (
+        "31eac9a9e274fc282270863efb09a7a884ee784f57032f9224b2f0bba4570bbb"
+    )
+    assert len(manifest.cases) == 64
+    assert tuple(case.identity.case.case_index for case in manifest.cases) == tuple(
+        range(64)
+    )
+    assert parsed["generator_commit_sha"] == "a" * 40
+    assert parsed["evaluator_commit_sha"] == "b" * 40
+    assert parsed["model_id"] == "dry-run-model"
+    assert parsed["model_weights_sha256"] == "c" * 64
+    assert parsed["tokenizer_id"] == "byte-tokenizer-v1"
+    assert parsed["tokenizer_sha256"] == "d" * 64
+    assert parsed["system_prompt_sha256"] == (
+        "2b3ec812307450d7e06806a62f240471d66aed192cb634873fa1397bac7cbaa7"
+    )
+    assert parsed["prompt_grammar_sha256"] == (
+        "ada71fbb0b59baeb565858780ede298f9d2a0a0f8026fb8361500a371c59e4e4"
+    )
+    assert parsed["renderer_sha256"] == (
+        "0656efbe3e6e107f2858cfa0dac99fee986048c2c8a031fb9f92205624bb4051"
+    )
+    assert parsed["query_template_sha256"] == (
+        "a5c17c493e037c8bd3d43e35ba2f35875f5fe8eadbf2036c432f70e457a6ec50"
+    )
+    assert parsed["profile"] == "model-helpfulness-v1"
+    assert parsed["case_seed"] == helpfulness.CASE_SEED
+    assert parsed["case_count"] == 64
+    assert parsed["call_count"] == 384
+    assert parsed["decoding"] == {
+        "mode": "greedy",
+        "samples": 1,
+        "temperature": "0",
+    }
+    assert parsed["bootstrap"] == {
+        "algorithm": "paired-pcg64-percentile-linear-type7-v1",
+        "matrix_sha256": helpfulness.MODEL_BOOTSTRAP_MATRIX_SHA256,
+        "resamples": 10_000,
+        "seed": 20_260_708,
+    }
+    assert all(type(item["value"]) is str for item in parsed["thresholds"])
+    assert tuple(case["case_index"] for case in parsed["cases"]) == tuple(range(64))
+    assert all(
+        tuple(arm["arm"] for arm in case["arms"])
+        == helpfulness.model_arm_order(case["case_id"])
+        for case in parsed["cases"]
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "reordered"])
+def test_model_manifest_rejects_missing_extra_and_reordered_cases(
+    mutation: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    if mutation == "missing":
+        cases = manifest.cases[:-1]
+    elif mutation == "extra":
+        cases = (*manifest.cases, manifest.cases[-1])
+    else:
+        cases = (manifest.cases[1], manifest.cases[0], *manifest.cases[2:])
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.model_run_manifest_bytes(
+            replace(manifest, cases=cases),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_fails_closed_on_malformed_nested_identity(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    malformed_case = replace(manifest.cases[0], identity=object())
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.model_run_manifest_bytes(
+            replace(manifest, cases=(malformed_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_bool_schema_version(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.model_run_manifest_bytes(
+            replace(manifest, schema_version=True),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_equal_but_wrong_nested_threshold_type(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+
+    class AlwaysEqual:
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+    malformed_thresholds = (AlwaysEqual(), *manifest.thresholds[1:])
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.model_run_manifest_bytes(
+            replace(
+                manifest,
+                thresholds=malformed_thresholds,  # type: ignore[arg-type]
+            ),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_lie_about_first_matching_attempt(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    forged_case = replace(
+        manifest.cases[0],
+        model_attempt=manifest.cases[0].model_attempt + 1,
+    )
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_dry_run_replays_tokenizer_before_boundary_on_attempt_lie(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    forged_case = replace(manifest.cases[0], model_attempt=1)
+    boundary_calls = 0
+
+    class ForbiddenBoundary:
+        def submit(self, *_args, **_kwargs):
+            nonlocal boundary_calls
+            boundary_calls += 1
+            raise AssertionError("boundary must not run")
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.run_model_dry_run(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+            ForbiddenBoundary(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+    assert boundary_calls == 0
+
+
+def test_model_manifest_rejects_rehashed_same_length_raw_token_forgery(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    case = manifest.cases[0]
+    raw_offset = next(
+        offset
+        for offset, call in enumerate(case.arm_calls)
+        if call.arm == "raw_history"
+    )
+    raw = case.arm_calls[raw_offset]
+    prepared = raw.prepared_call
+    forged_token_ids = tuple(token_id + 1 for token_id in prepared.input_token_ids)
+    forged_receipt = helpfulness.make_model_call_receipt(
+        submitted_prompt=prepared.prompt,
+        context_start=prepared.context_start,
+        context_end=prepared.context_end,
+        input_token_ids=forged_token_ids,
+    )
+    forged_raw = replace(
+        raw,
+        prepared_call=replace(
+            prepared,
+            input_token_ids=forged_token_ids,
+            expected_receipt=forged_receipt,
+        ),
+    )
+    forged_arms = tuple(
+        forged_raw if offset == raw_offset else call
+        for offset, call in enumerate(case.arm_calls)
+    )
+    forged_case = replace(case, arm_calls=forged_arms)
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_bool_nested_consumer_history_length(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    case = manifest.cases[0]
+    call = case.arm_calls[0]
+    prepared = call.prepared_call
+    forged_call = replace(
+        call,
+        prepared_call=replace(
+            prepared,
+            consumer_input_receipt=replace(
+                prepared.consumer_input_receipt,
+                received_history_length=False,
+            ),
+        ),
+    )
+    forged_case = replace(case, arm_calls=(forged_call, *case.arm_calls[1:]))
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_str_subclass_threshold_field(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+
+    class StrSubclass(str):
+        pass
+
+    first = manifest.thresholds[0]
+    forged_threshold = helpfulness.ModelThreshold(
+        name=StrSubclass(first.name),
+        value=first.value,
+    )
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(
+                manifest,
+                thresholds=(forged_threshold, *manifest.thresholds[1:]),
+            ),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+@pytest.mark.parametrize(
+    "public_gate",
+    ["validate", "bytes", "sha256", "dry_run"],
+)
+def test_public_manifest_gates_preserve_replay_tokenizer_failure(
+    public_gate: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+
+    class FirstEncodeFailsTokenizer(_ByteModelTokenizer):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode(
+            self,
+            value: bytes,
+            *,
+            add_special_tokens: bool,
+        ) -> tuple[int, ...]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("replay tokenizer failed")
+            return super().encode(value, add_special_tokens=add_special_tokens)
+
+    class CountingBoundary(_RecordingModelBoundary):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def submit(
+            self,
+            input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            self.calls += 1
+            return super().submit(
+                input_token_ids,
+                prepared_call=prepared_call,
+            )
+
+    tokenizer = FirstEncodeFailsTokenizer()
+    boundary = CountingBoundary()
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        if public_gate == "validate":
+            helpfulness.validate_model_run_manifest(manifest, tokenizer)
+        elif public_gate == "bytes":
+            helpfulness.model_run_manifest_bytes(manifest, tokenizer)
+        elif public_gate == "sha256":
+            helpfulness.model_run_manifest_sha256(manifest, tokenizer)
+        else:
+            helpfulness.run_model_dry_run(manifest, tokenizer, boundary)
+
+    assert error.value.reason == "tokenizer_failure"
+    assert tokenizer.calls == 1
+    assert boundary.calls == 0
+
+
+def test_replay_candidate_exhaustion_remains_manifest_completeness(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    monkeypatch.setattr(helpfulness, "MODEL_ATTEMPT_LIMIT", 1)
+    monkeypatch.setattr(
+        helpfulness,
+        "_model_candidate_balance",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(manifest, _ByteModelTokenizer())
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_attempt_zero_reproduces_original_generator_for_all_cases() -> None:
+    assert tuple(
+        helpfulness._generate_model_candidate(case_index, model_attempt=0)
+        for case_index in range(64)
+    ) == tuple(helpfulness.generate_case(case_index) for case_index in range(64))
+
+
+def test_full_manifest_stops_at_midrun_exhaustion_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = helpfulness.prepare_model_case_registration
+    visited: list[int] = []
+
+    def fail_case_seven(case_index: int, tokenizer):
+        visited.append(case_index)
+        if case_index == 7:
+            return helpfulness.ModelCaseRegistrationResult(
+                registration=None,
+                failure=helpfulness.ModelManifestFailure(
+                    case_index=7,
+                    reason="candidate_exhausted",
+                    attempted_model_candidates=100_000,
+                ),
+            )
+        return original(case_index, tokenizer)
+
+    monkeypatch.setattr(
+        helpfulness,
+        "prepare_model_case_registration",
+        fail_case_seven,
+    )
+    monkeypatch.setattr(
+        helpfulness,
+        "submit_model_call",
+        lambda *_args, **_kwargs: pytest.fail("model boundary called during manifest"),
+    )
+
+    result = helpfulness.prepare_model_run_manifest(
+        _ByteModelTokenizer(),
+        generator_commit_sha="a" * 40,
+        evaluator_commit_sha="b" * 40,
+        model_id="dry-run-model",
+        model_weights_sha256="c" * 64,
+        tokenizer_id="byte-tokenizer-v1",
+        tokenizer_sha256="d" * 64,
+    )
+
+    assert result.manifest is None
+    assert result.failure == helpfulness.ModelManifestFailure(
+        case_index=7,
+        reason="candidate_exhausted",
+        attempted_model_candidates=100_000,
+    )
+    assert visited == list(range(8))
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate", "reordered"])
+def test_model_manifest_rejects_incomplete_or_reordered_arm_schedule(
+    mutation: str,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    case = manifest.cases[0]
+    if mutation == "missing":
+        arms = case.arm_calls[:-1]
+    elif mutation == "extra":
+        arms = (*case.arm_calls, case.arm_calls[0])
+    elif mutation == "duplicate":
+        arms = (case.arm_calls[0], case.arm_calls[0], *case.arm_calls[2:])
+    else:
+        arms = (case.arm_calls[1], case.arm_calls[0], *case.arm_calls[2:])
+    forged_case = replace(case, arm_calls=arms)
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_model_manifest_rejects_nested_receipt_forgery(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    case = manifest.cases[0]
+    call = case.arm_calls[0]
+    forged_call = replace(
+        call,
+        prepared_call=replace(
+            call.prepared_call,
+            expected_receipt=replace(
+                call.prepared_call.expected_receipt,
+                submitted_prompt_sha256="0" * 64,
+            ),
+        ),
+    )
+    forged_case = replace(case, arm_calls=(forged_call, *case.arm_calls[1:]))
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.validate_model_run_manifest(
+            replace(manifest, cases=(forged_case, *manifest.cases[1:])),
+            _ByteModelTokenizer(),
+        )
+
+    assert error.value.reason == "manifest_completeness"
+
+
+def test_dry_run_validates_complete_manifest_before_boundary(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    boundary = _RecordingModelBoundary()
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.run_model_dry_run(
+            replace(manifest, cases=manifest.cases[:-1]),
+            _ByteModelTokenizer(),
+            boundary,
+        )
+
+    assert error.value.reason == "manifest_completeness"
+    assert boundary.received_token_ids is None
+
+
+def test_dry_run_submits_all_registered_calls_without_expected_answer(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    boundary = _RecordingModelBoundary()
+
+    tokenizer = _ByteModelTokenizer()
+    result = helpfulness.run_model_dry_run(manifest, tokenizer, boundary)
+
+    assert result.validity == "valid"
+    assert result.invalid_calls == ()
+    assert result.manifest_sha256 == helpfulness.model_run_manifest_sha256(
+        manifest,
+        tokenizer,
+    )
+    assert len(result.calls) == 64 * 6
+    assert all(call.execution.valid for call in result.calls)
+    assert tuple(call.arm for call in result.calls[:6]) == helpfulness.model_arm_order(
+        "nonce-000"
+    )
+    assert tuple(field.name for field in fields(helpfulness.PreparedModelCall)) == (
+        "prompt",
+        "context_start",
+        "context_end",
+        "input_token_ids",
+        "consumer_input_receipt",
+        "expected_receipt",
+        "rendered_context_token_count",
+    )
+
+
+def test_receiptless_case_attempts_all_six_arms_once_without_replacement(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    receiptless = {id(call.prepared_call) for call in manifest.cases[0].arm_calls}
+
+    class SelectivelyReceiptlessBoundary:
+        def __init__(self) -> None:
+            self.attempted: list[int] = []
+
+        def submit(
+            self,
+            input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            self.attempted.append(id(prepared_call))
+            receipt = None
+            if id(prepared_call) not in receiptless:
+                receipt = helpfulness.make_model_call_receipt(
+                    submitted_prompt=prepared_call.prompt,
+                    context_start=prepared_call.context_start,
+                    context_end=prepared_call.context_end,
+                    input_token_ids=input_token_ids,
+                )
+            return helpfulness.ModelBoundaryOutput("UNKNOWN", receipt)
+
+    boundary = SelectivelyReceiptlessBoundary()
+    result = helpfulness.run_model_dry_run(
+        manifest,
+        _ByteModelTokenizer(),
+        boundary,
+    )
+
+    assert result.validity == "invalid"
+    assert tuple(
+        (failure.case_index, failure.arm, failure.reason)
+        for failure in result.invalid_calls
+    ) == tuple(
+        (0, arm, "model_call_receipt")
+        for arm in helpfulness.model_arm_order("nonce-000")
+    )
+    case_zero = tuple(call for call in result.calls if call.case_index == 0)
+    assert len(case_zero) == 6
+    assert tuple(call.arm for call in case_zero) == helpfulness.model_arm_order(
+        "nonce-000"
+    )
+    assert all(call.execution.valid is False for call in case_zero)
+    assert all(
+        call.execution.invalid_reason == "model_call_receipt" for call in case_zero
+    )
+    assert all(call.attempt_index == 0 for call in result.calls)
+    assert len(boundary.attempted) == 384
+    assert len(set(boundary.attempted)) == 384
+    assert tuple(call.case_index for call in result.calls[::6]) == tuple(range(64))
+
+
+def test_boundary_exception_keeps_fixed_slot_attrition_without_retry(
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    target_case_index = 7
+    target_arm = "raw_history"
+    target_call = next(
+        call
+        for call in manifest.cases[target_case_index].arm_calls
+        if call.arm == target_arm
+    )
+
+    class OneFailingBoundary:
+        def __init__(self) -> None:
+            self.attempted: list[int] = []
+
+        def submit(
+            self,
+            input_token_ids: tuple[int, ...],
+            *,
+            prepared_call: helpfulness.PreparedModelCall,
+        ) -> helpfulness.ModelBoundaryOutput:
+            self.attempted.append(id(prepared_call))
+            if prepared_call is target_call.prepared_call:
+                raise RuntimeError("fixed-slot failure")
+            return helpfulness.ModelBoundaryOutput(
+                response="UNKNOWN",
+                receipt=helpfulness.make_model_call_receipt(
+                    submitted_prompt=prepared_call.prompt,
+                    context_start=prepared_call.context_start,
+                    context_end=prepared_call.context_end,
+                    input_token_ids=input_token_ids,
+                ),
+            )
+
+    boundary = OneFailingBoundary()
+    result = helpfulness.run_model_dry_run(
+        manifest,
+        _ByteModelTokenizer(),
+        boundary,
+    )
+
+    assert result.validity == "invalid"
+    assert result.invalid_calls == (
+        helpfulness.ModelDryRunInvalidCall(
+            case_index=target_case_index,
+            arm=target_arm,
+            attempted=True,
+            reason="model_call_failure",
+        ),
+    )
+    failed_slot = next(
+        call
+        for call in result.calls
+        if call.case_index == target_case_index and call.arm == target_arm
+    )
+    assert failed_slot.attempt_index == 0
+    assert failed_slot.execution is None
+    assert len(result.calls) == 384
+    assert len(boundary.attempted) == 384
+    assert len(set(boundary.attempted)) == 384
+
+
+def test_dry_run_does_not_swallow_evaluator_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    boundary = _RecordingModelBoundary()
+
+    def evaluator_bug(*_args, **_kwargs):
+        raise AssertionError("evaluator invariant failed")
+
+    monkeypatch.setattr(helpfulness, "submit_model_call", evaluator_bug)
+
+    with pytest.raises(AssertionError, match="evaluator invariant failed"):
+        helpfulness.run_model_dry_run(
+            manifest,
+            _ByteModelTokenizer(),
+            boundary,
+        )
+
+
+def test_dry_run_does_not_swallow_unrelated_model_protocol_error(
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_model_manifest: helpfulness.ModelRunManifest,
+) -> None:
+    manifest = prepared_model_manifest
+    boundary = _RecordingModelBoundary()
+
+    def evaluator_protocol_bug(*_args, **_kwargs):
+        raise helpfulness.ModelProtocolError("evaluator_protocol_bug")
+
+    monkeypatch.setattr(helpfulness, "submit_model_call", evaluator_protocol_bug)
+
+    with pytest.raises(helpfulness.ModelProtocolError) as error:
+        helpfulness.run_model_dry_run(
+            manifest,
+            _ByteModelTokenizer(),
+            boundary,
+        )
+
+    assert type(error.value) is helpfulness.ModelProtocolError
+    assert error.value.reason == "evaluator_protocol_bug"
+
+
+def test_model_preregistration_tokenizer_failure_is_not_candidate_rejection() -> None:
+    class ExplodingTokenizer:
+        def encode(
+            self,
+            _value: bytes,
+            *,
+            add_special_tokens: bool,
+        ) -> tuple[int, ...]:
+            del add_special_tokens
+            raise RuntimeError("boom")
+
+    result = helpfulness.prepare_model_case_registration(0, ExplodingTokenizer())
+
+    assert result.registration is None
+    assert result.failure == helpfulness.ModelManifestFailure(
+        case_index=0,
+        reason="tokenizer_failure",
+        attempted_model_candidates=1,
+    )
+
+
+def _forbidden_direct_eager_imports(source: str) -> frozenset[str]:
+    """Return forbidden imports executed eagerly while defining the module."""
+
+    class EagerImportVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.paths: set[str] = set()
+            self.names: set[str] = set()
+
+        def visit_FunctionDef(self, _node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, _node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, _node: ast.Lambda) -> None:
+            return
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self.paths.add(alias.name)
+                self.names.add(alias.name.rsplit(".", maxsplit=1)[-1])
+                if alias.asname is not None:
+                    self.names.add(alias.asname)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            module = f"{'.' * node.level}{node.module or ''}"
+            for alias in node.names:
+                separator = "" if not module or module.endswith(".") else "."
+                self.paths.add(f"{module}{separator}{alias.name}")
+                self.names.add(alias.name)
+                if alias.asname is not None:
+                    self.names.add(alias.asname)
+
+    tree = ast.parse(source)
+    visitor = EagerImportVisitor()
+    visitor.visit(tree)
+
+    bridge_module = "areal.v2.inference_service.inf_bridge"
+    forbidden = {
+        path
+        for path in visitor.paths
+        if path.split(".", maxsplit=1)[0] in {"torch", "transformers", "numpy"}
+        or path == bridge_module
+        or path.startswith(f"{bridge_module}.")
+    }
+    forbidden.update(
+        f"name:{name}"
+        for name in visitor.names
+        if name in {"InfBridge", "ModelRequest", "AgentMetadata"}
+    )
+    return frozenset(forbidden)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_path"),
+    [
+        ("if True:\n    import torch\n", "torch"),
+        (
+            "try:\n"
+            "    import areal.v2.inference_service.inf_bridge\n"
+            "except ImportError:\n"
+            "    pass\n",
+            "areal.v2.inference_service.inf_bridge",
+        ),
+        (
+            "from areal.v2.inference_service import inf_bridge\n",
+            "areal.v2.inference_service.inf_bridge",
+        ),
+        ("from safe_module import InfBridge\n", "name:InfBridge"),
+        ("import safe_module as ModelRequest\n", "name:ModelRequest"),
+        (
+            "from safe_module import metadata as AgentMetadata\n",
+            "name:AgentMetadata",
+        ),
+    ],
+)
+def test_direct_eager_import_guard_catches_forbidden_forms(
+    source: str,
+    expected_path: str,
+) -> None:
+    assert expected_path in _forbidden_direct_eager_imports(source)
+
+
+def test_direct_eager_import_guard_allows_function_local_numpy() -> None:
+    source = "def lazy():\n    import numpy\n"
+
+    assert _forbidden_direct_eager_imports(source) == frozenset()
+
+
+def test_model_harness_adds_no_direct_eager_heavy_or_bridge_imports() -> None:
+    source = Path(helpfulness.__file__).read_text()
+
+    assert _forbidden_direct_eager_imports(source) == frozenset()
