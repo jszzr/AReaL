@@ -22,7 +22,8 @@ from areal.v2.memory_service.errors import (
 from areal.v2.memory_service.types import MemoryScope
 
 _APPLICATION_ID = 1095912787
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_SCHEMA_V2_VERSION = 2
 _SCHEMA_V1_VERSION = 1
 _MIN_SQLITE_VERSION = (3, 7, 17)
 _BUSY_TIMEOUT_MS = 5000
@@ -243,7 +244,125 @@ _SCHEMA_V2_ADDITIONS = (
 )""",
 )
 
-_SCHEMA_DDL = _SCHEMA_V1_DDL + _SCHEMA_V2_ADDITIONS
+_SCHEMA_V2_DDL = _SCHEMA_V1_DDL + _SCHEMA_V2_ADDITIONS
+
+_SCHEMA_V3_ADDITIONS = (
+    """CREATE TABLE memory_application_roots (
+    scope_id INTEGER NOT NULL PRIMARY KEY CHECK (typeof(scope_id) = 'integer'),
+    root_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(root_id) = 'text'),
+    canonical BLOB NOT NULL CHECK (typeof(canonical) = 'blob'),
+    content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(content_hash) = 'text') CHECK (length(content_hash) = 64),
+    created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text'),
+    storage_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(storage_hash) = 'text') CHECK (length(storage_hash) = 64),
+    release_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(release_id) = 'text'),
+    release_content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(release_content_hash) = 'text')
+        CHECK (length(release_content_hash) = 64),
+    UNIQUE (root_id),
+    UNIQUE (scope_id, release_id),
+    FOREIGN KEY (scope_id) REFERENCES memory_scopes (scope_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (scope_id, release_id)
+        REFERENCES memory_releases (scope_id, release_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE TABLE memory_applications (
+    application_order INTEGER NOT NULL PRIMARY KEY
+        CHECK (typeof(application_order) = 'integer')
+        CHECK (application_order BETWEEN 0 AND 9223372036854775807),
+    scope_id INTEGER NOT NULL CHECK (typeof(scope_id) = 'integer'),
+    application_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(application_id) = 'text'),
+    canonical BLOB NOT NULL CHECK (typeof(canonical) = 'blob'),
+    content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(content_hash) = 'text') CHECK (length(content_hash) = 64),
+    created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text'),
+    storage_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(storage_hash) = 'text') CHECK (length(storage_hash) = 64),
+    source_snapshot_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(source_snapshot_id) = 'text'),
+    source_snapshot_content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(source_snapshot_content_hash) = 'text')
+        CHECK (length(source_snapshot_content_hash) = 64),
+    source_evidence_high_watermark INTEGER NOT NULL
+        CHECK (typeof(source_evidence_high_watermark) = 'integer')
+        CHECK (source_evidence_high_watermark BETWEEN -1 AND 9223372036854775807),
+    base_release_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(base_release_id) = 'text'),
+    base_release_content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(base_release_content_hash) = 'text')
+        CHECK (length(base_release_content_hash) = 64),
+    result_release_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(result_release_id) = 'text'),
+    result_release_content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(result_release_content_hash) = 'text')
+        CHECK (length(result_release_content_hash) = 64),
+    projector_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(projector_id) = 'text'),
+    projector_version_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(projector_version_hash) = 'text')
+        CHECK (length(projector_version_hash) = 64),
+    policy_id TEXT NOT NULL COLLATE BINARY CHECK (typeof(policy_id) = 'text'),
+    policy_version_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(policy_version_hash) = 'text')
+        CHECK (length(policy_version_hash) = 64),
+    policy_input_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(policy_input_hash) = 'text')
+        CHECK (length(policy_input_hash) = 64),
+    decision_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(decision_hash) = 'text') CHECK (length(decision_hash) = 64),
+    policy_context TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(policy_context) = 'text'),
+    update_count INTEGER NOT NULL CHECK (typeof(update_count) = 'integer')
+        CHECK (update_count BETWEEN 1 AND 9223372036854775807),
+    idempotency_key TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(idempotency_key) = 'text'),
+    UNIQUE (scope_id, application_id),
+    UNIQUE (scope_id, result_release_id),
+    UNIQUE (scope_id, idempotency_key),
+    FOREIGN KEY (scope_id) REFERENCES memory_scopes (scope_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (scope_id, source_snapshot_id)
+        REFERENCES memory_evidence_snapshots (scope_id, snapshot_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (scope_id, base_release_id)
+        REFERENCES memory_releases (scope_id, release_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (scope_id, result_release_id)
+        REFERENCES memory_releases (scope_id, release_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE TABLE memory_application_revisions (
+    scope_id INTEGER NOT NULL CHECK (typeof(scope_id) = 'integer'),
+    application_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(application_id) = 'text'),
+    ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer')
+        CHECK (ordinal BETWEEN 0 AND 9223372036854775807),
+    revision_id TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(revision_id) = 'text'),
+    revision_content_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(revision_content_hash) = 'text')
+        CHECK (length(revision_content_hash) = 64),
+    binding_hash TEXT NOT NULL COLLATE BINARY
+        CHECK (typeof(binding_hash) = 'text') CHECK (length(binding_hash) = 64),
+    PRIMARY KEY (scope_id, application_id, ordinal),
+    UNIQUE (scope_id, application_id, revision_id),
+    UNIQUE (scope_id, revision_id),
+    FOREIGN KEY (scope_id, application_id)
+        REFERENCES memory_applications (scope_id, application_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (scope_id, revision_id)
+        REFERENCES memory_revisions (scope_id, revision_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+)""",
+    """CREATE INDEX idx_memory_applications_scope_order ON memory_applications (
+    scope_id, application_order
+)""",
+)
+
+_SCHEMA_DDL = _SCHEMA_V2_DDL + _SCHEMA_V3_ADDITIONS
 
 _V1_REQUIRED_TABLES = frozenset(
     {
@@ -261,15 +380,25 @@ _V1_REQUIRED_TABLES = frozenset(
 _V1_REQUIRED_INDEXES = frozenset(
     {"idx_memory_evidence_sort", "idx_memory_revisions_sort"}
 )
-_REQUIRED_TABLES = _V1_REQUIRED_TABLES | frozenset(
+_V2_REQUIRED_TABLES = _V1_REQUIRED_TABLES | frozenset(
     {
         "memory_evidence_ingest_orders",
         "memory_evidence_snapshots",
         "memory_evidence_snapshot_aliases",
     }
 )
-_REQUIRED_INDEXES = _V1_REQUIRED_INDEXES | frozenset(
+_V2_REQUIRED_INDEXES = _V1_REQUIRED_INDEXES | frozenset(
     {"idx_memory_evidence_ingest_scope"}
+)
+_REQUIRED_TABLES = _V2_REQUIRED_TABLES | frozenset(
+    {
+        "memory_application_roots",
+        "memory_applications",
+        "memory_application_revisions",
+    }
+)
+_REQUIRED_INDEXES = _V2_REQUIRED_INDEXES | frozenset(
+    {"idx_memory_applications_scope_order"}
 )
 
 _CATALOG_SQL = """SELECT type, name, tbl_name, sql
@@ -296,8 +425,11 @@ def _schema_spec_digest(ddl: tuple[str, ...] = _SCHEMA_DDL) -> str:
 _SCHEMA_V1_SPEC_HASH = (
     "445a839fb37b9db29842f018f75887debcbb96997a1391b73068ea23e2f355c0"
 )
-_SCHEMA_SPEC_HASH = (
+_SCHEMA_V2_SPEC_HASH = (
     "28ce8fc78297c4d4b046ccd7be272b5d4de7318005fe277c8383f44e83ea9a0a"
+)
+_SCHEMA_SPEC_HASH = (
+    "eefb4d4ba85f65698103c90b86a54db9771cd51de10b5af1645e7eeeba44c1c5"
 )
 
 
@@ -431,7 +563,7 @@ def _read_integer_pragma(cursor: sqlite3.Cursor, pragma: str) -> int:
     return row[0]
 
 
-def _initialize_v2_locked(cursor: sqlite3.Cursor) -> None:
+def _initialize_v3_locked(cursor: sqlite3.Cursor) -> None:
     for statement in _SCHEMA_DDL:
         cursor.execute(statement)
     catalog_hash = _catalog_hash(cursor)
@@ -442,7 +574,7 @@ def _initialize_v2_locked(cursor: sqlite3.Cursor) -> None:
     )
     cursor.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
     cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-    _validate_v2_locked(cursor)
+    _validate_v3_locked(cursor)
 
 
 def _validate_schema_locked(
@@ -590,6 +722,18 @@ def _validate_ingest_orders_locked(cursor: sqlite3.Cursor) -> None:
 def _validate_v2_locked(cursor: sqlite3.Cursor) -> None:
     _validate_schema_locked(
         cursor,
+        version=_SCHEMA_V2_VERSION,
+        ddl=_SCHEMA_V2_DDL,
+        spec_hash=_SCHEMA_V2_SPEC_HASH,
+        required_tables=_V2_REQUIRED_TABLES,
+        required_indexes=_V2_REQUIRED_INDEXES,
+    )
+    _validate_ingest_orders_locked(cursor)
+
+
+def _validate_v3_locked(cursor: sqlite3.Cursor) -> None:
+    _validate_schema_locked(
+        cursor,
         version=_SCHEMA_VERSION,
         ddl=_SCHEMA_DDL,
         spec_hash=_SCHEMA_SPEC_HASH,
@@ -665,10 +809,23 @@ def _migrate_v1_to_v2_locked(cursor: sqlite3.Cursor) -> None:
     cursor.execute(
         "UPDATE memory_schema_metadata SET schema_spec_hash = ?, "
         "schema_catalog_hash = ? WHERE singleton = 1",
+        (_SCHEMA_V2_SPEC_HASH, _catalog_hash(cursor)),
+    )
+    cursor.execute(f"PRAGMA user_version = {_SCHEMA_V2_VERSION}")
+    _validate_v2_locked(cursor)
+
+
+def _migrate_v2_to_v3_locked(cursor: sqlite3.Cursor) -> None:
+    _validate_v2_locked(cursor)
+    for statement in _SCHEMA_V3_ADDITIONS:
+        cursor.execute(statement)
+    cursor.execute(
+        "UPDATE memory_schema_metadata SET schema_spec_hash = ?, "
+        "schema_catalog_hash = ? WHERE singleton = 1",
         (_SCHEMA_SPEC_HASH, _catalog_hash(cursor)),
     )
     cursor.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-    _validate_v2_locked(cursor)
+    _validate_v3_locked(cursor)
 
 
 def _initialize_or_validate_locked(
@@ -681,10 +838,14 @@ def _initialize_or_validate_locked(
     catalog_rows = _catalog_rows(cursor)
 
     if application_id == _APPLICATION_ID and user_version == _SCHEMA_VERSION:
-        _validate_v2_locked(cursor)
+        _validate_v3_locked(cursor)
+        return
+    if application_id == _APPLICATION_ID and user_version == _SCHEMA_V2_VERSION:
+        _migrate_v2_to_v3_locked(cursor)
         return
     if application_id == _APPLICATION_ID and user_version == _SCHEMA_V1_VERSION:
         _migrate_v1_to_v2_locked(cursor)
+        _migrate_v2_to_v3_locked(cursor)
         return
     if (
         prelock_page_count == 0
@@ -693,7 +854,7 @@ def _initialize_or_validate_locked(
         and internal_schema_version == 0
         and not catalog_rows
     ):
-        _initialize_v2_locked(cursor)
+        _initialize_v3_locked(cursor)
         return
     if application_id not in {0, _APPLICATION_ID}:
         raise MemoryPersistenceSchemaError(
@@ -731,7 +892,7 @@ def _add_cleanup_note(
 
 
 def _initialize_database(path: str) -> None:
-    """Initialize v2, migrate exact v1, or validate one exact v2 database."""
+    """Initialize v3, migrate exact v1/v2, or validate one exact v3 database."""
 
     _require_supported_runtime()
     connection: sqlite3.Connection | None = None
@@ -796,7 +957,7 @@ def _transaction(
         if lock_catalog_before_journal:
             cursor.execute("SELECT name FROM main.sqlite_master LIMIT 1").fetchone()
         _require_delete_journal(cursor)
-        _validate_v2_locked(cursor)
+        _validate_v3_locked(cursor)
         yield cursor
         cursor.execute("COMMIT")
         transaction_may_be_active = False
@@ -869,7 +1030,13 @@ def _scope_payload(scope: MemoryScope) -> dict[str, str]:
 def _record_storage_hash(
     *,
     record_kind: Literal[
-        "evidence", "candidate", "revision", "release", "evidence_snapshot"
+        "evidence",
+        "candidate",
+        "revision",
+        "release",
+        "evidence_snapshot",
+        "memory_application_root",
+        "memory_application",
     ],
     scope: MemoryScope,
     record_id: str,
@@ -884,6 +1051,8 @@ def _record_storage_hash(
         "revision",
         "release",
         "evidence_snapshot",
+        "memory_application_root",
+        "memory_application",
     }:
         raise ValueError("record_kind is not supported")
     payload: dict[str, object] = {
@@ -918,6 +1087,28 @@ def _release_binding_hash(
         "scope": _scope_payload(scope),
         "idempotency_key": idempotency_key,
         "release_id": release_id,
+    }
+    return _record_digest(_compact_json_bytes(payload))
+
+
+def _application_revision_binding_hash(
+    *,
+    scope: MemoryScope,
+    application_id: str,
+    ordinal: int,
+    revision_id: str,
+    revision_content_hash: str,
+) -> str:
+    if type(ordinal) is not int or not 0 <= ordinal <= _MAX_SIGNED_64:
+        raise ValueError("application revision ordinal must fit signed-64 range")
+    payload = {
+        "application_id": application_id,
+        "ordinal": ordinal,
+        "record_kind": "memory_application_revision",
+        "revision_content_hash": revision_content_hash,
+        "revision_id": revision_id,
+        "schema_version": 1,
+        "scope": _scope_payload(scope),
     }
     return _record_digest(_compact_json_bytes(payload))
 

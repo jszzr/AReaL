@@ -2658,7 +2658,7 @@ def test_runtime_floor_is_checked_before_connect(
     assert not (tmp_path / "memory.sqlite3").exists()
 
 
-def test_new_database_has_exact_v2_header_catalog_and_metadata(
+def test_new_database_has_exact_v3_header_catalog_and_metadata(
     tmp_path: Path,
 ) -> None:
     path = str(tmp_path / "memory.sqlite3")
@@ -2679,7 +2679,8 @@ def test_new_database_has_exact_v2_header_catalog_and_metadata(
         }
         assert len(sqlite_backend._SCHEMA_V1_DDL) == 11
         assert len(sqlite_backend._SCHEMA_V2_ADDITIONS) == 4
-        assert len(sqlite_backend._SCHEMA_DDL) == 15
+        assert len(sqlite_backend._SCHEMA_V3_ADDITIONS) == 4
+        assert len(sqlite_backend._SCHEMA_DDL) == 19
         assert names == (
             sqlite_backend._REQUIRED_TABLES | sqlite_backend._REQUIRED_INDEXES
         )
@@ -2699,6 +2700,15 @@ def test_new_database_has_exact_v2_header_catalog_and_metadata(
         ).fetchone() == (0,)
         assert connection.execute(
             "SELECT COUNT(*) FROM memory_evidence_snapshot_aliases"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_application_roots"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_applications"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memory_application_revisions"
         ).fetchone() == (0,)
     finally:
         connection.close()
@@ -3039,7 +3049,7 @@ def test_initializer_uses_begin_exclusive_without_executescript(
     normalized = [_normalize_sql(statement) for statement in statements]
     assert "BEGIN EXCLUSIVE" in normalized
     assert normalized.index("PRAGMA APPLICATION_ID = 1095912787") < normalized.index(
-        "PRAGMA USER_VERSION = 2"
+        "PRAGMA USER_VERSION = 3"
     )
     assert normalized[-1] == "COMMIT"
 
@@ -3053,7 +3063,7 @@ def test_interrupted_initialization_rolls_back_every_boundary(
     ] + [
         "INSERT INTO memory_schema_metadata",
         "PRAGMA application_id = 1095912787",
-        "PRAGMA user_version = 2",
+        "PRAGMA user_version = 3",
     ]
 
     for index, marker in enumerate(markers):
@@ -3123,7 +3133,7 @@ def test_two_initializers_converge(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA application_id").fetchone() == (
             sqlite_backend._APPLICATION_ID,
         )
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute(
             "SELECT schema_catalog_hash FROM memory_schema_metadata"
         ).fetchone() == (sqlite_backend._catalog_hash(connection.cursor()),)
@@ -3136,7 +3146,7 @@ def test_two_initializers_converge(tmp_path: Path) -> None:
     [
         "CREATE TABLE memory_revisions",
         "PRAGMA application_id = 1095912787",
-        "PRAGMA user_version = 2",
+        "PRAGMA user_version = 3",
     ],
     ids=["ddl", "application-id", "user-version"],
 )
@@ -3378,7 +3388,7 @@ def test_wrong_application_id_is_rejected(tmp_path: Path) -> None:
         sqlite_backend._initialize_database(database_path)
 
 
-@pytest.mark.parametrize("version", [3, 2**31 - 1])
+@pytest.mark.parametrize("version", [4, 2**31 - 1])
 def test_unknown_schema_version_is_rejected(tmp_path: Path, version: int) -> None:
     database_path = str(tmp_path / f"memory-{version}.sqlite3")
     sqlite_backend._initialize_database(database_path)
@@ -3524,7 +3534,7 @@ def test_empty_wal_database_is_rejected_without_conversion(tmp_path: Path) -> No
         connection.close()
 
 
-def test_v2_switched_to_wal_is_rejected_without_conversion(tmp_path: Path) -> None:
+def test_v3_switched_to_wal_is_rejected_without_conversion(tmp_path: Path) -> None:
     database_path = str(tmp_path / "memory.sqlite3")
     sqlite_backend._initialize_database(database_path)
     connection = sqlite3.connect(database_path, isolation_level=None)
@@ -3607,6 +3617,36 @@ def test_record_and_alias_hashes_match_golden_wire_vectors(
         == "2d82659f84c45b88e71110c1486dd6e3743263df9df0e5d0a837697de4553ff3"
     )
     assert (
+        sqlite_backend._record_storage_hash(
+            record_kind="memory_application_root",
+            scope=scope,
+            record_id="mroot_a",
+            content_hash="d" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+        )
+        == "e6dfae13b7432300dd18c7df232b43427c25533f6701a1bc7947e30c3f4a9453"
+    )
+    assert (
+        sqlite_backend._record_storage_hash(
+            record_kind="memory_application",
+            scope=scope,
+            record_id="mapp_a",
+            content_hash="e" * 64,
+            created_at_text="2026-07-08T00:00:00+00:00",
+        )
+        == "b09e050479afafa4fef8d1fd52116eefafdc699bf3c022206d8183c4617f4f04"
+    )
+    assert (
+        sqlite_backend._application_revision_binding_hash(
+            scope=scope,
+            application_id="mapp_a",
+            ordinal=7,
+            revision_id="rev_a",
+            revision_content_hash="f" * 64,
+        )
+        == "d592251eb678b6e7f802cf2ea4d18f5dc5090178097f92bebb1485cf070f49ab"
+    )
+    assert (
         sqlite_backend._release_binding_hash(
             scope=scope,
             idempotency_key="alias-a",
@@ -3635,6 +3675,9 @@ def test_record_and_alias_hashes_match_golden_wire_vectors(
         b'{"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"2026-07-08T00:00:00+00:00","record_id":"evd_a","record_kind":"evidence","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"content_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created_at":"2026-07-08T00:00:00+00:00","generation":7,"memory_id":"mem_a","record_id":"rev_a","record_kind":"revision","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"content_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","created_at":"2026-07-08T00:00:00+00:00","record_id":"esnap_a","record_kind":"evidence_snapshot","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"content_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","created_at":"2026-07-08T00:00:00+00:00","record_id":"mroot_a","record_kind":"memory_application_root","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"content_hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","created_at":"2026-07-08T00:00:00+00:00","record_id":"mapp_a","record_kind":"memory_application","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
+        b'{"application_id":"mapp_a","ordinal":7,"record_kind":"memory_application_revision","revision_content_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","revision_id":"rev_a","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"idempotency_key":"alias-a","record_kind":"release_alias","release_id":"rel_a","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"evidence_id":"evd_a","ingest_order":7,"record_kind":"evidence_ingest_order","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"}}',
         b'{"idempotency_key":"snapshot-alias-a","record_kind":"evidence_snapshot_alias","schema_version":1,"scope":{"namespace":"assistant-memory","subject_id":"user-1","tenant_id":"tenant-1"},"snapshot_id":"esnap_a"}',
@@ -3643,7 +3686,14 @@ def test_record_and_alias_hashes_match_golden_wire_vectors(
 
 @pytest.mark.parametrize(
     "record_kind",
-    ["evidence", "candidate", "release", "evidence_snapshot"],
+    [
+        "evidence",
+        "candidate",
+        "release",
+        "evidence_snapshot",
+        "memory_application_root",
+        "memory_application",
+    ],
 )
 def test_nonrevision_storage_hash_rejects_revision_binding_fields(
     record_kind: str,

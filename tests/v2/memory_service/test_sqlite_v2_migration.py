@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Failure-oriented tests for the exact SQLite v1 to v2 migration."""
+"""Failure-oriented tests for exact SQLite v1/v2 to v3 migration."""
 
 from __future__ import annotations
 
@@ -27,6 +27,9 @@ _V1_SCHEMA_SPEC_GOLDEN = (
 )
 _V1_SCHEMA_CATALOG_GOLDEN = (
     "713b6273425eee792360134b25ded70d88b8e4aba92fef256c566d322d41d7a6"
+)
+_V2_SCHEMA_SPEC_GOLDEN = (
+    "28ce8fc78297c4d4b046ccd7be272b5d4de7318005fe277c8383f44e83ea9a0a"
 )
 _V1_OBJECT_NAMES = frozenset(
     {
@@ -168,6 +171,61 @@ def _create_exact_v1(
         connection.close()
 
 
+def _create_exact_v2(database_path: Path) -> None:
+    """Create an empty exact v2 database without executing v3 additions."""
+
+    assert hashlib.sha256(
+        _compact_json_bytes(sqlite_backend._SCHEMA_V2_DDL)
+    ).hexdigest() == _V2_SCHEMA_SPEC_GOLDEN
+    assert sqlite_backend._SCHEMA_V2_SPEC_HASH == _V2_SCHEMA_SPEC_GOLDEN
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("BEGIN IMMEDIATE")
+        for statement in sqlite_backend._SCHEMA_V2_DDL:
+            cursor.execute(statement)
+        catalog_hash = _catalog_hash(cursor)
+        cursor.execute(
+            "INSERT INTO memory_schema_metadata "
+            "(singleton, schema_spec_hash, schema_catalog_hash) VALUES (?, ?, ?)",
+            (1, _V2_SCHEMA_SPEC_GOLDEN, catalog_hash),
+        )
+        cursor.execute(
+            f"PRAGMA application_id = {sqlite_backend._APPLICATION_ID}"
+        )
+        cursor.execute(f"PRAGMA user_version = {sqlite_backend._SCHEMA_V2_VERSION}")
+        cursor.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+
+def _create_populated_exact_v2(
+    database_path: Path,
+    seeds: Sequence[_V1EvidenceSeed],
+) -> None:
+    """Create populated v2 state while stopping before v3 additions."""
+
+    _create_exact_v1(database_path, seeds)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("BEGIN EXCLUSIVE")
+        sqlite_backend._migrate_v1_to_v2_locked(cursor)
+        cursor.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+
 def _object_names(cursor: sqlite3.Cursor) -> frozenset[str]:
     return frozenset(row[1] for row in _catalog_rows(cursor))
 
@@ -199,6 +257,30 @@ def _assert_exact_v2(database_path: Path) -> None:
             sqlite_backend._APPLICATION_ID,
         )
         assert cursor.execute("PRAGMA user_version").fetchone() == (2,)
+        assert _object_names(cursor) == (
+            sqlite_backend._V2_REQUIRED_TABLES
+            | sqlite_backend._V2_REQUIRED_INDEXES
+        )
+        assert cursor.execute(
+            "SELECT schema_spec_hash, schema_catalog_hash "
+            "FROM memory_schema_metadata WHERE singleton = 1"
+        ).fetchone() == (
+            sqlite_backend._SCHEMA_V2_SPEC_HASH,
+            _catalog_hash(cursor),
+        )
+        assert cursor.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+
+def _assert_exact_v3(database_path: Path) -> None:
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    try:
+        cursor = connection.cursor()
+        assert cursor.execute("PRAGMA application_id").fetchone() == (
+            sqlite_backend._APPLICATION_ID,
+        )
+        assert cursor.execute("PRAGMA user_version").fetchone() == (3,)
         assert _object_names(cursor) == (
             sqlite_backend._REQUIRED_TABLES | sqlite_backend._REQUIRED_INDEXES
         )
@@ -250,16 +332,51 @@ def test_exact_v1_fixture_is_bound_to_frozen_schema_goldens(tmp_path: Path) -> N
     _assert_exact_v1(database_path)
 
 
-def test_empty_exact_v1_migrates_to_v2_and_reopens(tmp_path: Path) -> None:
+def test_empty_exact_v1_migrates_to_v3_and_reopens(tmp_path: Path) -> None:
     database_path = tmp_path / "empty-v1.sqlite3"
     _create_exact_v1(database_path)
 
     SQLiteMemoryStore(database_path)
 
-    _assert_exact_v2(database_path)
+    _assert_exact_v3(database_path)
     assert _read_ingest_rows(database_path) == ()
     SQLiteMemoryStore(database_path)
+    _assert_exact_v3(database_path)
+
+
+def test_empty_exact_v2_migrates_to_v3_and_reopens(tmp_path: Path) -> None:
+    database_path = tmp_path / "empty-v2.sqlite3"
+    _create_exact_v2(database_path)
+
+    SQLiteMemoryStore(database_path)
+
+    _assert_exact_v3(database_path)
+    assert _read_ingest_rows(database_path) == ()
+    SQLiteMemoryStore(database_path)
+    _assert_exact_v3(database_path)
+
+
+def test_populated_exact_v2_migrates_without_rewriting_evidence_order(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "populated-v2.sqlite3"
+    scope = MemoryScope("tenant", "agent-memory", "populated-v2")
+    instant = datetime(2026, 7, 11, 7, 0, tzinfo=UTC)
+    seeds = (
+        _V1EvidenceSeed(5, _event(scope, 1), instant),
+        _V1EvidenceSeed(5, _event(scope, 2), instant + timedelta(seconds=1)),
+    )
+    _create_populated_exact_v2(database_path, seeds)
     _assert_exact_v2(database_path)
+    before = _read_ingest_rows(database_path)
+
+    store = SQLiteMemoryStore(database_path)
+
+    _assert_exact_v3(database_path)
+    assert _read_ingest_rows(database_path) == before
+    assert {item.evidence_id for item in store.list(scope)} == {
+        seed.evidence_id for seed in seeds
+    }
 
 
 def test_multiscope_backfill_is_deterministic_and_survives_reopen(
@@ -352,6 +469,8 @@ def test_corrupt_v1_is_rejected_without_partial_migration(tmp_path: Path) -> Non
 @dataclass(slots=True)
 class _OneShotFailure:
     fired: bool = False
+    target_prefix: str = "INSERT INTO MEMORY_EVIDENCE_INGEST_ORDERS"
+    message: str = "injected migration failure after ingest insert"
 
 
 class _FailingCursor:
@@ -364,10 +483,10 @@ class _FailingCursor:
         normalized = " ".join(sql.split()).upper()
         if (
             not self._state.fired
-            and normalized.startswith("INSERT INTO MEMORY_EVIDENCE_INGEST_ORDERS")
+            and normalized.startswith(self._state.target_prefix)
         ):
             self._state.fired = True
-            raise RuntimeError("injected migration failure after ingest insert")
+            raise RuntimeError(self._state.message)
         return self
 
     def __iter__(self) -> Any:
@@ -426,8 +545,47 @@ def test_migration_failure_rolls_back_atomically_and_retry_succeeds(
 
     monkeypatch.setattr(sqlite_backend, "_connect", real_connect)
     SQLiteMemoryStore(database_path)
-    _assert_exact_v2(database_path)
+    _assert_exact_v3(database_path)
     assert tuple(row[0] for row in _read_ingest_rows(database_path)) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    tuple(
+        " ".join(statement.split()).upper().split(" (")[0]
+        for statement in sqlite_backend._SCHEMA_V3_ADDITIONS
+    )
+    + (
+        "UPDATE MEMORY_SCHEMA_METADATA SET SCHEMA_SPEC_HASH = ?",
+        "PRAGMA USER_VERSION = 3",
+    ),
+)
+def test_every_v2_to_v3_migration_boundary_rolls_back_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    database_path = tmp_path / f"v2-v3-boundary-{hashlib.sha256(marker.encode()).hexdigest()[:8]}.sqlite3"
+    _create_exact_v2(database_path)
+    _assert_exact_v2(database_path)
+    state = _OneShotFailure(
+        target_prefix=marker,
+        message=f"injected v2 to v3 failure after {marker}",
+    )
+    real_connect = sqlite_backend._connect
+
+    def failing_connect(path: str) -> _FailingConnection:
+        return _FailingConnection(real_connect(path), state)
+
+    monkeypatch.setattr(sqlite_backend, "_connect", failing_connect)
+    with pytest.raises(RuntimeError, match="injected v2 to v3 failure"):
+        SQLiteMemoryStore(database_path)
+
+    assert state.fired
+    _assert_exact_v2(database_path)
+    monkeypatch.setattr(sqlite_backend, "_connect", real_connect)
+    SQLiteMemoryStore(database_path)
+    _assert_exact_v3(database_path)
 
 
 def test_concurrent_constructors_converge_on_one_migration(tmp_path: Path) -> None:
@@ -451,7 +609,7 @@ def test_concurrent_constructors_converge_on_one_migration(tmp_path: Path) -> No
         stores = tuple(future.result(timeout=10) for future in futures)
 
     assert len(stores) == 2
-    _assert_exact_v2(database_path)
+    _assert_exact_v3(database_path)
     rows = _read_ingest_rows(database_path)
     assert tuple(row[0] for row in rows) == (0, 1)
     assert len({(row[1], row[2]) for row in rows}) == 2

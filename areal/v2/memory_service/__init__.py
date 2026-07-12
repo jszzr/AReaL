@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public contracts for immutable evidence, snapshots, history, and releases."""
+"""Public contracts for immutable evidence, history, releases, and applications."""
 
+from areal.v2.memory_service.application_store import MemoryApplicationStore
+from areal.v2.memory_service.application_types import (
+    AppliedMemoryUpdateV1,
+    MemoryApplicationProposal,
+    MemoryApplicationRootV1,
+    MemoryApplicationUpdateProposal,
+    MemoryApplicationV1,
+)
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
     CandidateNotFoundError,
@@ -9,6 +17,11 @@ from areal.v2.memory_service.errors import (
     EvidenceNotFoundError,
     EvidenceSnapshotConflictError,
     EvidenceSnapshotNotFoundError,
+    MemoryApplicationConflictError,
+    MemoryApplicationNotFoundError,
+    MemoryApplicationRootConflictError,
+    MemoryApplicationRootNotFoundError,
+    MemoryApplicationStaleSnapshotError,
     MemoryServiceError,
     ReleaseConflictError,
     ReleaseNotFoundError,
@@ -50,6 +63,7 @@ from areal.v2.memory_service.types import (
 )
 
 __all__ = [
+    "AppliedMemoryUpdateV1",
     "CandidateConflictError",
     "CandidateNotFoundError",
     "CandidateProposal",
@@ -70,6 +84,16 @@ __all__ = [
     "InMemoryMemoryHistoryStore",
     "InMemoryMemoryReleaseStore",
     "MemoryCandidate",
+    "MemoryApplicationConflictError",
+    "MemoryApplicationNotFoundError",
+    "MemoryApplicationProposal",
+    "MemoryApplicationRootConflictError",
+    "MemoryApplicationRootNotFoundError",
+    "MemoryApplicationRootV1",
+    "MemoryApplicationStaleSnapshotError",
+    "MemoryApplicationStore",
+    "MemoryApplicationUpdateProposal",
+    "MemoryApplicationV1",
     "MemoryHistoryStore",
     "MemoryRelease",
     "MemoryReleaseStore",

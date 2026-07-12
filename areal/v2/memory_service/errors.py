@@ -49,6 +49,26 @@ class ReleaseConflictError(MemoryServiceError):
     """Raised when a release write conflicts with immutable history."""
 
 
+class MemoryApplicationRootNotFoundError(MemoryServiceError):
+    """Raised when a scope has no committed Memory application root."""
+
+
+class MemoryApplicationRootConflictError(MemoryServiceError):
+    """Raised when a scope's immutable Memory application root conflicts."""
+
+
+class MemoryApplicationNotFoundError(MemoryServiceError):
+    """Raised when a committed Memory application cannot be resolved."""
+
+
+class MemoryApplicationConflictError(MemoryServiceError):
+    """Raised when a Memory application conflicts with durable lineage."""
+
+
+class MemoryApplicationStaleSnapshotError(MemoryServiceError):
+    """Raised when evidence arrived after an application's source snapshot."""
+
+
 class MemoryPersistenceError(MemoryServiceError):
     """Base class for durable Memory Service storage failures."""
 

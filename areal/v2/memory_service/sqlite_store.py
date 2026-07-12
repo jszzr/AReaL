@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 
 from areal.v2.memory_service._sqlite_backend import (
+    _application_revision_binding_hash,
     _evidence_ingest_binding_hash,
     _initialize_database,
     _read_transaction,
@@ -21,6 +23,13 @@ from areal.v2.memory_service._sqlite_backend import (
     _validate_ingest_orders_locked,
     _write_transaction,
 )
+from areal.v2.memory_service.application_types import (
+    AppliedMemoryUpdateV1,
+    MemoryApplicationProposal,
+    MemoryApplicationRootV1,
+    MemoryApplicationUpdateProposal,
+    MemoryApplicationV1,
+)
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
     CandidateNotFoundError,
@@ -28,6 +37,11 @@ from areal.v2.memory_service.errors import (
     EvidenceNotFoundError,
     EvidenceSnapshotConflictError,
     EvidenceSnapshotNotFoundError,
+    MemoryApplicationConflictError,
+    MemoryApplicationNotFoundError,
+    MemoryApplicationRootConflictError,
+    MemoryApplicationRootNotFoundError,
+    MemoryApplicationStaleSnapshotError,
     MemoryPersistenceCorruptionError,
     ReleaseConflictError,
     ReleaseNotFoundError,
@@ -129,6 +143,71 @@ FROM memory_releases
 WHERE scope_id = ? AND release_id = ?"""
 
 _RELEASE_ROW_TYPES = (str, bytes, str, str, str)
+
+_APPLICATION_ROOT_SELECT = """SELECT root_id, canonical, content_hash,
+       created_at, storage_hash, release_id, release_content_hash
+FROM memory_application_roots
+WHERE scope_id = ?"""
+
+_APPLICATION_SELECT = """SELECT application_order, application_id, canonical,
+       content_hash, created_at, storage_hash, source_snapshot_id,
+       source_snapshot_content_hash, source_evidence_high_watermark,
+       base_release_id, base_release_content_hash, result_release_id,
+       result_release_content_hash, projector_id, projector_version_hash,
+       policy_id, policy_version_hash, policy_input_hash, decision_hash,
+       policy_context, update_count, idempotency_key
+FROM memory_applications
+WHERE scope_id = ? AND application_id = ?"""
+
+_APPLICATION_ROW_TYPES = (
+    int,
+    str,
+    bytes,
+    str,
+    str,
+    str,
+    str,
+    str,
+    int,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    int,
+    str,
+)
+
+_APPLICATION_CHILD_KEY_DOMAIN = b"areal-memory-application-child-key-v1\0"
+
+
+def _application_transaction_fault_hook(_stage: str) -> None:
+    """Private deterministic failure seam used by atomicity tests."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationState:
+    scope_by_id: dict[int, MemoryScope]
+    evidence_by_address: dict[tuple[int, str], EvidenceRecord]
+    ingest_order_by_address: dict[tuple[int, str], int]
+    snapshot_by_address: dict[tuple[int, str], EvidenceSnapshot]
+    candidate_by_address: dict[tuple[int, str], MemoryCandidate]
+    revision_by_address: dict[tuple[int, str], MemoryRevision]
+    release_by_address: dict[tuple[int, str], MemoryRelease]
+    release_by_alias: dict[tuple[int, str], MemoryRelease]
+    revisions_by_release: dict[tuple[int, str], tuple[MemoryRevision, ...]]
+    root_by_scope_id: dict[int, MemoryApplicationRootV1]
+    root_by_release: dict[tuple[int, str], MemoryApplicationRootV1]
+    application_by_address: dict[tuple[int, str], MemoryApplicationV1]
+    application_by_idempotency: dict[tuple[int, str], MemoryApplicationV1]
+    application_by_result_release: dict[tuple[int, str], MemoryApplicationV1]
+    application_by_revision: dict[tuple[int, str], MemoryApplicationV1]
 
 _MAX_SCOPE_ID = 2**63 - 1
 _MAX_GENERATION = 2**63 - 1
@@ -1528,6 +1607,1263 @@ def _load_release_snapshot(
     )
 
 
+def _load_application_roots(
+    cursor: sqlite3.Cursor,
+    *,
+    scope_by_id: dict[int, MemoryScope],
+    release_by_address: dict[tuple[int, str], MemoryRelease],
+) -> tuple[
+    dict[int, MemoryApplicationRootV1],
+    dict[tuple[int, str], MemoryApplicationRootV1],
+]:
+    rows = cursor.execute(
+        "SELECT scope_id FROM memory_application_roots ORDER BY scope_id"
+    ).fetchall()
+    by_scope_id: dict[int, MemoryApplicationRootV1] = {}
+    by_release: dict[tuple[int, str], MemoryApplicationRootV1] = {}
+    for address_row in rows:
+        if len(address_row) != 1:
+            raise MemoryPersistenceCorruptionError(
+                "application root address has the wrong field count"
+            )
+        scope_id = _require_scope_id(
+            address_row[0],
+            "application root has an invalid scope ID",
+        )
+        scope = scope_by_id.get(scope_id)
+        row = cursor.execute(_APPLICATION_ROOT_SELECT, (scope_id,)).fetchone()
+        if (
+            scope is None
+            or row is None
+            or len(row) != 7
+            or not all(
+                type(value) is expected
+                for value, expected in zip(
+                    row,
+                    (str, bytes, str, str, str, str, str),
+                    strict=True,
+                )
+            )
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "stored application root has invalid fields"
+            )
+        (
+            root_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            release_id,
+            release_content_hash,
+        ) = row
+        release = release_by_address.get((scope_id, release_id))
+        try:
+            root = MemoryApplicationRootV1(
+                scope=scope,
+                release_id=release_id,
+                release_content_sha256=release_content_hash,
+                root_id=root_id,
+                content_hash=content_hash,
+                created_at=datetime.fromisoformat(created_at_text),
+            )
+            if (
+                root.created_at.isoformat() != created_at_text
+                or root.canonical_bytes() != canonical
+                or release is None
+                or release.content_hash != release_content_hash
+                or storage_hash
+                != _record_storage_hash(
+                    record_kind="memory_application_root",
+                    scope=scope,
+                    record_id=root_id,
+                    content_hash=content_hash,
+                    created_at_text=created_at_text,
+                )
+            ):
+                raise ValueError("application root commitment mismatch")
+        except (TypeError, ValueError, OverflowError) as error:
+            raise MemoryPersistenceCorruptionError(
+                "stored application root failed integrity validation"
+            ) from error
+        release_address = (scope_id, release_id)
+        if scope_id in by_scope_id or release_address in by_release:
+            raise MemoryPersistenceCorruptionError(
+                "application root is not unique in its scope"
+            )
+        by_scope_id[scope_id] = root
+        by_release[release_address] = root
+    return by_scope_id, by_release
+
+
+def _load_application_edges(
+    cursor: sqlite3.Cursor,
+    *,
+    scope_by_id: dict[int, MemoryScope],
+    revision_by_address: dict[tuple[int, str], MemoryRevision],
+) -> dict[tuple[int, str], tuple[MemoryRevision, ...]]:
+    rows = cursor.execute(
+        "SELECT scope_id, application_id, ordinal, revision_id, "
+        "revision_content_hash, binding_hash "
+        "FROM memory_application_revisions "
+        "ORDER BY scope_id, application_id COLLATE BINARY, ordinal"
+    ).fetchall()
+    grouped: dict[tuple[int, str], list[MemoryRevision]] = {}
+    seen_revisions: set[tuple[int, str]] = set()
+    for row in rows:
+        if (
+            len(row) != 6
+            or type(row[0]) is not int
+            or type(row[1]) is not str
+            or type(row[2]) is not int
+            or any(type(value) is not str for value in row[3:])
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "application revision edge has invalid storage classes"
+            )
+        scope_id = _require_scope_id(
+            row[0],
+            "application revision edge has an invalid scope ID",
+        )
+        application_id, ordinal, revision_id, revision_hash, binding_hash = row[1:]
+        scope = scope_by_id.get(scope_id)
+        revision = revision_by_address.get((scope_id, revision_id))
+        address = (scope_id, application_id)
+        items = grouped.setdefault(address, [])
+        revision_address = (scope_id, revision_id)
+        if (
+            scope is None
+            or type(ordinal) is not int
+            or ordinal != len(items)
+            or revision is None
+            or revision.content_hash != revision_hash
+            or revision_address in seen_revisions
+            or binding_hash
+            != _application_revision_binding_hash(
+                scope=scope,
+                application_id=application_id,
+                ordinal=ordinal,
+                revision_id=revision_id,
+                revision_content_hash=revision_hash,
+            )
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "application revision edge failed integrity validation"
+            )
+        seen_revisions.add(revision_address)
+        items.append(revision)
+    return {address: tuple(items) for address, items in grouped.items()}
+
+
+def _application_child_idempotency_key(
+    proposal: MemoryApplicationProposal,
+    *,
+    record_kind: str,
+    ordinal: int | None = None,
+) -> str:
+    if record_kind not in {"candidate", "revision", "release"}:
+        raise ValueError("unsupported application child record kind")
+    if record_kind == "release":
+        if ordinal is not None:
+            raise ValueError("release application key must not have an ordinal")
+    elif type(ordinal) is not int or ordinal < 0:
+        raise ValueError("application child ordinal must be non-negative")
+    payload = json.dumps(
+        {
+            "ordinal": ordinal,
+            "proposal_sha256": sha256(proposal.canonical_bytes()).hexdigest(),
+            "record_kind": record_kind,
+            "schema_version": 1,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return (
+        f"memory-application-{record_kind}-"
+        + sha256(_APPLICATION_CHILD_KEY_DOMAIN + payload).hexdigest()
+    )
+
+
+def _validate_application_release_transform(
+    application: MemoryApplicationV1,
+    *,
+    base_revisions: tuple[MemoryRevision, ...],
+    result_revisions: tuple[MemoryRevision, ...],
+) -> None:
+    base_ids = tuple(item.revision_id for item in base_revisions)
+    expected = list(base_ids)
+    base_position = {revision_id: index for index, revision_id in enumerate(base_ids)}
+    add_count = 0
+    for update in application.applied_updates:
+        if update.operation is RevisionOperation.SUPERSEDE:
+            assert update.parent_revision_id is not None
+            position = base_position.get(update.parent_revision_id)
+            if position is None or update.release_position != position:
+                raise ValueError("SUPERSEDE does not replace an exact base tip")
+            expected[position] = update.revision_id
+        elif update.operation is RevisionOperation.ADD:
+            expected_position = len(base_ids) + add_count
+            if update.release_position != expected_position:
+                raise ValueError("ADD does not append in application order")
+            expected.append(update.revision_id)
+            add_count += 1
+        else:
+            raise ValueError("application contains an unsupported operation")
+    result_ids = tuple(item.revision_id for item in result_revisions)
+    if tuple(expected) != result_ids or application.result_revision_ids != result_ids:
+        raise ValueError("result release is not the exact declared base transform")
+
+
+def _load_application(
+    cursor: sqlite3.Cursor,
+    *,
+    scope_id: int,
+    application_id: str,
+    scope_by_id: dict[int, MemoryScope],
+    candidate_by_address: dict[tuple[int, str], MemoryCandidate],
+    revision_by_address: dict[tuple[int, str], MemoryRevision],
+    release_by_address: dict[tuple[int, str], MemoryRelease],
+    release_by_alias: dict[tuple[int, str], MemoryRelease],
+    revisions_by_release: dict[tuple[int, str], tuple[MemoryRevision, ...]],
+    snapshot_by_address: dict[tuple[int, str], EvidenceSnapshot],
+    application_edges: dict[tuple[int, str], tuple[MemoryRevision, ...]],
+) -> MemoryApplicationV1:
+    row = cursor.execute(_APPLICATION_SELECT, (scope_id, application_id)).fetchone()
+    if row is None:
+        raise MemoryApplicationNotFoundError(
+            f"application {application_id!r} was not found"
+        )
+    try:
+        if len(row) != len(_APPLICATION_ROW_TYPES) or any(
+            type(value) is not expected
+            for value, expected in zip(row, _APPLICATION_ROW_TYPES, strict=True)
+        ):
+            raise TypeError("application row has invalid storage classes")
+        (
+            application_order,
+            stored_application_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            source_snapshot_id,
+            source_snapshot_hash,
+            source_high_watermark,
+            base_release_id,
+            base_release_hash,
+            result_release_id,
+            result_release_hash,
+            projector_id,
+            projector_version_hash,
+            policy_id,
+            policy_version_hash,
+            policy_input_hash,
+            decision_hash,
+            policy_context,
+            update_count,
+            idempotency_key,
+        ) = row
+        if stored_application_id != application_id:
+            raise ValueError("application ID differs from requested ID")
+        scope = scope_by_id[scope_id]
+        snapshot = snapshot_by_address[(scope_id, source_snapshot_id)]
+        base_release = release_by_address[(scope_id, base_release_id)]
+        result_release = release_by_address[(scope_id, result_release_id)]
+        base_revisions = revisions_by_release[(scope_id, base_release_id)]
+        result_revisions = revisions_by_release[(scope_id, result_release_id)]
+        edge_revisions = application_edges[(scope_id, application_id)]
+        if len(edge_revisions) != update_count:
+            raise ValueError("application update count disagrees with edges")
+
+        member_by_id = {member.evidence_id: member for member in snapshot.members}
+        update_proposals: list[MemoryApplicationUpdateProposal] = []
+        applied_updates: list[AppliedMemoryUpdateV1] = []
+        result_position = {
+            revision.revision_id: position
+            for position, revision in enumerate(result_revisions)
+        }
+        for ordinal, revision in enumerate(edge_revisions):
+            candidate = candidate_by_address[(scope_id, revision.proposal.candidate_id)]
+            grounding = tuple(
+                member_by_id[evidence_id]
+                for evidence_id in candidate.proposal.evidence_ids
+            )
+            update_proposals.append(
+                MemoryApplicationUpdateProposal(
+                    content=candidate.proposal.content,
+                    evidence_ids=candidate.proposal.evidence_ids,
+                    operation=revision.proposal.operation,
+                    parent_revision_id=revision.proposal.parent_revision_id,
+                )
+            )
+            applied_updates.append(
+                AppliedMemoryUpdateV1(
+                    ordinal=ordinal,
+                    release_position=result_position[revision.revision_id],
+                    operation=revision.proposal.operation,
+                    grounding=grounding,
+                    candidate_id=candidate.candidate_id,
+                    candidate_content_sha256=candidate.content_hash,
+                    revision_id=revision.revision_id,
+                    revision_content_sha256=revision.content_hash,
+                    memory_id=revision.memory_id,
+                    generation=revision.generation,
+                    parent_revision_id=revision.proposal.parent_revision_id,
+                )
+            )
+        proposal = MemoryApplicationProposal(
+            scope=scope,
+            source_snapshot_id=source_snapshot_id,
+            source_base_release_id=base_release_id,
+            projector_id=projector_id,
+            projector_version_sha256=projector_version_hash,
+            policy_id=policy_id,
+            policy_version_sha256=policy_version_hash,
+            policy_input_sha256=policy_input_hash,
+            decision_sha256=decision_hash,
+            policy_context=policy_context,
+            updates=tuple(update_proposals),
+            idempotency_key=idempotency_key,
+        )
+        for ordinal, (revision, update) in enumerate(
+            zip(edge_revisions, applied_updates, strict=True)
+        ):
+            candidate = candidate_by_address[(scope_id, update.candidate_id)]
+            if (
+                candidate.proposal.idempotency_key
+                != _application_child_idempotency_key(
+                    proposal,
+                    record_kind="candidate",
+                    ordinal=ordinal,
+                )
+                or revision.proposal.idempotency_key
+                != _application_child_idempotency_key(
+                    proposal,
+                    record_kind="revision",
+                    ordinal=ordinal,
+                )
+            ):
+                raise ValueError("application child idempotency binding mismatch")
+        release_alias = release_by_alias.get(
+            (
+                scope_id,
+                _application_child_idempotency_key(
+                    proposal,
+                    record_kind="release",
+                ),
+            )
+        )
+        if release_alias != result_release:
+            raise ValueError("application result release alias is missing")
+        application = MemoryApplicationV1(
+            proposal=proposal,
+            source_snapshot_content_sha256=source_snapshot_hash,
+            source_evidence_high_watermark=source_high_watermark,
+            base_release_content_sha256=base_release_hash,
+            result_release_id=result_release_id,
+            result_release_content_sha256=result_release_hash,
+            result_revision_ids=result_release.manifest.revision_ids,
+            applied_updates=tuple(applied_updates),
+            application_order=application_order,
+            application_id=stored_application_id,
+            content_hash=content_hash,
+            created_at=datetime.fromisoformat(created_at_text),
+        )
+        if (
+            application.created_at.isoformat() != created_at_text
+            or application.canonical_bytes() != canonical
+            or snapshot.content_hash != source_snapshot_hash
+            or snapshot.evidence_high_watermark != source_high_watermark
+            or base_release.content_hash != base_release_hash
+            or result_release.content_hash != result_release_hash
+            or base_release_id == result_release_id
+            or storage_hash
+            != _record_storage_hash(
+                record_kind="memory_application",
+                scope=scope,
+                record_id=application_id,
+                content_hash=content_hash,
+                created_at_text=created_at_text,
+            )
+        ):
+            raise ValueError("application commitment mismatch")
+        _validate_application_release_transform(
+            application,
+            base_revisions=base_revisions,
+            result_revisions=result_revisions,
+        )
+        return application
+    except MemoryApplicationNotFoundError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise MemoryPersistenceCorruptionError(
+            "stored memory application failed integrity validation"
+        ) from error
+
+
+def _load_application_state(cursor: sqlite3.Cursor) -> _ApplicationState:
+    (
+        scope_by_id,
+        evidence_by_address,
+        ingest_order_by_address,
+        snapshot_by_address,
+        _snapshot_by_alias,
+    ) = _load_evidence_snapshot_state(cursor)
+    (
+        candidate_scope_by_id,
+        candidate_evidence_by_address,
+        candidate_by_address,
+        _candidate_by_idempotency,
+    ) = _load_candidate_snapshot(cursor)
+    (
+        release_scope_by_id,
+        revision_by_address,
+        release_by_address,
+        release_by_alias,
+        revisions_by_release,
+    ) = _load_release_snapshot(cursor)
+    if (
+        candidate_scope_by_id != scope_by_id
+        or release_scope_by_id != scope_by_id
+        or candidate_evidence_by_address != evidence_by_address
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "application dependencies disagree on durable scope or evidence state"
+        )
+    root_by_scope_id, root_by_release = _load_application_roots(
+        cursor,
+        scope_by_id=scope_by_id,
+        release_by_address=release_by_address,
+    )
+    application_edges = _load_application_edges(
+        cursor,
+        scope_by_id=scope_by_id,
+        revision_by_address=revision_by_address,
+    )
+    address_rows = cursor.execute(
+        "SELECT application_order, scope_id, application_id "
+        "FROM memory_applications ORDER BY application_order"
+    ).fetchall()
+    if any(
+        len(row) != 3
+        or type(row[0]) is not int
+        or type(row[1]) is not int
+        or type(row[2]) is not str
+        for row in address_rows
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "application address rows have invalid storage classes"
+        )
+    if tuple(row[0] for row in address_rows) != tuple(range(len(address_rows))):
+        raise MemoryPersistenceCorruptionError(
+            "application_order is not globally contiguous"
+        )
+    application_addresses = {
+        (_require_scope_id(row[1], "application has an invalid scope ID"), row[2])
+        for row in address_rows
+    }
+    if len(application_addresses) != len(address_rows) or set(application_edges) != (
+        application_addresses
+    ):
+        raise MemoryPersistenceCorruptionError(
+            "application rows and revision edges are not one-to-one"
+        )
+
+    application_by_address: dict[tuple[int, str], MemoryApplicationV1] = {}
+    application_by_idempotency: dict[tuple[int, str], MemoryApplicationV1] = {}
+    application_by_result_release: dict[tuple[int, str], MemoryApplicationV1] = {}
+    application_by_revision: dict[tuple[int, str], MemoryApplicationV1] = {}
+    head_release_by_scope = {
+        scope_id: root.release_id for scope_id, root in root_by_scope_id.items()
+    }
+    for expected_order, (_stored_order, scope_id, application_id) in enumerate(
+        address_rows
+    ):
+        if scope_id not in scope_by_id:
+            raise MemoryPersistenceCorruptionError(
+                "application refers to a missing scope"
+            )
+        application = _load_application(
+            cursor,
+            scope_id=scope_id,
+            application_id=application_id,
+            scope_by_id=scope_by_id,
+            candidate_by_address=candidate_by_address,
+            revision_by_address=revision_by_address,
+            release_by_address=release_by_address,
+            release_by_alias=release_by_alias,
+            revisions_by_release=revisions_by_release,
+            snapshot_by_address=snapshot_by_address,
+            application_edges=application_edges,
+        )
+        if application.application_order != expected_order:
+            raise MemoryPersistenceCorruptionError(
+                "application row order disagrees with canonical order"
+            )
+        address = (scope_id, application.application_id)
+        idempotency_address = (scope_id, application.proposal.idempotency_key)
+        result_address = (scope_id, application.result_release_id)
+        if (
+            address in application_by_address
+            or idempotency_address in application_by_idempotency
+            or result_address in application_by_result_release
+            or result_address in root_by_release
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "application identity or result release is not unique"
+            )
+        source_base_address = (
+            scope_id,
+            application.proposal.source_base_release_id,
+        )
+        predecessor = application_by_result_release.get(source_base_address)
+        if source_base_address not in root_by_release and (
+            predecessor is None
+            or predecessor.application_order >= application.application_order
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "application source release is not a prior committed lineage node"
+            )
+        if head_release_by_scope.get(scope_id) != (
+            application.proposal.source_base_release_id
+        ):
+            raise MemoryPersistenceCorruptionError(
+                "application does not extend the scope's canonical head"
+            )
+        application_by_address[address] = application
+        application_by_idempotency[idempotency_address] = application
+        application_by_result_release[result_address] = application
+        head_release_by_scope[scope_id] = application.result_release_id
+        for update in application.applied_updates:
+            revision_address = (scope_id, update.revision_id)
+            if revision_address in application_by_revision:
+                raise MemoryPersistenceCorruptionError(
+                    "revision is attributed to multiple applications"
+                )
+            application_by_revision[revision_address] = application
+
+    return _ApplicationState(
+        scope_by_id=scope_by_id,
+        evidence_by_address=evidence_by_address,
+        ingest_order_by_address=ingest_order_by_address,
+        snapshot_by_address=snapshot_by_address,
+        candidate_by_address=candidate_by_address,
+        revision_by_address=revision_by_address,
+        release_by_address=release_by_address,
+        release_by_alias=release_by_alias,
+        revisions_by_release=revisions_by_release,
+        root_by_scope_id=root_by_scope_id,
+        root_by_release=root_by_release,
+        application_by_address=application_by_address,
+        application_by_idempotency=application_by_idempotency,
+        application_by_result_release=application_by_result_release,
+        application_by_revision=application_by_revision,
+    )
+
+
+def _append_candidate_locked(
+    cursor: sqlite3.Cursor,
+    proposal: CandidateProposal,
+) -> MemoryCandidate:
+    """Append one candidate using the caller's active writer transaction."""
+
+    canonical = proposal.canonical_bytes()
+    content_hash = sha256(canonical).hexdigest()
+    candidate_id = f"cand_{content_hash[:24]}"
+    (
+        scope_by_id,
+        evidence_by_address,
+        candidate_by_address,
+        candidate_by_idempotency,
+    ) = _load_candidate_snapshot(cursor)
+    scope_id = _find_scope_id_in_index(scope_by_id, proposal.scope)
+    existing = (
+        None
+        if scope_id is None
+        else candidate_by_idempotency.get((scope_id, proposal.idempotency_key))
+    )
+    if existing is not None:
+        if existing.proposal.canonical_bytes() == canonical:
+            return existing
+        raise CandidateConflictError(
+            "scoped candidate idempotency key already refers to different content"
+        )
+
+    for evidence_id in proposal.evidence_ids:
+        if scope_id is None or (scope_id, evidence_id) not in evidence_by_address:
+            raise EvidenceNotFoundError(f"evidence {evidence_id!r} was not found")
+    assert scope_id is not None
+
+    existing = candidate_by_address.get((scope_id, candidate_id))
+    if existing is not None:
+        if existing.proposal.canonical_bytes() == canonical:
+            return existing
+        raise CandidateConflictError(f"candidate ID collision for {candidate_id!r}")
+
+    created_at = datetime.now(UTC)
+    created_at_text = created_at.isoformat()
+    storage_hash = _record_storage_hash(
+        record_kind="candidate",
+        scope=proposal.scope,
+        record_id=candidate_id,
+        content_hash=content_hash,
+        created_at_text=created_at_text,
+    )
+    cursor.execute(
+        """INSERT INTO memory_candidates (
+    scope_id, candidate_id, canonical, content_hash, created_at,
+    storage_hash, content, idempotency_key
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            scope_id,
+            candidate_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            proposal.content,
+            proposal.idempotency_key,
+        ),
+    )
+    for position, evidence_id in enumerate(proposal.evidence_ids):
+        cursor.execute(
+            """INSERT INTO memory_candidate_evidence (
+    scope_id, candidate_id, position, evidence_id
+) VALUES (?, ?, ?, ?)""",
+            (scope_id, candidate_id, position, evidence_id),
+        )
+
+    (
+        _scope_by_id,
+        _evidence_by_address,
+        inserted_candidates,
+        _candidate_by_idempotency,
+    ) = _load_candidate_snapshot(cursor)
+    inserted = inserted_candidates.get((scope_id, candidate_id))
+    if inserted is None:
+        raise MemoryPersistenceCorruptionError(
+            "inserted candidate graph could not be reloaded"
+        )
+    return inserted
+
+
+def _append_revision_locked(
+    cursor: sqlite3.Cursor,
+    proposal: RevisionProposal,
+) -> MemoryRevision:
+    """Append one revision using the caller's active writer transaction."""
+
+    canonical = proposal.canonical_bytes()
+    content_hash = sha256(canonical).hexdigest()
+    revision_id = f"rev_{content_hash[:24]}"
+    (
+        scope_by_id,
+        candidate_by_address,
+        revision_by_address,
+        revision_by_idempotency,
+        revision_by_candidate,
+    ) = _load_revision_snapshot(cursor)
+    scope_id = _find_scope_id_in_index(scope_by_id, proposal.scope)
+    existing = (
+        None
+        if scope_id is None
+        else revision_by_idempotency.get((scope_id, proposal.idempotency_key))
+    )
+    if existing is not None:
+        if existing.proposal.canonical_bytes() == canonical:
+            return existing
+        raise RevisionConflictError(
+            "scoped revision idempotency key already refers to different content"
+        )
+
+    existing = (
+        None
+        if scope_id is None
+        else revision_by_address.get((scope_id, revision_id))
+    )
+    if existing is not None:
+        if existing.proposal.canonical_bytes() == canonical:
+            return existing
+        raise RevisionConflictError(f"revision ID collision for {revision_id!r}")
+
+    candidate = (
+        None
+        if scope_id is None
+        else candidate_by_address.get((scope_id, proposal.candidate_id))
+    )
+    if candidate is None:
+        raise CandidateNotFoundError(
+            f"candidate {proposal.candidate_id!r} was not found"
+        )
+    assert scope_id is not None
+    candidate_address = (scope_id, proposal.candidate_id)
+    if candidate_address in revision_by_candidate:
+        raise RevisionConflictError(
+            f"candidate {proposal.candidate_id!r} already backs a revision"
+        )
+
+    parent: MemoryRevision | None = None
+    if proposal.operation is not RevisionOperation.ADD:
+        assert proposal.parent_revision_id is not None
+        parent = revision_by_address.get((scope_id, proposal.parent_revision_id))
+        if parent is None:
+            raise RevisionNotFoundError(
+                f"revision {proposal.parent_revision_id!r} was not found"
+            )
+    memory_id, generation = _derive_revision_lineage(
+        proposal,
+        content_hash,
+        parent,
+    )
+    created_at = datetime.now(UTC)
+    created_at_text = created_at.isoformat()
+    storage_hash = _record_storage_hash(
+        record_kind="revision",
+        scope=proposal.scope,
+        record_id=revision_id,
+        content_hash=content_hash,
+        created_at_text=created_at_text,
+        memory_id=memory_id,
+        generation=generation,
+    )
+    expected = MemoryRevision(
+        revision_id=revision_id,
+        memory_id=memory_id,
+        generation=generation,
+        proposal=proposal,
+        content_hash=content_hash,
+        created_at=created_at,
+    )
+    cursor.execute(
+        """INSERT INTO memory_revisions (
+    scope_id, revision_id, canonical, content_hash, created_at,
+    storage_hash, candidate_id, memory_id, generation, operation,
+    parent_revision_id, idempotency_key
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            scope_id,
+            revision_id,
+            canonical,
+            content_hash,
+            created_at_text,
+            storage_hash,
+            proposal.candidate_id,
+            memory_id,
+            generation,
+            proposal.operation.value,
+            proposal.parent_revision_id,
+            proposal.idempotency_key,
+        ),
+    )
+    (
+        _scope_by_id,
+        _candidate_by_address,
+        inserted_revisions,
+        _revision_by_idempotency,
+        _revision_by_candidate,
+    ) = _load_revision_snapshot(cursor)
+    inserted = inserted_revisions.get((scope_id, revision_id))
+    if inserted is None:
+        raise MemoryPersistenceCorruptionError(
+            "inserted revision graph could not be reloaded"
+        )
+    if inserted != expected:
+        raise MemoryPersistenceCorruptionError(
+            "inserted revision did not round-trip exactly"
+        )
+    return inserted
+
+
+def _append_release_locked(
+    cursor: sqlite3.Cursor,
+    manifest: ReleaseManifest,
+    *,
+    idempotency_key: str,
+) -> MemoryRelease:
+    """Append one release using the caller's active writer transaction."""
+
+    canonical = manifest.canonical_bytes()
+    content_hash = sha256(canonical).hexdigest()
+    release_id = f"rel_{content_hash[:24]}"
+    (
+        scope_by_id,
+        revision_by_address,
+        release_by_address,
+        release_by_alias,
+        _revisions_by_release,
+    ) = _load_release_snapshot(cursor)
+    scope_id = _find_scope_id_in_index(scope_by_id, manifest.scope)
+    existing = (
+        None
+        if scope_id is None
+        else release_by_alias.get((scope_id, idempotency_key))
+    )
+    if existing is not None:
+        if existing.manifest.canonical_bytes() == canonical:
+            return existing
+        raise ReleaseConflictError(
+            "scoped release idempotency key already refers to different content"
+        )
+
+    revisions: list[MemoryRevision] = []
+    for revision_id in manifest.revision_ids:
+        revision = (
+            None
+            if scope_id is None
+            else revision_by_address.get((scope_id, revision_id))
+        )
+        if revision is None:
+            raise RevisionNotFoundError(f"revision {revision_id!r} was not found")
+        revisions.append(revision)
+    ordered_revisions = tuple(revisions)
+
+    memory_ids: set[str] = set()
+    for revision in ordered_revisions:
+        if revision.memory_id in memory_ids:
+            raise ReleaseConflictError(
+                "release contains more than one revision for memory_id "
+                f"{revision.memory_id!r}"
+            )
+        memory_ids.add(revision.memory_id)
+
+    existing = (
+        None
+        if scope_id is None
+        else release_by_address.get((scope_id, release_id))
+    )
+    if existing is not None and existing.manifest.canonical_bytes() != canonical:
+        raise ReleaseConflictError(f"release ID collision for {release_id!r}")
+    expected = existing
+    if existing is None:
+        if scope_id is None:
+            scope_id = _ensure_scope_id(cursor, manifest.scope)
+        created_at = datetime.now(UTC)
+        created_at_text = created_at.isoformat()
+        storage_hash = _record_storage_hash(
+            record_kind="release",
+            scope=manifest.scope,
+            record_id=release_id,
+            content_hash=content_hash,
+            created_at_text=created_at_text,
+        )
+        expected = MemoryRelease(
+            release_id=release_id,
+            manifest=manifest,
+            content_hash=content_hash,
+            created_at=created_at,
+        )
+        cursor.execute(
+            """INSERT INTO memory_releases (
+    scope_id, release_id, canonical, content_hash, created_at, storage_hash
+) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                scope_id,
+                release_id,
+                canonical,
+                content_hash,
+                created_at_text,
+                storage_hash,
+            ),
+        )
+        for position, revision in enumerate(ordered_revisions):
+            cursor.execute(
+                """INSERT INTO memory_release_revisions (
+    scope_id, release_id, position, revision_id, memory_id
+) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    scope_id,
+                    release_id,
+                    position,
+                    revision.revision_id,
+                    revision.memory_id,
+                ),
+            )
+
+    assert scope_id is not None
+    binding_hash = _release_binding_hash(
+        scope=manifest.scope,
+        idempotency_key=idempotency_key,
+        release_id=release_id,
+    )
+    cursor.execute(
+        """INSERT INTO memory_release_aliases (
+    scope_id, idempotency_key, release_id, binding_hash
+) VALUES (?, ?, ?, ?)""",
+        (scope_id, idempotency_key, release_id, binding_hash),
+    )
+    assert expected is not None
+    (
+        _readback_scope_by_id,
+        _readback_revision_by_address,
+        readback_release_by_address,
+        readback_release_by_alias,
+        readback_revisions_by_release,
+    ) = _load_release_snapshot(cursor)
+    address = (scope_id, release_id)
+    inserted = readback_release_by_address.get(address)
+    if inserted is None:
+        raise MemoryPersistenceCorruptionError(
+            "inserted release row could not be reloaded"
+        )
+    if inserted != expected:
+        raise MemoryPersistenceCorruptionError(
+            "inserted release did not round-trip exactly"
+        )
+    if readback_revisions_by_release.get(address) != ordered_revisions:
+        raise MemoryPersistenceCorruptionError(
+            "inserted release members did not round-trip exactly"
+        )
+    if readback_release_by_alias.get((scope_id, idempotency_key)) != inserted:
+        raise MemoryPersistenceCorruptionError(
+            "inserted release alias did not round-trip exactly"
+        )
+    return inserted
+
+
+def _register_application_root_locked(
+    cursor: sqlite3.Cursor,
+    *,
+    scope: MemoryScope,
+    release_id: str,
+) -> MemoryApplicationRootV1:
+    state = _load_application_state(cursor)
+    scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+    release = (
+        None
+        if scope_id is None
+        else state.release_by_address.get((scope_id, release_id))
+    )
+    if release is None:
+        raise ReleaseNotFoundError(f"release {release_id!r} was not found")
+    assert scope_id is not None
+    existing = state.root_by_scope_id.get(scope_id)
+    if existing is not None:
+        if existing.release_id == release_id:
+            return existing
+        raise MemoryApplicationRootConflictError(
+            "scope already has a different immutable application root"
+        )
+    if any(
+        address_scope_id == scope_id
+        for address_scope_id, _application_id in state.application_by_address
+    ):
+        raise MemoryApplicationRootConflictError(
+            "application root must be registered before the first application"
+        )
+    root = MemoryApplicationRootV1.create(
+        scope=scope,
+        release_id=release.release_id,
+        release_content_sha256=release.content_hash,
+    )
+    created_at_text = root.created_at.isoformat()
+    cursor.execute(
+        """INSERT INTO memory_application_roots (
+    scope_id, root_id, canonical, content_hash, created_at, storage_hash,
+    release_id, release_content_hash
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            scope_id,
+            root.root_id,
+            root.canonical_bytes(),
+            root.content_hash,
+            created_at_text,
+            _record_storage_hash(
+                record_kind="memory_application_root",
+                scope=scope,
+                record_id=root.root_id,
+                content_hash=root.content_hash,
+                created_at_text=created_at_text,
+            ),
+            root.release_id,
+            root.release_content_sha256,
+        ),
+    )
+    readback = _load_application_state(cursor).root_by_scope_id.get(scope_id)
+    if readback != root:
+        raise MemoryPersistenceCorruptionError(
+            "inserted application root did not round-trip exactly"
+        )
+    return readback
+
+
+def _commit_memory_application_locked(
+    cursor: sqlite3.Cursor,
+    proposal: MemoryApplicationProposal,
+) -> MemoryApplicationV1:
+    state = _load_application_state(cursor)
+    scope_id = _find_scope_id_in_index(state.scope_by_id, proposal.scope)
+    existing = (
+        None
+        if scope_id is None
+        else state.application_by_idempotency.get(
+            (scope_id, proposal.idempotency_key)
+        )
+    )
+    if existing is not None:
+        if existing.proposal == proposal:
+            return existing
+        raise MemoryApplicationConflictError(
+            "scoped application idempotency key has different content"
+        )
+    if scope_id is None:
+        raise MemoryApplicationConflictError(
+            "application scope has no source snapshot or root release"
+        )
+    snapshot = state.snapshot_by_address.get(
+        (scope_id, proposal.source_snapshot_id)
+    )
+    base_release = state.release_by_address.get(
+        (scope_id, proposal.source_base_release_id)
+    )
+    if snapshot is None:
+        raise EvidenceSnapshotNotFoundError(
+            f"evidence snapshot {proposal.source_snapshot_id!r} was not found"
+        )
+    if base_release is None:
+        raise ReleaseNotFoundError(
+            f"release {proposal.source_base_release_id!r} was not found"
+        )
+    base_address = (scope_id, base_release.release_id)
+    if base_address not in state.root_by_release and base_address not in (
+        state.application_by_result_release
+    ):
+        raise MemoryApplicationConflictError(
+            "source base release is neither the root nor a committed result"
+        )
+    prior_scope_applications = tuple(
+        application
+        for (application_scope_id, _application_id), application in (
+            state.application_by_address.items()
+        )
+        if application_scope_id == scope_id
+    )
+    expected_head_release_id = (
+        state.root_by_scope_id[scope_id].release_id
+        if not prior_scope_applications
+        else max(
+            prior_scope_applications,
+            key=lambda item: item.application_order,
+        ).result_release_id
+    )
+    if base_release.release_id != expected_head_release_id:
+        raise MemoryApplicationConflictError(
+            "source base release is not the scope's canonical head"
+        )
+    if any(
+        evidence_scope_id == scope_id
+        and ingest_order > snapshot.evidence_high_watermark
+        for (evidence_scope_id, _evidence_id), ingest_order in (
+            state.ingest_order_by_address.items()
+        )
+    ):
+        raise MemoryApplicationStaleSnapshotError(
+            "same-scope evidence arrived after the source snapshot was sealed"
+        )
+    member_by_id = {member.evidence_id: member for member in snapshot.members}
+    if any(
+        evidence_id not in member_by_id
+        for update in proposal.updates
+        for evidence_id in update.evidence_ids
+    ):
+        raise MemoryApplicationConflictError(
+            "application update references evidence outside the source snapshot"
+        )
+
+    base_revisions = state.revisions_by_release[base_address]
+    base_position = {
+        revision.revision_id: position
+        for position, revision in enumerate(base_revisions)
+    }
+    result_revision_ids = [revision.revision_id for revision in base_revisions]
+    candidates: list[MemoryCandidate] = []
+    revisions: list[MemoryRevision] = []
+    release_positions: list[int] = []
+    add_count = 0
+    for ordinal, update in enumerate(proposal.updates):
+        if update.operation is RevisionOperation.SUPERSEDE:
+            assert update.parent_revision_id is not None
+            position = base_position.get(update.parent_revision_id)
+            if position is None:
+                raise MemoryApplicationConflictError(
+                    "SUPERSEDE parent is not an exact source base tip"
+                )
+        else:
+            position = len(base_revisions) + add_count
+            add_count += 1
+        candidate_proposal = CandidateProposal(
+            scope=proposal.scope,
+            content=update.content,
+            evidence_ids=update.evidence_ids,
+            idempotency_key=_application_child_idempotency_key(
+                proposal,
+                record_kind="candidate",
+                ordinal=ordinal,
+            ),
+        )
+        candidate_hash = sha256(candidate_proposal.canonical_bytes()).hexdigest()
+        candidate_id = f"cand_{candidate_hash[:24]}"
+        if (scope_id, candidate_id) in state.candidate_by_address:
+            raise MemoryApplicationConflictError(
+                "application candidate already exists without this application"
+            )
+        candidate = _append_candidate_locked(cursor, candidate_proposal)
+        _application_transaction_fault_hook("after_candidate")
+        revision_proposal = RevisionProposal(
+            scope=proposal.scope,
+            candidate_id=candidate.candidate_id,
+            operation=update.operation,
+            parent_revision_id=update.parent_revision_id,
+            idempotency_key=_application_child_idempotency_key(
+                proposal,
+                record_kind="revision",
+                ordinal=ordinal,
+            ),
+        )
+        revision_hash = sha256(revision_proposal.canonical_bytes()).hexdigest()
+        revision_id = f"rev_{revision_hash[:24]}"
+        if (scope_id, revision_id) in state.revision_by_address:
+            raise MemoryApplicationConflictError(
+                "application revision already exists without this application"
+            )
+        revision = _append_revision_locked(cursor, revision_proposal)
+        _application_transaction_fault_hook("after_revision")
+        if update.operation is RevisionOperation.SUPERSEDE:
+            result_revision_ids[position] = revision.revision_id
+        else:
+            result_revision_ids.append(revision.revision_id)
+        candidates.append(candidate)
+        revisions.append(revision)
+        release_positions.append(position)
+
+    result_manifest = ReleaseManifest(
+        scope=proposal.scope,
+        revision_ids=tuple(result_revision_ids),
+    )
+    result_hash = sha256(result_manifest.canonical_bytes()).hexdigest()
+    result_release_id = f"rel_{result_hash[:24]}"
+    if (scope_id, result_release_id) in state.release_by_address:
+        raise MemoryApplicationConflictError(
+            "application result release already exists without this application"
+        )
+    result_release = _append_release_locked(
+        cursor,
+        result_manifest,
+        idempotency_key=_application_child_idempotency_key(
+            proposal,
+            record_kind="release",
+        ),
+    )
+    _application_transaction_fault_hook("after_release")
+    application_order = len(state.application_by_address)
+    applied_updates = tuple(
+        AppliedMemoryUpdateV1(
+            ordinal=ordinal,
+            release_position=release_positions[ordinal],
+            operation=revision.proposal.operation,
+            grounding=tuple(
+                member_by_id[evidence_id]
+                for evidence_id in candidate.proposal.evidence_ids
+            ),
+            candidate_id=candidate.candidate_id,
+            candidate_content_sha256=candidate.content_hash,
+            revision_id=revision.revision_id,
+            revision_content_sha256=revision.content_hash,
+            memory_id=revision.memory_id,
+            generation=revision.generation,
+            parent_revision_id=revision.proposal.parent_revision_id,
+        )
+        for ordinal, (candidate, revision) in enumerate(
+            zip(candidates, revisions, strict=True)
+        )
+    )
+    application = MemoryApplicationV1.create(
+        proposal=proposal,
+        source_snapshot_content_sha256=snapshot.content_hash,
+        source_evidence_high_watermark=snapshot.evidence_high_watermark,
+        base_release_content_sha256=base_release.content_hash,
+        result_release_id=result_release.release_id,
+        result_release_content_sha256=result_release.content_hash,
+        result_revision_ids=result_release.manifest.revision_ids,
+        applied_updates=applied_updates,
+        application_order=application_order,
+    )
+    created_at_text = application.created_at.isoformat()
+    cursor.execute(
+        """INSERT INTO memory_applications (
+    application_order, scope_id, application_id, canonical, content_hash,
+    created_at, storage_hash, source_snapshot_id, source_snapshot_content_hash,
+    source_evidence_high_watermark, base_release_id, base_release_content_hash,
+    result_release_id, result_release_content_hash, projector_id,
+    projector_version_hash, policy_id, policy_version_hash, policy_input_hash,
+    decision_hash, policy_context, update_count, idempotency_key
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            application.application_order,
+            scope_id,
+            application.application_id,
+            application.canonical_bytes(),
+            application.content_hash,
+            created_at_text,
+            _record_storage_hash(
+                record_kind="memory_application",
+                scope=proposal.scope,
+                record_id=application.application_id,
+                content_hash=application.content_hash,
+                created_at_text=created_at_text,
+            ),
+            proposal.source_snapshot_id,
+            application.source_snapshot_content_sha256,
+            application.source_evidence_high_watermark,
+            proposal.source_base_release_id,
+            application.base_release_content_sha256,
+            application.result_release_id,
+            application.result_release_content_sha256,
+            proposal.projector_id,
+            proposal.projector_version_sha256,
+            proposal.policy_id,
+            proposal.policy_version_sha256,
+            proposal.policy_input_sha256,
+            proposal.decision_sha256,
+            proposal.policy_context,
+            len(application.applied_updates),
+            proposal.idempotency_key,
+        ),
+    )
+    _application_transaction_fault_hook("after_application")
+    for update in application.applied_updates:
+        cursor.execute(
+            """INSERT INTO memory_application_revisions (
+    scope_id, application_id, ordinal, revision_id,
+    revision_content_hash, binding_hash
+) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                scope_id,
+                application.application_id,
+                update.ordinal,
+                update.revision_id,
+                update.revision_content_sha256,
+                _application_revision_binding_hash(
+                    scope=proposal.scope,
+                    application_id=application.application_id,
+                    ordinal=update.ordinal,
+                    revision_id=update.revision_id,
+                    revision_content_hash=update.revision_content_sha256,
+                ),
+            ),
+        )
+        _application_transaction_fault_hook("after_edge")
+    readback = _load_application_state(cursor).application_by_address.get(
+        (scope_id, application.application_id)
+    )
+    if readback != application:
+        raise MemoryPersistenceCorruptionError(
+            "inserted memory application did not round-trip exactly"
+        )
+    _application_transaction_fault_hook("after_readback")
+    return readback
+
+
 class SQLiteMemoryStore:
     """Local SQLite backend for immutable evidence and memory history."""
 
@@ -1921,97 +3257,8 @@ class SQLiteMemoryStore:
 
         if type(proposal) is not CandidateProposal:
             raise TypeError("proposal must be a CandidateProposal")
-        canonical = proposal.canonical_bytes()
-        content_hash = sha256(canonical).hexdigest()
-        candidate_id = f"cand_{content_hash[:24]}"
-
         with _write_transaction(self._database_path) as cursor:
-            (
-                scope_by_id,
-                evidence_by_address,
-                candidate_by_address,
-                candidate_by_idempotency,
-            ) = _load_candidate_snapshot(cursor)
-            scope_id = _find_scope_id_in_index(scope_by_id, proposal.scope)
-            existing = (
-                None
-                if scope_id is None
-                else candidate_by_idempotency.get((scope_id, proposal.idempotency_key))
-            )
-            if existing is not None:
-                if existing.proposal.canonical_bytes() == canonical:
-                    return existing
-                raise CandidateConflictError(
-                    "scoped candidate idempotency key already refers to different content"
-                )
-
-            for evidence_id in proposal.evidence_ids:
-                if (
-                    scope_id is None
-                    or (
-                        scope_id,
-                        evidence_id,
-                    )
-                    not in evidence_by_address
-                ):
-                    raise EvidenceNotFoundError(
-                        f"evidence {evidence_id!r} was not found"
-                    )
-            assert scope_id is not None
-
-            existing = candidate_by_address.get((scope_id, candidate_id))
-            if existing is not None:
-                if existing.proposal.canonical_bytes() == canonical:
-                    return existing
-                raise CandidateConflictError(
-                    f"candidate ID collision for {candidate_id!r}"
-                )
-
-            created_at = datetime.now(UTC)
-            created_at_text = created_at.isoformat()
-            storage_hash = _record_storage_hash(
-                record_kind="candidate",
-                scope=proposal.scope,
-                record_id=candidate_id,
-                content_hash=content_hash,
-                created_at_text=created_at_text,
-            )
-            cursor.execute(
-                """INSERT INTO memory_candidates (
-    scope_id, candidate_id, canonical, content_hash, created_at,
-    storage_hash, content, idempotency_key
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    scope_id,
-                    candidate_id,
-                    canonical,
-                    content_hash,
-                    created_at_text,
-                    storage_hash,
-                    proposal.content,
-                    proposal.idempotency_key,
-                ),
-            )
-            for position, evidence_id in enumerate(proposal.evidence_ids):
-                cursor.execute(
-                    """INSERT INTO memory_candidate_evidence (
-    scope_id, candidate_id, position, evidence_id
-) VALUES (?, ?, ?, ?)""",
-                    (scope_id, candidate_id, position, evidence_id),
-                )
-
-            (
-                _scope_by_id,
-                _evidence_by_address,
-                inserted_candidates,
-                _candidate_by_idempotency,
-            ) = _load_candidate_snapshot(cursor)
-            inserted = inserted_candidates.get((scope_id, candidate_id))
-            if inserted is None:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted candidate graph could not be reloaded"
-                )
-            return inserted
+            return _append_candidate_locked(cursor, proposal)
 
     def get_candidate(
         self,
@@ -2115,131 +3362,8 @@ class SQLiteMemoryStore:
 
         if type(proposal) is not RevisionProposal:
             raise TypeError("proposal must be a RevisionProposal")
-        canonical = proposal.canonical_bytes()
-        content_hash = sha256(canonical).hexdigest()
-        revision_id = f"rev_{content_hash[:24]}"
-
         with _write_transaction(self._database_path) as cursor:
-            (
-                scope_by_id,
-                candidate_by_address,
-                revision_by_address,
-                revision_by_idempotency,
-                revision_by_candidate,
-            ) = _load_revision_snapshot(cursor)
-            scope_id = _find_scope_id_in_index(scope_by_id, proposal.scope)
-            existing = (
-                None
-                if scope_id is None
-                else revision_by_idempotency.get((scope_id, proposal.idempotency_key))
-            )
-            if existing is not None:
-                if existing.proposal.canonical_bytes() == canonical:
-                    return existing
-                raise RevisionConflictError(
-                    "scoped revision idempotency key already refers to different content"
-                )
-
-            existing = (
-                None
-                if scope_id is None
-                else revision_by_address.get((scope_id, revision_id))
-            )
-            if existing is not None:
-                if existing.proposal.canonical_bytes() == canonical:
-                    return existing
-                raise RevisionConflictError(
-                    f"revision ID collision for {revision_id!r}"
-                )
-
-            candidate = (
-                None
-                if scope_id is None
-                else candidate_by_address.get((scope_id, proposal.candidate_id))
-            )
-            if candidate is None:
-                raise CandidateNotFoundError(
-                    f"candidate {proposal.candidate_id!r} was not found"
-                )
-            assert scope_id is not None
-            candidate_address = (scope_id, proposal.candidate_id)
-            if candidate_address in revision_by_candidate:
-                raise RevisionConflictError(
-                    f"candidate {proposal.candidate_id!r} already backs a revision"
-                )
-
-            parent: MemoryRevision | None = None
-            if proposal.operation is not RevisionOperation.ADD:
-                assert proposal.parent_revision_id is not None
-                parent = revision_by_address.get(
-                    (scope_id, proposal.parent_revision_id)
-                )
-                if parent is None:
-                    raise RevisionNotFoundError(
-                        f"revision {proposal.parent_revision_id!r} was not found"
-                    )
-            memory_id, generation = _derive_revision_lineage(
-                proposal,
-                content_hash,
-                parent,
-            )
-            created_at = datetime.now(UTC)
-            created_at_text = created_at.isoformat()
-            storage_hash = _record_storage_hash(
-                record_kind="revision",
-                scope=proposal.scope,
-                record_id=revision_id,
-                content_hash=content_hash,
-                created_at_text=created_at_text,
-                memory_id=memory_id,
-                generation=generation,
-            )
-            expected = MemoryRevision(
-                revision_id=revision_id,
-                memory_id=memory_id,
-                generation=generation,
-                proposal=proposal,
-                content_hash=content_hash,
-                created_at=created_at,
-            )
-            cursor.execute(
-                """INSERT INTO memory_revisions (
-    scope_id, revision_id, canonical, content_hash, created_at,
-    storage_hash, candidate_id, memory_id, generation, operation,
-    parent_revision_id, idempotency_key
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    scope_id,
-                    revision_id,
-                    canonical,
-                    content_hash,
-                    created_at_text,
-                    storage_hash,
-                    proposal.candidate_id,
-                    memory_id,
-                    generation,
-                    proposal.operation.value,
-                    proposal.parent_revision_id,
-                    proposal.idempotency_key,
-                ),
-            )
-            (
-                _scope_by_id,
-                _candidate_by_address,
-                inserted_revisions,
-                _revision_by_idempotency,
-                _revision_by_candidate,
-            ) = _load_revision_snapshot(cursor)
-            inserted = inserted_revisions.get((scope_id, revision_id))
-            if inserted is None:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted revision graph could not be reloaded"
-                )
-            if inserted != expected:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted revision did not round-trip exactly"
-                )
-            return inserted
+            return _append_revision_locked(cursor, proposal)
 
     def get_revision(
         self,
@@ -2327,149 +3451,12 @@ class SQLiteMemoryStore:
         if type(manifest) is not ReleaseManifest:
             raise TypeError("manifest must be a ReleaseManifest")
         idempotency_key = _validate_string(idempotency_key, "idempotency_key")
-        canonical = manifest.canonical_bytes()
-        content_hash = sha256(canonical).hexdigest()
-        release_id = f"rel_{content_hash[:24]}"
-
         with _write_transaction(self._database_path) as cursor:
-            (
-                scope_by_id,
-                revision_by_address,
-                release_by_address,
-                release_by_alias,
-                _revisions_by_release,
-            ) = _load_release_snapshot(cursor)
-            scope_id = _find_scope_id_in_index(scope_by_id, manifest.scope)
-            existing = (
-                None
-                if scope_id is None
-                else release_by_alias.get((scope_id, idempotency_key))
-            )
-            if existing is not None:
-                if existing.manifest.canonical_bytes() == canonical:
-                    return existing
-                raise ReleaseConflictError(
-                    "scoped release idempotency key already refers to different content"
-                )
-
-            revisions: list[MemoryRevision] = []
-            for revision_id in manifest.revision_ids:
-                revision = (
-                    None
-                    if scope_id is None
-                    else revision_by_address.get((scope_id, revision_id))
-                )
-                if revision is None:
-                    raise RevisionNotFoundError(
-                        f"revision {revision_id!r} was not found"
-                    )
-                revisions.append(revision)
-            ordered_revisions = tuple(revisions)
-
-            memory_ids: set[str] = set()
-            for revision in ordered_revisions:
-                if revision.memory_id in memory_ids:
-                    raise ReleaseConflictError(
-                        "release contains more than one revision for memory_id "
-                        f"{revision.memory_id!r}"
-                    )
-                memory_ids.add(revision.memory_id)
-
-            existing = (
-                None
-                if scope_id is None
-                else release_by_address.get((scope_id, release_id))
-            )
-            if (
-                existing is not None
-                and existing.manifest.canonical_bytes() != canonical
-            ):
-                raise ReleaseConflictError(f"release ID collision for {release_id!r}")
-            expected = existing
-            if existing is None:
-                if scope_id is None:
-                    scope_id = _ensure_scope_id(cursor, manifest.scope)
-                created_at = datetime.now(UTC)
-                created_at_text = created_at.isoformat()
-                storage_hash = _record_storage_hash(
-                    record_kind="release",
-                    scope=manifest.scope,
-                    record_id=release_id,
-                    content_hash=content_hash,
-                    created_at_text=created_at_text,
-                )
-                expected = MemoryRelease(
-                    release_id=release_id,
-                    manifest=manifest,
-                    content_hash=content_hash,
-                    created_at=created_at,
-                )
-                cursor.execute(
-                    """INSERT INTO memory_releases (
-    scope_id, release_id, canonical, content_hash, created_at, storage_hash
-) VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        scope_id,
-                        release_id,
-                        canonical,
-                        content_hash,
-                        created_at_text,
-                        storage_hash,
-                    ),
-                )
-                for position, revision in enumerate(ordered_revisions):
-                    cursor.execute(
-                        """INSERT INTO memory_release_revisions (
-    scope_id, release_id, position, revision_id, memory_id
-) VALUES (?, ?, ?, ?, ?)""",
-                        (
-                            scope_id,
-                            release_id,
-                            position,
-                            revision.revision_id,
-                            revision.memory_id,
-                        ),
-                    )
-
-            assert scope_id is not None
-            binding_hash = _release_binding_hash(
-                scope=manifest.scope,
+            return _append_release_locked(
+                cursor,
+                manifest,
                 idempotency_key=idempotency_key,
-                release_id=release_id,
             )
-            cursor.execute(
-                """INSERT INTO memory_release_aliases (
-    scope_id, idempotency_key, release_id, binding_hash
-) VALUES (?, ?, ?, ?)""",
-                (scope_id, idempotency_key, release_id, binding_hash),
-            )
-            assert expected is not None
-            (
-                _readback_scope_by_id,
-                _readback_revision_by_address,
-                readback_release_by_address,
-                readback_release_by_alias,
-                readback_revisions_by_release,
-            ) = _load_release_snapshot(cursor)
-            address = (scope_id, release_id)
-            inserted = readback_release_by_address.get(address)
-            if inserted is None:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted release row could not be reloaded"
-                )
-            if inserted != expected:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted release did not round-trip exactly"
-                )
-            if readback_revisions_by_release.get(address) != ordered_revisions:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted release members did not round-trip exactly"
-                )
-            if readback_release_by_alias.get((scope_id, idempotency_key)) != inserted:
-                raise MemoryPersistenceCorruptionError(
-                    "inserted release alias did not round-trip exactly"
-                )
-            return inserted
 
     def get_release(self, scope: MemoryScope, release_id: str) -> MemoryRelease:
         """Load one release only from its exact public scope."""
@@ -2545,3 +3532,129 @@ class SQLiteMemoryStore:
                     key=lambda release: release.release_id,
                 )
             )
+
+    def register_memory_application_root(
+        self,
+        scope: MemoryScope,
+        release_id: str,
+    ) -> MemoryApplicationRootV1:
+        """Commit the one explicit non-application release trusted by a scope."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        release_id = _validate_string(release_id, "release_id", allow_blank=True)
+        with _write_transaction(self._database_path) as cursor:
+            return _register_application_root_locked(
+                cursor,
+                scope=scope,
+                release_id=release_id,
+            )
+
+    def get_memory_application_root(
+        self,
+        scope: MemoryScope,
+    ) -> MemoryApplicationRootV1:
+        """Load the exact immutable application root for one scope."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        with _read_transaction(self._database_path) as cursor:
+            state = _load_application_state(cursor)
+            scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+            root = None if scope_id is None else state.root_by_scope_id.get(scope_id)
+            if root is None:
+                raise MemoryApplicationRootNotFoundError(
+                    "memory application root was not found"
+                )
+            return root
+
+    def commit_memory_application(
+        self,
+        proposal: MemoryApplicationProposal,
+    ) -> MemoryApplicationV1:
+        """Atomically publish updates, their release, and provenance ledger."""
+
+        if type(proposal) is not MemoryApplicationProposal:
+            raise TypeError("proposal must be a MemoryApplicationProposal")
+        with _write_transaction(self._database_path) as cursor:
+            return _commit_memory_application_locked(cursor, proposal)
+
+    def get_memory_application(
+        self,
+        scope: MemoryScope,
+        application_id: str,
+    ) -> MemoryApplicationV1:
+        """Load one committed application by exact scope and content ID."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        application_id = _validate_string(
+            application_id,
+            "application_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            state = _load_application_state(cursor)
+            scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+            application = (
+                None
+                if scope_id is None
+                else state.application_by_address.get((scope_id, application_id))
+            )
+            if application is None:
+                raise MemoryApplicationNotFoundError(
+                    f"application {application_id!r} was not found"
+                )
+            return application
+
+    def get_memory_application_for_revision(
+        self,
+        scope: MemoryScope,
+        revision_id: str,
+    ) -> MemoryApplicationV1:
+        """Resolve the unique committed application that created a revision."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        revision_id = _validate_string(
+            revision_id,
+            "revision_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            state = _load_application_state(cursor)
+            scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+            application = (
+                None
+                if scope_id is None
+                else state.application_by_revision.get((scope_id, revision_id))
+            )
+            if application is None:
+                raise MemoryApplicationNotFoundError(
+                    f"revision {revision_id!r} has no committed application"
+                )
+            return application
+
+    def get_memory_application_for_release(
+        self,
+        scope: MemoryScope,
+        release_id: str,
+    ) -> MemoryApplicationV1:
+        """Resolve the unique application that atomically published a release."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        release_id = _validate_string(release_id, "release_id", allow_blank=True)
+        with _read_transaction(self._database_path) as cursor:
+            state = _load_application_state(cursor)
+            scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+            application = (
+                None
+                if scope_id is None
+                else state.application_by_result_release.get((scope_id, release_id))
+            )
+            if application is None:
+                raise MemoryApplicationNotFoundError(
+                    f"release {release_id!r} has no committed application"
+                )
+            return application
