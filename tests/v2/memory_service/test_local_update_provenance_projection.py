@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -527,6 +528,163 @@ def _commit_unchecked_application(
             idempotency_key=f"provenance-application-{label}",
         )
     )
+
+
+def _synthetic_lineage_runner(
+    monkeypatch,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    *,
+    depth: int,
+    cycle_to: int | None = None,
+):
+    """Install a constant-payload lineage to isolate orchestration complexity."""
+
+    release_hashes = tuple(
+        hashlib.sha256(f"synthetic-release:{index}".encode()).hexdigest()
+        for index in range(depth + 1)
+    )
+    release_ids = tuple(f"rel_{value[:24]}" for value in release_hashes)
+    releases = {
+        release_id: SimpleNamespace(
+            release=SimpleNamespace(
+                release_id=release_id,
+                content_hash=release_hashes[index],
+                manifest=SimpleNamespace(revision_ids=()),
+            ),
+            revisions=(),
+        )
+        for index, release_id in enumerate(release_ids)
+    }
+    snapshot_hash = hashlib.sha256(b"synthetic-snapshot").hexdigest()
+    snapshot_id = f"esnap_{snapshot_hash[:24]}"
+    applications = {}
+    for index in range(1, depth + 1):
+        source_index = cycle_to if index == 1 and cycle_to is not None else index - 1
+        source_release = releases[release_ids[source_index]].release
+        result_release = releases[release_ids[index]].release
+        applications[result_release.release_id] = SimpleNamespace(
+            proposal=SimpleNamespace(
+                scope=scope,
+                source_base_release_id=source_release.release_id,
+                source_snapshot_id=snapshot_id,
+                projector_id=projection.PROVENANCE_PROJECTOR_ID_V1,
+                projector_version_sha256=(
+                    projection.PROVENANCE_PROJECTOR_VERSION_SHA256_V1
+                ),
+                policy_id=projection.VERIFIED_CHAIN_POLICY_ID_V1,
+                policy_version_sha256=(
+                    projection.VERIFIED_CHAIN_POLICY_VERSION_SHA256_V1
+                ),
+                policy_input_sha256="synthetic-input-hash",
+                decision_sha256="synthetic-decision-hash",
+                policy_context="synthetic-context",
+                updates=(),
+            ),
+            application_id=(
+                "mapp_"
+                + hashlib.sha256(
+                    f"synthetic-application:{index}".encode()
+                ).hexdigest()[:24]
+            ),
+            application_order=index - 1,
+            result_release_id=result_release.release_id,
+            result_release_content_sha256=result_release.content_hash,
+            result_revision_ids=(),
+            base_release_content_sha256=source_release.content_hash,
+            source_snapshot_content_sha256=snapshot_hash,
+            source_evidence_high_watermark=0,
+        )
+    root_release = releases[release_ids[0]].release
+    root = SimpleNamespace(
+        scope=scope,
+        release_id=root_release.release_id,
+        release_content_sha256=root_release.content_hash,
+    )
+    snapshot = SimpleNamespace(
+        content_hash=snapshot_hash,
+        evidence_high_watermark=0,
+        members=(),
+    )
+    material = SimpleNamespace(snapshot=snapshot, evidence=())
+    bases = (object(),)
+    source_input = object()
+    calls = {
+        "application": 0,
+        "apply": 0,
+        "build": 0,
+        "release": 0,
+        "root": 0,
+        "snapshot": 0,
+    }
+
+    def load_release(**kwargs):
+        calls["release"] += 1
+        return releases[kwargs["release_id"]]
+
+    def load_application(_self, requested_scope, release_id):
+        assert requested_scope == scope
+        calls["application"] += 1
+        return applications[release_id]
+
+    def load_root(_self, requested_scope):
+        assert requested_scope == scope
+        calls["root"] += 1
+        return root
+
+    def load_snapshot(**_kwargs):
+        calls["snapshot"] += 1
+        return material
+
+    def build_input(**_kwargs):
+        calls["build"] += 1
+        return source_input
+
+    def apply_result(**_kwargs):
+        calls["apply"] += 1
+        return bases
+
+    monkeypatch.setattr(projection, "_load_release_material_v1", load_release)
+    monkeypatch.setattr(projection, "_load_snapshot_material_v2", load_snapshot)
+    monkeypatch.setattr(projection, "_build_policy_input_v2", build_input)
+    monkeypatch.setattr(projection, "_apply_application_result_v1", apply_result)
+    monkeypatch.setattr(projection, "_project_root_memories", lambda **_kwargs: bases)
+    monkeypatch.setattr(
+        projection,
+        "_profile_from_application_context",
+        lambda _context: _profile(),
+    )
+    monkeypatch.setattr(
+        projection,
+        "policy_input_sha256_v2",
+        lambda _value: "synthetic-input-hash",
+    )
+    monkeypatch.setattr(
+        projection,
+        "verified_chain_decision_sha256_v1",
+        lambda _source, _updates: "synthetic-decision-hash",
+    )
+    monkeypatch.setattr(
+        SQLiteMemoryStore,
+        "get_memory_application_root",
+        load_root,
+    )
+    monkeypatch.setattr(
+        SQLiteMemoryStore,
+        "get_memory_application_for_release",
+        load_application,
+    )
+
+    def run():
+        return projection._project_base_memories(
+            store=store,
+            scope=scope,
+            base_release_id=release_ids[-1],
+            members=(),
+            evidence=(),
+        )
+
+    return run, calls, releases[release_ids[-1]].release, bases
 
 
 def test_profile_and_policy_input_are_canonical_and_store_authentic(tmp_path) -> None:
@@ -1340,6 +1498,61 @@ def test_partial_update_does_not_consume_an_absent_keys_valid_chain(tmp_path) ->
         (_OTHER_KEY, _OTHER),
     )
     assert _resolve(store, scope, final_input).verified_fact_chains == ()
+
+
+def test_application_lineage_replays_2048_nodes_without_python_recursion(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "synthetic-deep-lineage.sqlite3")
+    scope = MemoryScope("synthetic-tenant", "synthetic-memory", "synthetic-subject")
+    depth = 2048
+    run, calls, target_release, bases = _synthetic_lineage_runner(
+        monkeypatch,
+        store,
+        scope,
+        depth=depth,
+    )
+
+    release, replayed_bases = run()
+
+    assert release is target_release
+    assert replayed_bases is bases
+    assert calls == {
+        "application": depth,
+        "apply": depth,
+        "build": depth,
+        "release": depth + 1,
+        "root": 1,
+        "snapshot": depth,
+    }
+
+
+def test_deep_application_cycle_has_stable_payload_free_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = SQLiteMemoryStore(tmp_path / "synthetic-cycle.sqlite3")
+    scope = MemoryScope("synthetic-tenant", "synthetic-memory", "synthetic-subject")
+    depth = 1536
+    run, calls, _target_release, _bases = _synthetic_lineage_runner(
+        monkeypatch,
+        store,
+        scope,
+        depth=depth,
+        cycle_to=depth // 2,
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(
+            projection.LocalUpdateProvenanceProjectionError,
+            match=r"^base_release_invalid$",
+        ) as error:
+            run()
+        assert error.value.reason == "base_release_invalid"
+        assert error.value.args == ("base_release_invalid",)
+    assert calls["application"] == depth * 2
+    assert calls["snapshot"] == 0
 
 
 def test_unrelated_update_cannot_wash_out_an_absent_keys_conflict(tmp_path) -> None:

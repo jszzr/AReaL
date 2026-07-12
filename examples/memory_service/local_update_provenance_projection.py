@@ -55,6 +55,7 @@ from areal.v2.memory_service import (
     EvidenceSnapshotSpec,
     MemoryApplicationUpdateProposal,
     MemoryApplicationV1,
+    MemoryRelease,
     MemoryRevision,
     MemoryScope,
     RevisionOperation,
@@ -179,6 +180,25 @@ class VerifiedFactChainV1:
 class ProvenanceGraphV1:
     verified_fact_chains: tuple[VerifiedFactChainV1, ...]
     rejected_outcome_evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotMaterialV2:
+    snapshot: EvidenceSnapshot
+    evidence: tuple[PolicyEvidenceV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseMaterialV1:
+    release: MemoryRelease
+    revisions: tuple[MemoryRevision, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LineageFrameV1:
+    application: MemoryApplicationV1
+    result: _ReleaseMaterialV1
+    historical_profile: ProvenanceProfileV1
 
 
 _PROFILE_SCHEMA_VERSION = 1
@@ -833,6 +853,66 @@ def _load_snapshot_projection(
     return snapshot, records
 
 
+def _load_snapshot_material_v2(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    snapshot_id: str,
+) -> _SnapshotMaterialV2:
+    snapshot, records = _load_snapshot_projection(
+        store=store,
+        scope=scope,
+        snapshot_id=snapshot_id,
+    )
+    evidence = tuple(
+        PolicyEvidenceV2(
+            evidence_id=record.evidence_id,
+            evidence_content_sha256=record.content_hash,
+            ingest_order=member.ingest_order,
+            kind=record.event.kind.value,
+            session_id=record.event.session_id,
+            run_id=record.event.run_id,
+            sequence_no=record.event.sequence_no,
+            observed_at_utc=_canonical_utc_text(record.event.observed_at),
+            payload=record.event.payload,
+            provenance_payload_sha256=_parsed_provenance_sha256(
+                kind=record.event.kind.value,
+                payload=record.event.payload,
+            ),
+        )
+        for member, record in zip(snapshot.members, records, strict=True)
+    )
+    return _SnapshotMaterialV2(snapshot=snapshot, evidence=evidence)
+
+
+def _load_release_material_v1(
+    *,
+    store: SQLiteMemoryStore,
+    scope: MemoryScope,
+    release_id: str,
+) -> _ReleaseMaterialV1:
+    release = store.get_release(scope, release_id)
+    revisions = store.get_release_revisions(scope, release_id)
+    expected_hash = hashlib.sha256(release.manifest.canonical_bytes()).hexdigest()
+    if (
+        type(release) is not MemoryRelease
+        or type(revisions) is not tuple
+        or release.manifest.scope != scope
+        or release.release_id != release_id
+        or release.content_hash != expected_hash
+        or release.release_id != f"rel_{expected_hash[:24]}"
+        or tuple(revision.revision_id for revision in revisions)
+        != release.manifest.revision_ids
+        or any(
+            type(revision) is not MemoryRevision
+            or revision.proposal.scope != scope
+            for revision in revisions
+        )
+    ):
+        raise _error("base_release_invalid")
+    return _ReleaseMaterialV1(release=release, revisions=revisions)
+
+
 def _load_legacy_revision_fact_v2(
     *,
     store: SQLiteMemoryStore,
@@ -875,12 +955,11 @@ def _project_root_memories(
     *,
     store: SQLiteMemoryStore,
     scope: MemoryScope,
-    release_id: str,
+    release: MemoryRelease,
+    revisions: tuple[MemoryRevision, ...],
     members: tuple[EvidenceSnapshotMember, ...],
     evidence: tuple[PolicyEvidenceV2, ...],
 ) -> tuple[BaseMemoryV2, ...]:
-    release = store.get_release(scope, release_id)
-    revisions = store.get_release_revisions(scope, release_id)
     member_by_id = {member.evidence_id: member for member in members}
     evidence_by_id = {item.evidence_id: item for item in evidence}
     bases: list[BaseMemoryV2] = []
@@ -950,7 +1029,6 @@ def _project_root_memories(
         )
     if (
         release.manifest.scope != scope
-        or release.release_id != release_id
         or tuple(revision.revision_id for revision in revisions)
         != release.manifest.revision_ids
     ):
@@ -1021,6 +1099,69 @@ def _authenticate_application_updates(
     return updates
 
 
+def _build_policy_input_v2(
+    *,
+    scope: MemoryScope,
+    release: MemoryRelease,
+    bases: tuple[BaseMemoryV2, ...],
+    material: _SnapshotMaterialV2,
+    profile: ProvenanceProfileV1,
+) -> PolicyInputV2:
+    snapshot = material.snapshot
+    return _validate_policy_input(
+        PolicyInputV2(
+            schema_version=_INPUT_SCHEMA_VERSION,
+            policy_scope_token=_scope_token(scope),
+            base_release_id=release.release_id,
+            base_release_content_sha256=release.content_hash,
+            provenance_profile=profile,
+            provenance_profile_sha256=provenance_profile_sha256_v1(profile),
+            learning_allowed_kinds=POLICY_EVIDENCE_KINDS_V2,
+            evidence_snapshot_id=snapshot.snapshot_id,
+            evidence_snapshot_content_hash=snapshot.content_hash,
+            evidence_high_watermark=snapshot.evidence_high_watermark,
+            evidence_ordering_policy=snapshot.ordering_policy,
+            evidence_snapshot_members=snapshot.members,
+            cutoff_utc=_canonical_utc_text(snapshot.spec.cutoff),
+            evidence=material.evidence,
+            base_memories=bases,
+        )
+    )
+
+
+def _apply_application_result_v1(
+    *,
+    application: MemoryApplicationV1,
+    result: _ReleaseMaterialV1,
+    source_input: PolicyInputV2,
+) -> tuple[BaseMemoryV2, ...]:
+    if (
+        application.result_release_id != result.release.release_id
+        or application.result_release_content_sha256 != result.release.content_hash
+        or application.result_revision_ids
+        != result.release.manifest.revision_ids
+    ):
+        raise _error("base_release_invalid")
+    updated = _authenticate_application_updates(
+        application=application,
+        source_input=source_input,
+    )
+    source_by_revision = {
+        base.revision_id: base for base in source_input.base_memories
+    }
+    ordered_bases: list[BaseMemoryV2] = []
+    for revision in result.revisions:
+        base = updated.get(revision.revision_id)
+        if base is None:
+            base = source_by_revision.get(revision.revision_id)
+        if base is None:
+            raise _error("base_release_invalid")
+        ordered_bases.append(base)
+    if len({base.revision_id for base in ordered_bases}) != len(ordered_bases):
+        raise _error("base_release_invalid")
+    return tuple(sorted(ordered_bases, key=lambda value: value.key))
+
+
 def _project_base_memories(
     *,
     store: SQLiteMemoryStore,
@@ -1028,36 +1169,58 @@ def _project_base_memories(
     base_release_id: str,
     members: tuple[EvidenceSnapshotMember, ...],
     evidence: tuple[PolicyEvidenceV2, ...],
-    active_application_ids: set[str],
-) -> tuple[str, str, tuple[BaseMemoryV2, ...]]:
+) -> tuple[MemoryRelease, tuple[BaseMemoryV2, ...]]:
+    """Discover the linear ledger backward, then replay it root-first."""
+
     try:
-        release = store.get_release(scope, base_release_id)
-        revisions = store.get_release_revisions(scope, base_release_id)
+        target = _load_release_material_v1(
+            store=store,
+            scope=scope,
+            release_id=base_release_id,
+        )
+        root = store.get_memory_application_root(scope)
         if (
-            release.manifest.scope != scope
-            or release.release_id != base_release_id
-            or tuple(revision.revision_id for revision in revisions)
-            != release.manifest.revision_ids
+            root.scope != scope
+            or (
+                root.release_id == base_release_id
+                and root.release_content_sha256 != target.release.content_hash
+            )
         ):
             raise _error("base_release_invalid")
-        root = store.get_memory_application_root(scope)
         if root.release_id == base_release_id:
             bases = _project_root_memories(
                 store=store,
                 scope=scope,
-                release_id=base_release_id,
+                release=target.release,
+                revisions=target.revisions,
                 members=members,
                 evidence=evidence,
             )
-        else:
+            return target.release, bases
+
+        newest_first: list[_LineageFrameV1] = []
+        seen_release_ids = {base_release_id}
+        seen_application_ids: set[str] = set()
+        newer_application_order: int | None = None
+        current = target
+        while current.release.release_id != root.release_id:
             application = store.get_memory_application_for_release(
                 scope,
-                base_release_id,
+                current.release.release_id,
             )
-            if application.application_id in active_application_ids:
-                raise _error("base_release_invalid")
             if (
-                application.proposal.projector_id != PROVENANCE_PROJECTOR_ID_V1
+                application.proposal.scope != scope
+                or application.result_release_id != current.release.release_id
+                or application.result_release_content_sha256
+                != current.release.content_hash
+                or application.result_revision_ids
+                != current.release.manifest.revision_ids
+                or application.application_id in seen_application_ids
+                or (
+                    newer_application_order is not None
+                    and application.application_order >= newer_application_order
+                )
+                or application.proposal.projector_id != PROVENANCE_PROJECTOR_ID_V1
                 or application.proposal.projector_version_sha256
                 != PROVENANCE_PROJECTOR_VERSION_SHA256_V1
             ):
@@ -1065,18 +1228,62 @@ def _project_base_memories(
             historical_profile = _profile_from_application_context(
                 application.proposal.policy_context
             )
-            active_application_ids.add(application.application_id)
-            try:
-                source_input = _project_policy_input_from_snapshot_v2(
+            source_release_id = application.proposal.source_base_release_id
+            if source_release_id in seen_release_ids:
+                raise _error("base_release_invalid")
+            newest_first.append(
+                _LineageFrameV1(
+                    application=application,
+                    result=current,
+                    historical_profile=historical_profile,
+                )
+            )
+            seen_application_ids.add(application.application_id)
+            seen_release_ids.add(source_release_id)
+            newer_application_order = application.application_order
+            current = _load_release_material_v1(
+                store=store,
+                scope=scope,
+                release_id=source_release_id,
+            )
+
+        if root.release_content_sha256 != current.release.content_hash:
+            raise _error("base_release_invalid")
+        current_bases: tuple[BaseMemoryV2, ...] | None = None
+        for frame in reversed(newest_first):
+            application = frame.application
+            material = _load_snapshot_material_v2(
+                store=store,
+                scope=scope,
+                snapshot_id=application.proposal.source_snapshot_id,
+            )
+            if current_bases is None:
+                current_bases = _project_root_memories(
                     store=store,
                     scope=scope,
-                    base_release_id=application.proposal.source_base_release_id,
-                    evidence_snapshot_id=(application.proposal.source_snapshot_id),
-                    provenance_profile=historical_profile,
-                    active_application_ids=active_application_ids,
+                    release=current.release,
+                    revisions=current.revisions,
+                    members=material.snapshot.members,
+                    evidence=material.evidence,
                 )
-            finally:
-                active_application_ids.remove(application.application_id)
+            if (
+                application.proposal.source_base_release_id
+                != current.release.release_id
+                or application.base_release_content_sha256
+                != current.release.content_hash
+                or application.source_snapshot_content_sha256
+                != material.snapshot.content_hash
+                or application.source_evidence_high_watermark
+                != material.snapshot.evidence_high_watermark
+            ):
+                raise _error("base_release_invalid")
+            source_input = _build_policy_input_v2(
+                scope=scope,
+                release=current.release,
+                bases=current_bases,
+                material=material,
+                profile=frame.historical_profile,
+            )
             if policy_input_sha256_v2(source_input) != (
                 application.proposal.policy_input_sha256
             ):
@@ -1092,22 +1299,18 @@ def _project_base_memories(
                 )
             ):
                 raise _error("base_release_invalid")
-            updated = _authenticate_application_updates(
+            current_bases = _apply_application_result_v1(
                 application=application,
+                result=frame.result,
                 source_input=source_input,
             )
-            source_by_revision = {
-                base.revision_id: base for base in source_input.base_memories
-            }
-            ordered_bases: list[BaseMemoryV2] = []
-            for revision in revisions:
-                base = updated.get(revision.revision_id)
-                if base is None:
-                    base = source_by_revision.get(revision.revision_id)
-                if base is None:
-                    raise _error("base_release_invalid")
-                ordered_bases.append(base)
-            bases = tuple(sorted(ordered_bases, key=lambda value: value.key))
+            current = frame.result
+        if (
+            current_bases is None
+            or current.release.release_id != target.release.release_id
+            or current.release.content_hash != target.release.content_hash
+        ):
+            raise _error("base_release_invalid")
     except LocalUpdateProvenanceProjectionError:
         raise
     except (
@@ -1119,11 +1322,7 @@ def _project_base_memories(
         ValueError,
     ) as error:
         raise _error("base_release_invalid") from error
-    return (
-        release.release_id,
-        release.content_hash,
-        bases,
-    )
+    return target.release, current_bases
 
 
 def _project_policy_input_from_snapshot_v2(
@@ -1133,7 +1332,6 @@ def _project_policy_input_from_snapshot_v2(
     base_release_id: str,
     evidence_snapshot_id: str,
     provenance_profile: ProvenanceProfileV1,
-    active_application_ids: set[str],
 ) -> PolicyInputV2:
     """Reconstruct a V2 policy input from one store-authentic snapshot."""
 
@@ -1147,55 +1345,25 @@ def _project_policy_input_from_snapshot_v2(
     ):
         raise _error("closed_schema")
     profile = _validate_profile(provenance_profile)
-    snapshot, records = _load_snapshot_projection(
+    material = _load_snapshot_material_v2(
         store=store,
         scope=scope,
         snapshot_id=evidence_snapshot_id,
     )
-    evidence = tuple(
-        PolicyEvidenceV2(
-            evidence_id=record.evidence_id,
-            evidence_content_sha256=record.content_hash,
-            ingest_order=member.ingest_order,
-            kind=record.event.kind.value,
-            session_id=record.event.session_id,
-            run_id=record.event.run_id,
-            sequence_no=record.event.sequence_no,
-            observed_at_utc=_canonical_utc_text(record.event.observed_at),
-            payload=record.event.payload,
-            provenance_payload_sha256=_parsed_provenance_sha256(
-                kind=record.event.kind.value,
-                payload=record.event.payload,
-            ),
-        )
-        for member, record in zip(snapshot.members, records, strict=True)
-    )
-    release_id, release_hash, bases = _project_base_memories(
+    release, bases = _project_base_memories(
         store=store,
         scope=scope,
         base_release_id=base_release_id,
-        members=snapshot.members,
-        evidence=evidence,
-        active_application_ids=active_application_ids,
+        members=material.snapshot.members,
+        evidence=material.evidence,
     )
-    result = PolicyInputV2(
-        schema_version=_INPUT_SCHEMA_VERSION,
-        policy_scope_token=_scope_token(scope),
-        base_release_id=release_id,
-        base_release_content_sha256=release_hash,
-        provenance_profile=profile,
-        provenance_profile_sha256=provenance_profile_sha256_v1(profile),
-        learning_allowed_kinds=POLICY_EVIDENCE_KINDS_V2,
-        evidence_snapshot_id=snapshot.snapshot_id,
-        evidence_snapshot_content_hash=snapshot.content_hash,
-        evidence_high_watermark=snapshot.evidence_high_watermark,
-        evidence_ordering_policy=snapshot.ordering_policy,
-        evidence_snapshot_members=snapshot.members,
-        cutoff_utc=_canonical_utc_text(snapshot.spec.cutoff),
-        evidence=evidence,
-        base_memories=bases,
+    return _build_policy_input_v2(
+        scope=scope,
+        release=release,
+        bases=bases,
+        material=material,
+        profile=profile,
     )
-    return _validate_policy_input(result)
 
 
 def project_policy_input_from_snapshot_v2(
@@ -1214,7 +1382,6 @@ def project_policy_input_from_snapshot_v2(
         base_release_id=base_release_id,
         evidence_snapshot_id=evidence_snapshot_id,
         provenance_profile=provenance_profile,
-        active_application_ids=set(),
     )
 
 
