@@ -23,6 +23,10 @@ from areal.v2.memory_service._sqlite_backend import (
     _validate_ingest_orders_locked,
     _write_transaction,
 )
+from areal.v2.memory_service.application_replay import (
+    MemoryApplicationReplayStepV1,
+    MemoryApplicationReplayViewV1,
+)
 from areal.v2.memory_service.application_types import (
     AppliedMemoryUpdateV1,
     MemoryApplicationProposal,
@@ -2162,6 +2166,108 @@ def _load_application_state(cursor: sqlite3.Cursor) -> _ApplicationState:
     )
 
 
+def _application_replay_from_state(
+    state: _ApplicationState,
+    *,
+    scope: MemoryScope,
+    target_release_id: str,
+) -> MemoryApplicationReplayViewV1:
+    """Select one integrity-validated lineage without reloading durable state."""
+
+    try:
+        scope_id = _find_scope_id_in_index(state.scope_by_id, scope)
+        if scope_id is None:
+            raise MemoryApplicationRootNotFoundError(
+                "memory application root was not found"
+            )
+        root = state.root_by_scope_id.get(scope_id)
+        if root is None:
+            raise MemoryApplicationRootNotFoundError(
+                "memory application root was not found"
+            )
+        newest_first: list[MemoryApplicationV1] = []
+        seen_release_ids = {target_release_id}
+        seen_application_ids: set[str] = set()
+        current_release_id = target_release_id
+        while current_release_id != root.release_id:
+            application = state.application_by_result_release.get(
+                (scope_id, current_release_id)
+            )
+            if application is None:
+                if current_release_id == target_release_id:
+                    raise MemoryApplicationNotFoundError(
+                        f"release {target_release_id!r} has no committed lineage"
+                    )
+                raise MemoryPersistenceCorruptionError(
+                    "memory application lineage has a missing predecessor"
+                )
+            source_release_id = application.proposal.source_base_release_id
+            if (
+                application.application_id in seen_application_ids
+                or source_release_id in seen_release_ids
+            ):
+                raise MemoryPersistenceCorruptionError(
+                    "memory application lineage contains a cycle"
+                )
+            newest_first.append(application)
+            seen_application_ids.add(application.application_id)
+            seen_release_ids.add(source_release_id)
+            current_release_id = source_release_id
+
+        root_address = (scope_id, root.release_id)
+        root_release = state.release_by_address[root_address]
+        root_revisions = state.revisions_by_release[root_address]
+        steps: list[MemoryApplicationReplayStepV1] = []
+        evidence_by_snapshot_id: dict[str, tuple[EvidenceRecord, ...]] = {}
+        for application in reversed(newest_first):
+            snapshot_address = (
+                scope_id,
+                application.proposal.source_snapshot_id,
+            )
+            snapshot = state.snapshot_by_address[snapshot_address]
+            source_evidence = evidence_by_snapshot_id.get(snapshot.snapshot_id)
+            if source_evidence is None:
+                source_evidence = tuple(
+                    state.evidence_by_address[(scope_id, member.evidence_id)]
+                    for member in snapshot.members
+                )
+                evidence_by_snapshot_id[snapshot.snapshot_id] = source_evidence
+            if any(
+                state.ingest_order_by_address[(scope_id, member.evidence_id)]
+                != member.ingest_order
+                for member in snapshot.members
+            ):
+                raise MemoryPersistenceCorruptionError(
+                    "replay snapshot ingest-order binding is inconsistent"
+                )
+            result_address = (scope_id, application.result_release_id)
+            steps.append(
+                MemoryApplicationReplayStepV1(
+                    application=application,
+                    source_snapshot=snapshot,
+                    source_evidence=source_evidence,
+                    result_release=state.release_by_address[result_address],
+                    result_revisions=state.revisions_by_release[result_address],
+                )
+            )
+        return MemoryApplicationReplayViewV1(
+            root=root,
+            root_release=root_release,
+            root_revisions=root_revisions,
+            steps=tuple(steps),
+        )
+    except (
+        MemoryApplicationNotFoundError,
+        MemoryApplicationRootNotFoundError,
+        MemoryPersistenceCorruptionError,
+    ):
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise MemoryPersistenceCorruptionError(
+            "stored memory application replay view failed integrity validation"
+        ) from error
+
+
 def _append_candidate_locked(
     cursor: sqlite3.Cursor,
     proposal: CandidateProposal,
@@ -3658,3 +3764,24 @@ class SQLiteMemoryStore:
                     f"release {release_id!r} has no committed application"
                 )
             return application
+
+    def get_memory_application_replay(
+        self,
+        scope: MemoryScope,
+        target_release_id: str,
+    ) -> MemoryApplicationReplayViewV1:
+        """Load one root-to-target lineage in a single consistent transaction."""
+
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
+        target_release_id = _validate_string(
+            target_release_id,
+            "target_release_id",
+            allow_blank=True,
+        )
+        with _read_transaction(self._database_path) as cursor:
+            return _application_replay_from_state(
+                _load_application_state(cursor),
+                scope=scope,
+                target_release_id=target_release_id,
+            )

@@ -6,6 +6,9 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from areal.v2.memory_service.application_replay import (
+    MemoryApplicationReplayViewV1,
+)
 from areal.v2.memory_service.application_types import (
     MemoryApplicationProposal,
     MemoryApplicationRootV1,
@@ -66,5 +69,14 @@ class MemoryApplicationStore(Protocol):
         release_id: str,
     ) -> MemoryApplicationV1:
         """Resolve the unique application that published a release."""
+
+        ...
+
+    def get_memory_application_replay(
+        self,
+        scope: MemoryScope,
+        target_release_id: str,
+    ) -> MemoryApplicationReplayViewV1:
+        """Load one root-to-result lineage from a consistent read view."""
 
         ...

@@ -271,6 +271,8 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         "MemoryApplicationConflictError",
         "MemoryApplicationNotFoundError",
         "MemoryApplicationProposal",
+        "MemoryApplicationReplayStepV1",
+        "MemoryApplicationReplayViewV1",
         "MemoryApplicationRootConflictError",
         "MemoryApplicationRootNotFoundError",
         "MemoryApplicationRootV1",

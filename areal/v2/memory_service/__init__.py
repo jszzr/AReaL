@@ -2,6 +2,10 @@
 
 """Public contracts for immutable evidence, history, releases, and applications."""
 
+from areal.v2.memory_service.application_replay import (
+    MemoryApplicationReplayStepV1,
+    MemoryApplicationReplayViewV1,
+)
 from areal.v2.memory_service.application_store import MemoryApplicationStore
 from areal.v2.memory_service.application_types import (
     AppliedMemoryUpdateV1,
@@ -87,6 +91,8 @@ __all__ = [
     "MemoryApplicationConflictError",
     "MemoryApplicationNotFoundError",
     "MemoryApplicationProposal",
+    "MemoryApplicationReplayStepV1",
+    "MemoryApplicationReplayViewV1",
     "MemoryApplicationRootConflictError",
     "MemoryApplicationRootNotFoundError",
     "MemoryApplicationRootV1",
