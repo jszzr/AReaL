@@ -924,6 +924,51 @@ def test_base_release_projection_rejects_semantically_ungrounded_candidate(
     assert error.value.reason == "base_release_invalid"
 
 
+def test_base_release_projection_rejects_wrong_grounding_evidence_kind(
+    tmp_path,
+) -> None:
+    store, scope, _records, _base, _original = _fixture(tmp_path)
+    wrong_kind = _append(
+        store,
+        scope,
+        label="wrong-kind-grounding",
+        seconds=120,
+        sequence_no=7,
+        kind=EvidenceKind.TOOL_RESULT,
+        payload=f"{_TARGET_KEY} = {_CURRENT}",
+    )
+    candidate = store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=wrong_kind.event.payload,
+            evidence_ids=(wrong_kind.evidence_id,),
+            idempotency_key="candidate-wrong-kind",
+        )
+    )
+    revision = store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+            idempotency_key="revision-wrong-kind",
+        )
+    )
+    release = store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(revision.revision_id,)),
+        idempotency_key="release-wrong-kind",
+    )
+    with pytest.raises(policy.LocalUpdatePolicyError) as error:
+        policy.make_policy_input_v1(
+            store=store,
+            scope=scope,
+            base_release_id=release.release_id,
+            cutoff=_BASE + timedelta(seconds=150),
+            evidence_snapshot_idempotency_key="snapshot-wrong-kind",
+        )
+    assert error.value.reason == "base_release_invalid"
+
+
 def test_closed_input_validation_rejects_noncanonical_or_ambiguous_values(
     tmp_path,
 ) -> None:

@@ -411,6 +411,10 @@ def _load_grounded_revision_fact(
         != tuple(item.evidence_id for item in evidence_records)
         or not evidence_records
         or any(item.event.scope != scope for item in evidence_records)
+        or any(
+            item.event.kind.value not in POLICY_EVIDENCE_KINDS
+            for item in evidence_records
+        )
         or (
             snapshot_hash_by_evidence_id is not None
             and any(
